@@ -30,6 +30,8 @@ mod generated {
         LPI2C1,
         LPI2C2,
         LPI2C3,
+        LPSPI0,
+        LPSPI1,
         LPUART0,
         LPUART1,
         LPUART2,
@@ -489,6 +491,132 @@ impl InterruptExt for Gpio4 {
     #[inline]
     fn is_pending(&self) -> bool {
         cortex_m::peripheral::NVIC::is_pending(Interrupt::GPIO4)
+    }
+}
+
+// =============================================================================
+// LPSPI0 interrupt helper
+// =============================================================================
+
+/// LPSPI0 interrupt struct for configuration and control.
+pub struct Lpspi0;
+
+/// LPSPI0 interrupt constant for use in configuration.
+pub const LPSPI0: Lpspi0 = Lpspi0;
+
+impl InterruptExt for Lpspi0 {
+    #[inline]
+    fn unpend(&self) {
+        cortex_m::peripheral::NVIC::unpend(Interrupt::LPSPI0);
+    }
+
+    #[inline]
+    fn set_priority(&self, priority: Priority) {
+        unsafe {
+            let mut nvic = cortex_m::peripheral::Peripherals::steal().NVIC;
+            nvic.set_priority(Interrupt::LPSPI0, u8::from(priority));
+        }
+    }
+
+    #[inline]
+    unsafe fn enable(&self) {
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(Interrupt::LPSPI0);
+        }
+    }
+
+    #[inline]
+    unsafe fn disable(&self) {
+        cortex_m::peripheral::NVIC::mask(Interrupt::LPSPI0);
+    }
+
+    #[inline]
+    fn is_pending(&self) -> bool {
+        cortex_m::peripheral::NVIC::is_pending(Interrupt::LPSPI0)
+    }
+}
+
+impl Lpspi0 {
+    /// Configure LPSPI0 interrupt for SPI operation.
+    /// Sets priority, enables the interrupt, and ensures global interrupts are enabled.
+    pub fn configure_for_spi(&self, priority: Priority) {
+        self.unpend();
+        self.set_priority(priority);
+        unsafe {
+            self.enable();
+            cortex_m::interrupt::enable();
+        }
+    }
+
+    /// Install LPSPI0 handler into the RAM vector table.
+    /// Safety: See `install_irq_handler`.
+    pub unsafe fn install_handler(&self, handler: unsafe extern "C" fn()) {
+        unsafe {
+            install_irq_handler(Interrupt::LPSPI0, handler);
+        }
+    }
+}
+
+// =============================================================================
+// LPSPI1 interrupt helper
+// =============================================================================
+
+/// LPSPI1 interrupt struct for configuration and control.
+pub struct Lpspi1;
+
+/// LPSPI1 interrupt constant for use in configuration.
+pub const LPSPI1: Lpspi1 = Lpspi1;
+
+impl InterruptExt for Lpspi1 {
+    #[inline]
+    fn unpend(&self) {
+        cortex_m::peripheral::NVIC::unpend(Interrupt::LPSPI1);
+    }
+
+    #[inline]
+    fn set_priority(&self, priority: Priority) {
+        unsafe {
+            let mut nvic = cortex_m::peripheral::Peripherals::steal().NVIC;
+            nvic.set_priority(Interrupt::LPSPI1, u8::from(priority));
+        }
+    }
+
+    #[inline]
+    unsafe fn enable(&self) {
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(Interrupt::LPSPI1);
+        }
+    }
+
+    #[inline]
+    unsafe fn disable(&self) {
+        cortex_m::peripheral::NVIC::mask(Interrupt::LPSPI1);
+    }
+
+    #[inline]
+    fn is_pending(&self) -> bool {
+        cortex_m::peripheral::NVIC::is_pending(Interrupt::LPSPI1)
+    }
+}
+
+impl Lpspi1 {
+    /// Configure LPSPI1 interrupt for SPI operation.
+    /// Sets priority, enables the interrupt, and ensures global interrupts are enabled.
+    pub fn configure_for_spi(&self, priority: Priority) {
+        self.unpend();
+        self.set_priority(priority);
+        unsafe {
+            self.enable();
+            cortex_m::interrupt::enable();
+        }
+    }
+
+    /// Install LPSPI1 handler into the RAM vector table.
+    /// Safety: See `install_irq_handler`.
+    pub unsafe fn install_handler(&self, handler: unsafe extern "C" fn()) {
+        unsafe {
+            install_irq_handler(Interrupt::LPSPI1, handler);
+        }
     }
 }
 
