@@ -67,6 +67,7 @@ use core::marker::PhantomData;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
+use super::controller_registers::{ControllerCommand, ControllerRegisters, ControllerStatus, ControllerStatusError};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
@@ -74,7 +75,7 @@ use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
-use crate::pac::lpi2c::{Alf, Cmd, Dmf, Dozen, Epf, McrRrf, McrRtf, Msr, MsrFef, MsrSdf, Ndf, Pltf, Prescale, Stf};
+use crate::pac::lpi2c::{Dozen, Prescale};
 
 /// Errors exclusive to HW initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -129,20 +130,8 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         T::PERF_INT_INCR();
-        if T::info().regs().mier().read().0 != 0 {
-            T::info().regs().mier().write(|w| {
-                w.set_tdie(false);
-                w.set_rdie(false);
-                w.set_epie(false);
-                w.set_sdie(false);
-                w.set_ndie(false);
-                w.set_alie(false);
-                w.set_feie(false);
-                w.set_pltie(false);
-                w.set_dmie(false);
-                w.set_stie(false);
-            });
-
+        let registers = ControllerRegisters::new(T::info().regs());
+        if registers.disable_interrupts_if_enabled() {
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
         }
@@ -348,6 +337,11 @@ impl<'d> I2c<'d, Blocking> {
 }
 
 impl<'d, M: Mode> I2c<'d, M> {
+    #[inline(always)]
+    fn registers(&self) -> ControllerRegisters {
+        ControllerRegisters::new(self.info.regs())
+    }
+
     fn new_inner<T: Instance>(
         _peri: Peri<'d, T>,
         scl: Peri<'d, impl SclPin<T>>,
@@ -429,17 +423,8 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.info.regs().mcr().modify(|w| w.set_men(true));
         });
 
-        // Clear all flags
-        self.info.regs().msr().write(|w| {
-            w.set_epf(Epf::IntYes);
-            w.set_sdf(MsrSdf::IntYes);
-            w.set_ndf(Ndf::IntYes);
-            w.set_alf(Alf::IntYes);
-            w.set_fef(MsrFef::IntYes);
-            w.set_pltf(Pltf::IntYes);
-            w.set_dmf(Dmf::IntYes);
-            w.set_stf(Stf::IntYes);
-        });
+        // Clear all flags.
+        self.registers().clear_all_status();
     }
 
     fn remediation(&self) {
@@ -460,18 +445,12 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         // Clear any residual MSR flags raised by the recovery STOP
         // (FEF in particular) so the next transaction starts clean.
-        let msr = self.info.regs().msr().read();
-        self.info.regs().msr().write(|w| *w = msr);
+        self.registers().clear_current_status();
     }
 
     /// Resets both TX and RX FIFOs dropping their contents.
     fn reset_fifos(&self) {
-        critical_section::with(|_| {
-            self.info.regs().mcr().modify(|w| {
-                w.set_rtf(McrRtf::Reset);
-                w.set_rrf(McrRrf::Reset);
-            });
-        });
+        self.registers().reset_fifos();
     }
 
     /// Recover from an I2C error by resetting FIFOs and clearing all
@@ -480,27 +459,17 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// fails with FifoError.
     fn recover_from_error(&self) {
         self.reset_fifos();
-        self.info.regs().msr().write(|w| {
-            w.set_epf(Epf::IntYes);
-            w.set_sdf(MsrSdf::IntYes);
-            w.set_ndf(Ndf::IntYes);
-            w.set_alf(Alf::IntYes);
-            w.set_fef(MsrFef::IntYes);
-            w.set_pltf(Pltf::IntYes);
-            w.set_dmf(Dmf::IntYes);
-            w.set_stf(Stf::IntYes);
-        });
+        self.registers().clear_all_status();
     }
 
     /// Checks whether the TX FIFO is full
     fn is_tx_fifo_full(&self) -> bool {
-        let txfifo_size = 1 << self.info.regs().param().read().mtxfifo();
-        self.info.regs().mfsr().read().txcount() == txfifo_size
+        self.registers().tx_fifo_full()
     }
 
     /// Checks whether the TX FIFO is empty
     fn is_tx_fifo_empty(&self) -> bool {
-        self.info.regs().mfsr().read().txcount() == 0
+        self.registers().tx_fifo_empty()
     }
 
     /// Checks whether the TX FIFO or if there is an error condition active.
@@ -510,20 +479,17 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     /// Checks whether the RX FIFO is empty.
     fn is_rx_fifo_empty(&self) -> bool {
-        self.info.regs().mfsr().read().rxcount() == 0
+        self.registers().rx_fifo_empty()
     }
 
     /// Parses the controller status producing an
     /// appropriate `Result<(), Error>` variant.
-    fn parse_status(&self, msr: &Msr) -> Result<(), IOError> {
-        if msr.ndf() == Ndf::IntYes {
-            Err(IOError::AddressNack)
-        } else if msr.alf() == Alf::IntYes {
-            Err(IOError::ArbitrationLoss)
-        } else if msr.fef() == MsrFef::IntYes {
-            Err(IOError::FifoError)
-        } else {
-            Ok(())
+    fn parse_status(&self, status: ControllerStatus) -> Result<(), IOError> {
+        match status.error() {
+            Some(ControllerStatusError::AddressNack) => Err(IOError::AddressNack),
+            Some(ControllerStatusError::ArbitrationLoss) => Err(IOError::ArbitrationLoss),
+            Some(ControllerStatusError::Fifo) => Err(IOError::FifoError),
+            None => Ok(()),
         }
     }
 
@@ -532,10 +498,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     ///
     /// Will also send a STOP command if the tx_fifo is empty.
     fn status_and_act(&self) -> Result<(), IOError> {
-        let msr = self.info.regs().msr().read();
-        self.info.regs().msr().write(|w| *w = msr);
-
-        let status = self.parse_status(&msr);
+        let status = self.parse_status(self.registers().take_status());
 
         if let Err(IOError::AddressNack) = status {
             // According to the Reference Manual, section 40.7.1.5
@@ -546,7 +509,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             //
             // If neither of those conditions is true, we will send a
             // STOP ourselves.
-            if !self.info.regs().mcfgr1().read().autostop() && self.is_tx_fifo_empty() {
+            if !self.registers().automatic_stop_enabled() && self.is_tx_fifo_empty() {
                 self.remediation();
             }
         }
@@ -557,27 +520,15 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Reads and parses the controller status producing an
     /// appropriate `Result<(), Error>` variant.
     fn status(&self) -> Result<(), IOError> {
-        self.parse_status(&self.info.regs().msr().read())
+        self.parse_status(self.registers().read_status())
     }
 
     /// Inserts the given command into the outgoing FIFO.
     ///
     /// Caller must ensure there is space in the FIFO for the new
     /// command.
-    fn send_cmd(&self, cmd: Cmd, data: u8) {
-        #[cfg(feature = "defmt")]
-        defmt::trace!(
-            "Sending cmd '{}' ({}) with data '{:08x}' MSR: {:08x}",
-            cmd,
-            cmd as u8,
-            data,
-            self.info.regs().msr().read()
-        );
-
-        self.info.regs().mtdr().write(|w| {
-            w.set_data(data);
-            w.set_cmd(cmd);
-        });
+    fn send_cmd(&self, command: ControllerCommand, data: u8) {
+        self.registers().write_command(command, data);
     }
 
     /// Prepares an appropriate Start condition on bus by issuing a
@@ -595,7 +546,14 @@ impl<'d, M: Mode> I2c<'d, M> {
         while self.is_tx_fifo_full() {}
 
         let addr_rw = address << 1 | if read { 1 } else { 0 };
-        self.send_cmd(if self.is_hs { Cmd::START_HS } else { Cmd::START }, addr_rw);
+        self.send_cmd(
+            if self.is_hs {
+                ControllerCommand::START_HS
+            } else {
+                ControllerCommand::START
+            },
+            addr_rw,
+        );
 
         // Wait for TxFIFO to be drained
         while !self.is_tx_fifo_empty_or_error() {}
@@ -614,7 +572,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         // Wait until we have space in the TxFIFO
         while self.is_tx_fifo_full() {}
 
-        self.send_cmd(Cmd::STOP, 0);
+        self.send_cmd(ControllerCommand::STOP, 0);
 
         // Wait for TxFIFO to be drained
         while !self.is_tx_fifo_empty_or_error() {}
@@ -633,13 +591,13 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Wait until we have space in the TxFIFO
             while self.is_tx_fifo_full() {}
 
-            self.send_cmd(Cmd::RECEIVE, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
             for byte in chunk.iter_mut() {
                 // Wait until there's data in the RxFIFO
                 while self.is_rx_fifo_empty() {}
 
-                *byte = self.info.regs().mrdr().read().data();
+                *byte = self.registers().read_data();
             }
         }
 
@@ -676,7 +634,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Wait until we have space in the TxFIFO
             while self.is_tx_fifo_full() {}
 
-            self.send_cmd(Cmd::TRANSMIT, *byte);
+            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
         }
 
         if send_stop == SendStop::Yes {
@@ -776,23 +734,11 @@ where
     Self: AsyncEngine,
 {
     fn enable_rx_ints(&self) {
-        self.info.regs().mier().write(|w| {
-            w.set_rdie(true);
-            w.set_ndie(true);
-            w.set_alie(true);
-            w.set_feie(true);
-            w.set_pltie(true);
-        });
+        self.registers().enable_receive_interrupts();
     }
 
     fn enable_tx_ints(&self) {
-        self.info.regs().mier().write(|w| {
-            w.set_tdie(true);
-            w.set_ndie(true);
-            w.set_alie(true);
-            w.set_feie(true);
-            w.set_pltie(true);
-        });
+        self.registers().enable_transmit_interrupts();
     }
 
     /// Schedule sending a START command and await it being pulled from the FIFO.
@@ -805,7 +751,14 @@ where
 
         // send the start command
         let addr_rw = address << 1 | if read { 1 } else { 0 };
-        self.send_cmd(if self.is_hs { Cmd::START_HS } else { Cmd::START }, addr_rw);
+        self.send_cmd(
+            if self.is_hs {
+                ControllerCommand::START_HS
+            } else {
+                ControllerCommand::START
+            },
+            addr_rw,
+        );
 
         self.info
             .wait_cell()
@@ -825,7 +778,7 @@ where
 
     async fn async_stop(&self) -> Result<(), IOError> {
         // send the stop command
-        self.send_cmd(Cmd::STOP, 0);
+        self.send_cmd(ControllerCommand::STOP, 0);
 
         self.info
             .wait_cell()
@@ -1016,7 +969,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             let on_drop = OnDrop::new(|| self.remediation());
 
             // send receive command
-            self.send_cmd(Cmd::RECEIVE, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
             self.info
                 .wait_cell()
@@ -1041,7 +994,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     .await
                     .map_err(|_| IOError::ReadFail)?;
 
-                *byte = self.info.regs().mrdr().read().data();
+                *byte = self.registers().read_data();
             }
 
             // defuse it; we'll re-arm on the next chunk if any.
@@ -1082,7 +1035,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
 
         for byte in write {
             // initiate transmit
-            self.send_cmd(Cmd::TRANSMIT, *byte);
+            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
 
             self.info
                 .wait_cell()
@@ -1203,7 +1156,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             });
 
             // send receive command
-            self.send_cmd(Cmd::RECEIVE, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
             let peri_addr = self.info.regs().mrdr().as_ptr() as *const u8;
 

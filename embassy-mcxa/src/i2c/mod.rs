@@ -10,6 +10,7 @@ use crate::gpio::GpioPin;
 use crate::{interrupt, pac};
 
 pub mod controller;
+mod controller_registers;
 pub mod target;
 
 pub(crate) mod sealed {
