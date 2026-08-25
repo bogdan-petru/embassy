@@ -374,6 +374,15 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.info.regs().scfgr1().modify(|w| {
                 w.set_rxstall(true);
                 w.set_txdstall(true);
+                // Stretch SCL during each address ACK until firmware
+                // acknowledges the address. Without this, address events
+                // do not queue: if firmware is delayed (busy system, slow
+                // ISR entry) past a complete transaction plus the next
+                // transaction's address, SASR is overwritten and the
+                // earlier transaction's event is silently lost — observed
+                // on FRDM-MCXA577 as a write dropped in its entirety when
+                // the target ran with artificial interrupt latency.
+                w.set_adrstall(true);
                 w.set_gcen(config.general_call.into());
                 w.set_saen(config.smbus_alert.into());
             });
@@ -653,7 +662,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.clear_status();
 
         for byte in buf.iter_mut() {
-            // Wait until we have data to read
+            // Wait until we have data to read, or the transfer ends.
             let ssr = loop {
                 let ssr = self.info.regs().ssr().read();
                 if ssr.rdf() || ssr.sdf() || ssr.rsf() {
@@ -661,6 +670,13 @@ impl<'d, M: Mode> I2c<'d, M> {
                 }
             };
 
+            // Drain pending data before honoring any end-of-transfer
+            // flag (see the async twin for the rationale).
+            if ssr.rdf() {
+                *byte = self.info.regs().srdr().read().data();
+                count += 1;
+                continue;
+            }
             if ssr.sdf() {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("Early stop of Target Receive routine. STOP received");
@@ -671,9 +687,6 @@ impl<'d, M: Mode> I2c<'d, M> {
                 defmt::trace!("Early stop of Target Receive routine. Repeated-start received");
                 return Ok(WriteStatus::Restarted(count));
             }
-
-            *byte = self.info.regs().srdr().read().data();
-            count += 1;
         }
 
         Ok(WriteStatus::BufferFull(count))
@@ -1201,32 +1214,41 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         self.clear_status();
 
         for byte in buf.iter_mut() {
-            self.info
-                .wait_cell()
-                .wait_for(|| {
-                    self.enable_rx_ints();
-                    let ssr = self.info.regs().ssr().read();
-                    ssr.rdf() || ssr.sdf() || ssr.rsf()
-                })
-                .await
-                .map_err(|_| IOError::Other)?;
+            loop {
+                self.info
+                    .wait_cell()
+                    .wait_for(|| {
+                        self.enable_rx_ints();
+                        let ssr = self.info.regs().ssr().read();
+                        ssr.rdf() || ssr.sdf() || ssr.rsf()
+                    })
+                    .await
+                    .map_err(|_| IOError::Other)?;
 
-            let ssr = self.info.regs().ssr().read();
-            if ssr.sdf() {
-                #[cfg(feature = "defmt")]
-                defmt::trace!("Early stop of Target Receive routine. STOP received");
-                self.reset_fifos();
-                return Ok(WriteStatus::Stopped(count));
+                let ssr = self.info.regs().ssr().read();
+                // Drain pending data before honoring any end-of-transfer
+                // flag: when firmware enters late (delayed ISR entry on a
+                // busy system), the controller may already have issued
+                // the STOP while received bytes still sit in the FIFO,
+                // and returning on SDF first would silently drop them.
+                if ssr.rdf() {
+                    *byte = self.info.regs().srdr().read().data();
+                    count += 1;
+                    break;
+                }
+                if ssr.sdf() {
+                    #[cfg(feature = "defmt")]
+                    defmt::trace!("Early stop of Target Receive routine. STOP received");
+                    self.reset_fifos();
+                    return Ok(WriteStatus::Stopped(count));
+                }
+                if ssr.rsf() {
+                    #[cfg(feature = "defmt")]
+                    defmt::trace!("Early stop of Target Receive routine. Repeated-start received");
+                    self.reset_fifos();
+                    return Ok(WriteStatus::Restarted(count));
+                }
             }
-            if ssr.rsf() {
-                #[cfg(feature = "defmt")]
-                defmt::trace!("Early stop of Target Receive routine. Repeated-start received");
-                self.reset_fifos();
-                return Ok(WriteStatus::Restarted(count));
-            }
-
-            *byte = self.info.regs().srdr().read().data();
-            count += 1;
         }
 
         Ok(WriteStatus::BufferFull(count))

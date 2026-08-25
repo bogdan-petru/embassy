@@ -559,7 +559,19 @@ impl<'d, M: Mode> I2c<'d, M> {
         while !self.is_tx_fifo_empty_or_error() {}
 
         // Check controller status
-        self.status_and_act()
+        let res = self.status_and_act();
+
+        // `status_and_act` recovers a NACKed start itself, but a start
+        // that failed with arbitration loss or a FIFO error leaves the
+        // controller halted with the aborted commands still queued; a
+        // subsequent transfer would then spin forever waiting for data
+        // that never arrives. Recover here so a failed start always
+        // returns with the controller in a clean state.
+        if matches!(res, Err(IOError::ArbitrationLoss) | Err(IOError::FifoError)) {
+            self.remediation();
+        }
+
+        res
     }
 
     /// Prepares a Stop condition on the bus.
@@ -585,23 +597,51 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        for chunk in read.chunks_mut(256) {
+        let nchunks = read.len().div_ceil(256);
+        for (idx, chunk) in read.chunks_mut(256).enumerate() {
+            // NOTE: start() is outside the recovery guard below —
+            // `status_and_act` inside it already remediates a NACK, and
+            // remediating twice corrupts the controller state for the
+            // next transaction (see the async path's OnDrop note).
             self.start(address, true)?;
 
-            // Wait until we have space in the TxFIFO
-            while self.is_tx_fifo_full() {}
+            // Mirror the async path's OnDrop: an error past this point
+            // aborts mid-transaction, and without recovery the bus is
+            // left in a state that fails the next transfer (observed as
+            // FifoError when a retry followed an arbitration loss).
+            let mut drain = || -> Result<(), IOError> {
+                // Wait until we have space in the TxFIFO
+                while self.is_tx_fifo_full() {}
 
-            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
-            for byte in chunk.iter_mut() {
-                // Wait until there's data in the RxFIFO. An error (NACK,
-                // arbitration loss, FIFO error) means no more data will
-                // arrive, so bail out instead of spinning forever.
-                while self.is_rx_fifo_empty() {
-                    self.status()?;
+                for byte in chunk.iter_mut() {
+                    // Wait until there's data in the RxFIFO. An error
+                    // (NACK, arbitration loss, FIFO error) means no more
+                    // data will arrive, so bail out instead of spinning
+                    // forever.
+                    while self.is_rx_fifo_empty() {
+                        self.status()?;
+                    }
+
+                    *byte = self.registers().read_data();
                 }
 
-                *byte = self.registers().read_data();
+                // End every non-final chunk with a STOP and address the
+                // next chunk fresh. The controller auto-NACKs the last
+                // byte of a consumed RECEIVE command (no adjacent receive
+                // queued), and a repeated START issued right after that
+                // NACK is not reliably accepted: the blocking path hit
+                // FEF at the 256-byte seam. A STOP/START boundary avoids
+                // depending on that marginal state entirely.
+                if idx + 1 < nchunks {
+                    self.stop()?;
+                }
+                Ok(())
+            };
+            if let Err(e) = drain() {
+                self.remediation();
+                return Err(e);
             }
         }
 
@@ -959,7 +999,8 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        for chunk in read.chunks_mut(256) {
+        let nchunks = read.len().div_ceil(256);
+        for (idx, chunk) in read.chunks_mut(256).enumerate() {
             self.async_start(address, true).await?;
 
             // perform corrective action if the future is dropped or an
@@ -1008,6 +1049,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     // flag cleared in between, loop back and wait again.
                     self.status()?;
                 }
+            }
+
+            // End every non-final chunk with a STOP (see the blocking
+            // path): a repeated START right after the auto-NACK of a
+            // consumed RECEIVE command is not reliably accepted.
+            if idx + 1 < nchunks {
+                self.async_stop().await?;
             }
 
             // defuse it; we'll re-arm on the next chunk if any.
@@ -1152,7 +1200,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        for chunk in read.chunks_mut(256) {
+        let nchunks = read.len().div_ceil(256);
+        for (idx, chunk) in read.chunks_mut(256).enumerate() {
             self.async_start(address, true).await?;
 
             // perform corrective action if the future is dropped or an
@@ -1225,6 +1274,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             unsafe {
                 self.mode.rx_dma.disable_request();
                 self.mode.rx_dma.clear_done();
+            }
+
+            // End every non-final chunk with a STOP (see the blocking
+            // path): a repeated START right after the auto-NACK of a
+            // consumed RECEIVE command is not reliably accepted.
+            if idx + 1 < nchunks {
+                self.async_stop().await?;
             }
 
             // defuse it; we'll re-arm on the next chunk if any.
