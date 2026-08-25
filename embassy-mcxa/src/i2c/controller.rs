@@ -594,8 +594,12 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
             for byte in chunk.iter_mut() {
-                // Wait until there's data in the RxFIFO
-                while self.is_rx_fifo_empty() {}
+                // Wait until there's data in the RxFIFO. An error (NACK,
+                // arbitration loss, FIFO error) means no more data will
+                // arrive, so bail out instead of spinning forever.
+                while self.is_rx_fifo_empty() {
+                    self.status()?;
+                }
 
                 *byte = self.registers().read_data();
             }
@@ -983,18 +987,27 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                 .map_err(|_| IOError::Other)?;
 
             for byte in chunk.iter_mut() {
-                self.info
-                    .wait_cell()
-                    .wait_for(|| {
-                        // enable interrupts
-                        self.enable_rx_ints();
-                        // if the rx FIFO is not empty, we need to read a byte
-                        !self.is_rx_fifo_empty()
-                    })
-                    .await
-                    .map_err(|_| IOError::ReadFail)?;
+                loop {
+                    self.info
+                        .wait_cell()
+                        .wait_for(|| {
+                            // enable interrupts
+                            self.enable_rx_ints();
+                            // wake on data, or on an error that means no
+                            // more data will ever arrive
+                            !self.is_rx_fifo_empty() || self.status().is_err()
+                        })
+                        .await
+                        .map_err(|_| IOError::ReadFail)?;
 
-                *byte = self.registers().read_data();
+                    if !self.is_rx_fifo_empty() {
+                        *byte = self.registers().read_data();
+                        break;
+                    }
+                    // No data: surface the error that woke us. If the
+                    // flag cleared in between, loop back and wait again.
+                    self.status()?;
+                }
             }
 
             // defuse it; we'll re-arm on the next chunk if any.
@@ -1185,16 +1198,25 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 self.mode.rx_dma.enable_request();
             }
 
-            // Wait for completion asynchronously
+            // Wait for completion asynchronously — or for a bus error
+            // (NACK, arbitration loss, FIFO error) that stops the
+            // transfer, in which case the DMA would never complete and
+            // waiting on it alone would hang forever.
             core::future::poll_fn(|cx| {
                 let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
                 if self.mode.rx_dma.is_done() {
-                    core::task::Poll::Ready(())
-                } else {
-                    core::task::Poll::Pending
+                    return core::task::Poll::Ready(Ok(()));
                 }
+                let _ = self.info.wait_cell().poll_wait(cx);
+                // The interrupt handler disables MIER on wake; re-arm the
+                // error sources for the next wait.
+                self.registers().enable_error_interrupts();
+                if let Err(e) = self.status() {
+                    return core::task::Poll::Ready(Err(e));
+                }
+                core::task::Poll::Pending
             })
-            .await;
+            .await?;
 
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
@@ -1271,16 +1293,25 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 self.mode.tx_dma.enable_request();
             }
 
-            // Wait for completion asynchronously
+            // Wait for completion asynchronously — or for a bus error
+            // (NACK, arbitration loss, FIFO error) that stops the
+            // transfer, in which case the DMA would never complete and
+            // waiting on it alone would hang forever.
             core::future::poll_fn(|cx| {
                 let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
                 if self.mode.tx_dma.is_done() {
-                    core::task::Poll::Ready(())
-                } else {
-                    core::task::Poll::Pending
+                    return core::task::Poll::Ready(Ok(()));
                 }
+                let _ = self.info.wait_cell().poll_wait(cx);
+                // The interrupt handler disables MIER on wake; re-arm the
+                // error sources for the next wait.
+                self.registers().enable_error_interrupts();
+                if let Err(e) = self.status() {
+                    return core::task::Poll::Ready(Err(e));
+                }
+                core::task::Poll::Pending
             })
-            .await;
+            .await?;
 
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();

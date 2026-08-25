@@ -301,6 +301,8 @@ pub enum Event {
 /// I2C Target Driver.
 pub struct I2c<'d, M: Mode> {
     info: &'static Info,
+    /// Peripheral input clock frequency in Hz, captured at construction.
+    freq: u32,
     _scl: Peri<'d, AnyPin>,
     _sda: Peri<'d, AnyPin>,
     smbus_alert: Status,
@@ -337,6 +339,7 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         let inst = Self {
             info: T::info(),
+            freq: parts.freq,
             _scl,
             _sda,
             smbus_alert: config.smbus_alert.clone(),
@@ -374,6 +377,26 @@ impl<'d, M: Mode> I2c<'d, M> {
                 w.set_gcen(config.general_call.into());
                 w.set_saen(config.smbus_alert.into());
             });
+
+            // Gate the target's SDA transitions to the SCL falling edge.
+            //
+            // With DATAVD=0 the target can change SDA as soon as its state
+            // machine advances. At the address-ACK → first-data-bit
+            // boundary, when transmit data is already available (no
+            // TXDSTALL stretch needed), that lets it release its ACK drive
+            // while SCL is still high. If the first data bit is 1, SDA
+            // then rises during SCL-high, which the controller correctly
+            // detects as a STOP condition it did not generate and reports
+            // as arbitration loss. Observed on FRDM-MCXA577: reads whose
+            // first data byte has the MSB set failed with ArbitrationLoss
+            // on roughly every other transfer; DATAVD > 0 eliminates it.
+            //
+            // Empirically ~250ns is not enough on FRDM-MCXA577; 1us
+            // eliminates the failure completely. The target stretches SCL
+            // as needed to honor the delay, so faster bus speeds remain
+            // correct, just marginally slower per byte.
+            let datavd = (self.freq / 1_000_000).clamp(1, 63) as u8;
+            self.info.regs().scfgr2().modify(|w| w.set_datavd(datavd));
 
             // Configure address matching
             match config.address {

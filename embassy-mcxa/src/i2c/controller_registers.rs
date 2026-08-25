@@ -84,6 +84,19 @@ impl ControllerRegisters {
         true
     }
 
+    /// Enable only the error interrupt sources (NACK, arbitration loss,
+    /// FIFO error, pin-low timeout). Used while DMA moves the data, where
+    /// TDF/RDF service the DMA engine but an error still needs to wake
+    /// the waiting task.
+    pub(super) fn enable_error_interrupts(&self) {
+        self.regs.mier().write(|w| {
+            w.set_ndie(true);
+            w.set_alie(true);
+            w.set_feie(true);
+            w.set_pltie(true);
+        });
+    }
+
     pub(super) fn enable_receive_interrupts(&self) {
         self.regs.mier().write(|w| {
             w.set_rdie(true);
