@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-semihosting = "0.5"
 cortex-m-rt = { version = "0.7", features = ["set-sp", "set-vtor"] }
 crc = "3.4.0"
 critical-section = "1.2.0"
