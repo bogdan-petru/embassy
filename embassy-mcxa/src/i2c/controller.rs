@@ -67,7 +67,9 @@ use core::marker::PhantomData;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::controller_registers::{ControllerCommand, ControllerRegisters, ControllerStatus, ControllerStatusError};
+use super::controller_registers::{
+    ControllerCommand, ControllerRegisters, ControllerStatus, ControllerStatusError, RxStep, TxStep,
+};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
@@ -119,6 +121,16 @@ pub enum IOError {
 impl From<crate::dma::InvalidParameters> for IOError {
     fn from(_value: crate::dma::InvalidParameters) -> Self {
         IOError::Other
+    }
+}
+
+impl From<ControllerStatusError> for IOError {
+    fn from(value: ControllerStatusError) -> Self {
+        match value {
+            ControllerStatusError::AddressNack => IOError::AddressNack,
+            ControllerStatusError::ArbitrationLoss => IOError::ArbitrationLoss,
+            ControllerStatusError::Fifo => IOError::FifoError,
+        }
     }
 }
 
@@ -429,18 +441,24 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     fn remediation(&self) {
         #[cfg(feature = "defmt")]
-        defmt::trace!("Future dropped, recovering controller",);
+        defmt::trace!("Recovering controller",);
 
-        // Send a STOP. After an address NACK with empty TX FIFO and
-        // autostop disabled, this releases the bus.
+        // Recovery must not re-enter the fault-aware wait paths that call
+        // it (`wait_tx_room` -> `status_and_act` -> here): with a fault
+        // that keeps re-latching, that cycle recurses until the stack
+        // overflows. Everything below is self-contained.
         //
-        // Important: `stop()` busy-waits on `is_tx_fifo_empty_or_error`,
-        // which returns true on *any* error (e.g., FEF raised because
-        // the master was already in idle when STOP was queued). In
-        // that case the STOP command may still be sitting in the TX
-        // FIFO, ready to confuse the next transaction. Always reset
-        // the FIFOs after the STOP attempt to guarantee a clean slate.
-        let _ = self.stop();
+        // Reset the FIFOs first: this drops whatever the aborted transfer
+        // left queued and guarantees room for the recovery STOP. After an
+        // address NACK with autostop disabled, the STOP releases the bus.
+        self.reset_fifos();
+        self.registers().write_command(ControllerCommand::Stop, 0);
+
+        // Wait for the STOP to be consumed. `tx_settled` also returns on
+        // a fault, so this cannot spin forever — but in that case the
+        // STOP may still sit in the TX FIFO, ready to confuse the next
+        // transaction. Reset again to guarantee a clean slate.
+        while !self.registers().tx_settled() {}
         self.reset_fifos();
 
         // Clear any residual MSR flags raised by the recovery STOP
@@ -462,33 +480,34 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().clear_all_status();
     }
 
-    /// Checks whether the TX FIFO is full
-    fn is_tx_fifo_full(&self) -> bool {
-        self.registers().tx_fifo_full()
-    }
-
-    /// Checks whether the TX FIFO is empty
-    fn is_tx_fifo_empty(&self) -> bool {
-        self.registers().tx_fifo_empty()
-    }
-
-    /// Checks whether the TX FIFO or if there is an error condition active.
-    fn is_tx_fifo_empty_or_error(&self) -> bool {
-        self.is_tx_fifo_empty() || self.status().is_err()
-    }
-
-    /// Checks whether the RX FIFO is empty.
-    fn is_rx_fifo_empty(&self) -> bool {
-        self.registers().rx_fifo_empty()
+    /// Blocking wait for room in the command FIFO, honoring faults: a
+    /// halted transfer never frees space, so a data-only wait here would
+    /// spin forever. On a fault, the standard classification/recovery
+    /// path runs before the error is returned.
+    fn wait_tx_room(&self) -> Result<(), IOError> {
+        loop {
+            match self.registers().tx_room_step() {
+                Some(TxStep::Room) => return Ok(()),
+                Some(TxStep::Fault(_)) => {
+                    let res = self.status_and_act();
+                    if let Err(e) = res {
+                        if matches!(e, IOError::ArbitrationLoss | IOError::FifoError) {
+                            self.remediation();
+                        }
+                        return Err(e);
+                    }
+                    // The flag cleared concurrently; keep waiting.
+                }
+                None => {}
+            }
+        }
     }
 
     /// Parses the controller status producing an
     /// appropriate `Result<(), Error>` variant.
     fn parse_status(&self, status: ControllerStatus) -> Result<(), IOError> {
         match status.error() {
-            Some(ControllerStatusError::AddressNack) => Err(IOError::AddressNack),
-            Some(ControllerStatusError::ArbitrationLoss) => Err(IOError::ArbitrationLoss),
-            Some(ControllerStatusError::Fifo) => Err(IOError::FifoError),
+            Some(e) => Err(e.into()),
             None => Ok(()),
         }
     }
@@ -509,7 +528,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             //
             // If neither of those conditions is true, we will send a
             // STOP ourselves.
-            if !self.registers().automatic_stop_enabled() && self.is_tx_fifo_empty() {
+            if self.registers().needs_manual_stop_after_nack() {
                 self.remediation();
             }
         }
@@ -543,20 +562,20 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
 
         // Wait until we have space in the TxFIFO
-        while self.is_tx_fifo_full() {}
+        self.wait_tx_room()?;
 
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
             if self.is_hs {
-                ControllerCommand::START_HS
+                ControllerCommand::StartHs
             } else {
-                ControllerCommand::START
+                ControllerCommand::Start
             },
             addr_rw,
         );
 
         // Wait for TxFIFO to be drained
-        while !self.is_tx_fifo_empty_or_error() {}
+        while !self.registers().tx_settled() {}
 
         // Check controller status
         let res = self.status_and_act();
@@ -582,12 +601,12 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// sent.
     fn stop(&self) -> Result<(), IOError> {
         // Wait until we have space in the TxFIFO
-        while self.is_tx_fifo_full() {}
+        self.wait_tx_room()?;
 
-        self.send_cmd(ControllerCommand::STOP, 0);
+        self.send_cmd(ControllerCommand::Stop, 0);
 
         // Wait for TxFIFO to be drained
-        while !self.is_tx_fifo_empty_or_error() {}
+        while !self.registers().tx_settled() {}
 
         self.status_and_act()
     }
@@ -611,20 +630,21 @@ impl<'d, M: Mode> I2c<'d, M> {
             // FifoError when a retry followed an arbitration loss).
             let mut drain = || -> Result<(), IOError> {
                 // Wait until we have space in the TxFIFO
-                while self.is_tx_fifo_full() {}
+                self.wait_tx_room()?;
 
-                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+                self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
 
                 for byte in chunk.iter_mut() {
-                    // Wait until there's data in the RxFIFO. An error
-                    // (NACK, arbitration loss, FIFO error) means no more
-                    // data will arrive, so bail out instead of spinning
-                    // forever.
-                    while self.is_rx_fifo_empty() {
-                        self.status()?;
-                    }
-
-                    *byte = self.registers().read_data();
+                    // Receive one byte, or bail out on a fault (NACK,
+                    // arbitration loss, FIFO error): no more data will
+                    // arrive, and a data-only wait would spin forever.
+                    *byte = loop {
+                        match self.registers().rx_step() {
+                            Some(RxStep::Byte(b)) => break b,
+                            Some(RxStep::Fault(e)) => return Err(e.into()),
+                            None => {}
+                        }
+                    };
                 }
 
                 // End every non-final chunk with a STOP and address the
@@ -676,9 +696,9 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         for byte in write {
             // Wait until we have space in the TxFIFO
-            while self.is_tx_fifo_full() {}
+            self.wait_tx_room()?;
 
-            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+            self.send_cmd(ControllerCommand::Transmit, *byte);
         }
 
         if send_stop == SendStop::Yes {
@@ -797,9 +817,9 @@ where
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
             if self.is_hs {
-                ControllerCommand::START_HS
+                ControllerCommand::StartHs
             } else {
-                ControllerCommand::START
+                ControllerCommand::Start
             },
             addr_rw,
         );
@@ -810,7 +830,7 @@ where
                 // enable interrupts
                 self.enable_tx_ints();
                 // if the command FIFO is empty, we're done sending start
-                self.is_tx_fifo_empty_or_error()
+                self.registers().tx_settled()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -822,7 +842,7 @@ where
 
     async fn async_stop(&self) -> Result<(), IOError> {
         // send the stop command
-        self.send_cmd(ControllerCommand::STOP, 0);
+        self.send_cmd(ControllerCommand::Stop, 0);
 
         self.info
             .wait_cell()
@@ -830,7 +850,7 @@ where
                 // enable interrupts
                 self.enable_tx_ints();
                 // if the command FIFO is empty, we're done sending stop
-                self.is_tx_fifo_empty_or_error()
+                self.registers().tx_settled()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -1014,7 +1034,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             let on_drop = OnDrop::new(|| self.remediation());
 
             // send receive command
-            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
 
             self.info
                 .wait_cell()
@@ -1022,7 +1042,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     // enable interrupts
                     self.enable_tx_ints();
                     // if the command FIFO is empty, we're done sending start
-                    self.is_tx_fifo_empty_or_error()
+                    self.registers().tx_settled()
                 })
                 .await
                 .map_err(|_| IOError::Other)?;
@@ -1034,20 +1054,23 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                         .wait_for(|| {
                             // enable interrupts
                             self.enable_rx_ints();
-                            // wake on data, or on an error that means no
+                            // wake on data, or on a fault that means no
                             // more data will ever arrive
-                            !self.is_rx_fifo_empty() || self.status().is_err()
+                            self.registers().rx_ready()
                         })
                         .await
                         .map_err(|_| IOError::ReadFail)?;
 
-                    if !self.is_rx_fifo_empty() {
-                        *byte = self.registers().read_data();
-                        break;
+                    match self.registers().rx_step() {
+                        Some(RxStep::Byte(b)) => {
+                            *byte = b;
+                            break;
+                        }
+                        // Surface the fault that woke us. If the flag
+                        // cleared in between, loop back and wait again.
+                        Some(RxStep::Fault(e)) => return Err(e.into()),
+                        None => {}
                     }
-                    // No data: surface the error that woke us. If the
-                    // flag cleared in between, loop back and wait again.
-                    self.status()?;
                 }
             }
 
@@ -1096,7 +1119,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
 
         for byte in write {
             // initiate transmit
-            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+            self.send_cmd(ControllerCommand::Transmit, *byte);
 
             self.info
                 .wait_cell()
@@ -1104,7 +1127,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     // enable interrupts
                     self.enable_tx_ints();
                     // if the tx FIFO is empty, we're done transmiting
-                    self.is_tx_fifo_empty_or_error()
+                    self.registers().tx_settled()
                 })
                 .await
                 .map_err(|_| IOError::WriteFail)?;
@@ -1214,13 +1237,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // the controller state for the next transaction.
             let on_drop = OnDrop::new(|| {
                 self.remediation();
-                self.info.regs().mder().modify(|w| w.set_rdde(false));
+                self.registers().set_rx_dma(false);
             });
 
             // send receive command
-            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
 
-            let peri_addr = self.info.regs().mrdr().as_ptr() as *const u8;
+            let peri_addr = self.registers().rx_data_ptr();
 
             // _rx_dma is guaranteed to be Some
             unsafe {
@@ -1241,7 +1264,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 )?;
 
                 // Enable I2C RX DMA request
-                self.info.regs().mder().modify(|w| w.set_rdde(true));
+                self.registers().set_rx_dma(true);
 
                 // Enable DMA channel request
                 self.mode.rx_dma.enable_request();
@@ -1270,7 +1293,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
             // Cleanup
-            self.info.regs().mder().modify(|w| w.set_rdde(false));
+            self.registers().set_rx_dma(false);
             unsafe {
                 self.mode.rx_dma.disable_request();
                 self.mode.rx_dma.clear_done();
@@ -1319,11 +1342,11 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
             self.remediation();
-            self.info.regs().mder().modify(|w| w.set_tdde(false));
+            self.registers().set_tx_dma(false);
         });
 
         for chunk in write.chunks(DMA_MAX_TRANSFER_SIZE) {
-            let peri_addr = self.info.regs().mtdr().as_ptr() as *mut u8;
+            let peri_addr = self.registers().tx_data_ptr();
 
             unsafe {
                 // Clean up channel state
@@ -1343,7 +1366,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 )?;
 
                 // Enable I2C TX DMA request
-                self.info.regs().mder().modify(|w| w.set_tdde(true));
+                self.registers().set_tx_dma(true);
 
                 // Enable DMA channel request
                 self.mode.tx_dma.enable_request();
@@ -1372,7 +1395,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
             // Cleanup
-            self.info.regs().mder().modify(|w| w.set_tdde(false));
+            self.registers().set_tx_dma(false);
             unsafe {
                 self.mode.tx_dma.disable_request();
                 self.mode.tx_dma.clear_done();

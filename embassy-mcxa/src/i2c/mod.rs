@@ -11,7 +11,9 @@ use crate::{interrupt, pac};
 
 pub mod controller;
 mod controller_registers;
+mod lpi2c_regs;
 pub mod target;
+mod target_registers;
 
 pub(crate) mod sealed {
     /// Seal a trait

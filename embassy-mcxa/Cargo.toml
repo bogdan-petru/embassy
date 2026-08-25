@@ -33,6 +33,7 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core", "inlin
 # If you would like "device" to be an optional feature, please open an issue.
 cortex-m-rt = { version = "0.7", features = ["device"] }
 critical-section = "1.2.0"
+tock-registers = "0.9"
 defmt = { version = "1.0", optional = true }
 embassy-embedded-hal = { version = "0.6.0", path = "../embassy-embedded-hal" }
 embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
