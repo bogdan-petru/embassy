@@ -32,12 +32,18 @@ bind_interrupts!(
 );
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = Config::default();
     config.clock_cfg.sirc.fro_lf_div = Div8::from_divisor(1);
 
     let p = hal::init(config);
     defmt::info!("i2c-twoboard-target: serving 0x2a on LPI2C3 (P3_21 SCL / P3_20 SDA)");
+
+    // Constant light interrupt-latency interference (~0.25 ms blocked
+    // every ~2 ms), so the whole suite exercises target-side ACK/stall
+    // handling under delayed ISR entry.
+    i2c_twoboard::interference::ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+    spawner.spawn(i2c_twoboard::interference::task(80_000, 2_000).unwrap());
 
     i2c_twoboard::target_task(p.LPI2C3, p.P3_21, p.P3_20, Irqs).await
 }

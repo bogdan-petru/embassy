@@ -5,15 +5,30 @@
 //! GND ↔ GND. The bus needs pull-ups to 3V3 on both lines.
 //!
 //! The target exposes a 32-byte RAM buffer at address 0x2A: controller
-//! writes store into the front of the buffer, controller reads return the
-//! current contents. The controller keeps an exact shadow model of that
-//! buffer and checks every byte it reads back against the model, so data
-//! integrity is verified end to end against real written payloads instead
-//! of a constant fill.
+//! writes store into the buffer in 32-byte chunks, controller reads serve
+//! the buffer cyclically for arbitrarily long transfers. The controller
+//! keeps an exact shadow model of that buffer and checks every byte it
+//! reads back against the model, so data integrity is verified end to end
+//! against real written payloads instead of a constant fill.
+//!
+//! Long-transfer coverage: reads of 255/256/257/260/300/512 bytes cross
+//! the driver's 256-byte RECEIVE-command chunk boundary, where the LPI2C
+//! controller would otherwise depend on back-to-back receive-command
+//! chaining (the documented silent-data-loss hazard for >256-byte reads).
+//! This driver instead issues each chunk as its own repeated-START
+//! transfer; these tests verify no byte is lost or duplicated across the
+//! seams, in the interrupt-async, DMA, and blocking paths separately.
+//!
+//! Interrupt-latency stress: `interference::task` periodically blocks all
+//! interrupts for ~0.5 ms. The controller binary gates it around
+//! `t_isr_latency`; the target binary runs a lighter version constantly,
+//! so every test also exercises target-side ACK/stall handling under
+//! delayed ISR entry (the target relies on RXSTALL/TXDSTALL stretching
+//! whenever firmware is late).
 //!
 //! The suite starts with a sync write that resets the target buffer to a
-//! known state, so it is deterministic across re-runs and across the
-//! async/DMA phases without resetting the target board.
+//! known state, so it is deterministic across re-runs and across phases
+//! without resetting the target board.
 //!
 //! Retry policy: `ArbitrationLoss` is retried up to 3 times per operation
 //! and counted — the FRDM-MCXA577 LPI2C flags a spurious arbitration loss
@@ -27,7 +42,10 @@ use embassy_embedded_hal::SetConfig;
 use embassy_mcxa as hal;
 use embassy_time::Instant;
 use hal::Peri;
-use hal::i2c::controller::{Config as CtrlConfig, IOError as ControllerIOError, SetupError, Speed};
+use hal::i2c::Blocking;
+use hal::i2c::controller::{
+    Config as CtrlConfig, I2c as ControllerI2c, IOError as ControllerIOError, SetupError, Speed,
+};
 use hal::i2c::target::{self, Address, Config as TargetConfig, InterruptHandler, ReadStatus, Request, WriteStatus};
 use hal::interrupt::typelevel::Binding;
 use hal::peripherals::{LPI2C3, P3_20, P3_21};
@@ -35,12 +53,43 @@ use hal::peripherals::{LPI2C3, P3_20, P3_21};
 pub const TARGET_ADDR: u8 = 0x2A;
 pub const BUF_LEN: usize = 32;
 const FILL: u8 = 0x55;
+/// An address nothing on the bus answers to.
+const BAD_ADDR: u8 = 0x33;
+/// Longest read the tests perform.
+const MAX_READ: usize = 512;
+
+/// Interrupt-latency interference: a task that periodically blocks all
+/// interrupts, delaying ISR entry to model a busy system.
+pub mod interference {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use embassy_time::Timer;
+
+    /// Gate for the interference task. When false the task idles.
+    pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// Spawn at executor startup. Every `period_us` microseconds, if
+    /// [`ACTIVE`] is set, holds a critical section for `spin` busy-wait
+    /// units (~3 CPU cycles each), blocking every interrupt handler for
+    /// the duration.
+    #[embassy_executor::task]
+    pub async fn task(spin: u32, period_us: u64) {
+        loop {
+            Timer::after_micros(period_us).await;
+            if ACTIVE.load(Ordering::Relaxed) {
+                critical_section::with(|_| cortex_m::asm::delay(spin));
+            }
+        }
+    }
+}
 
 /// Target task: a 32-byte RAM buffer served over I2C at [`TARGET_ADDR`].
 ///
-/// Writes overwrite the front of the buffer; reads return the current
-/// contents. The buffer persists between transactions, which is what lets
-/// the controller model it byte for byte.
+/// Reads serve the buffer cyclically for as long as the controller keeps
+/// clocking (`NeedMore` responds with the buffer again). Writes commit in
+/// 32-byte chunks, each overwriting the front of the buffer. The buffer
+/// persists between transactions, which is what lets the controller model
+/// it byte for byte.
 pub async fn target_task(
     peri: Peri<'static, LPI2C3>,
     scl: Peri<'static, P3_21>,
@@ -57,22 +106,34 @@ pub async fn target_task(
         let request = tgt.async_listen().await.unwrap();
         defmt::trace!("[T] event {}", request);
         match request {
-            Request::Read(addr) => {
-                let count = match tgt.async_respond_to_read(&buf).await.unwrap() {
-                    ReadStatus::Complete(n) | ReadStatus::NeedMore(n) | ReadStatus::EarlyStop(n) => n,
-                    _ => 0,
-                };
-                defmt::trace!("[T R {:02x}] -> {:02x}", addr, buf[..count]);
-            }
-            Request::Write(addr) => {
-                let mut scratch = [0u8; BUF_LEN];
-                let count = match tgt.async_respond_to_write(&mut scratch).await.unwrap() {
+            Request::Read(_) => loop {
+                defmt::trace!("[T] R serve {:02x}", buf[..2]);
+                match tgt.async_respond_to_read(&buf).await.unwrap() {
+                    // Controller ACKed the whole buffer and wants more:
+                    // serve it again (cyclic).
+                    ReadStatus::NeedMore(_) => continue,
+                    ReadStatus::Complete(_) | ReadStatus::EarlyStop(_) => break,
+                    _ => break,
+                }
+            },
+            Request::Write(_) => {
+                // One respond call per Write event, with headroom above
+                // the longest transfer the tests perform. `BufferFull` on
+                // an exact-multiple-length write is ambiguous ("full" vs
+                // "full and stopped"), and calling respond_to_write again
+                // would clear the pending STOP flag and misattribute the
+                // *next* transaction's bytes to this one.
+                let mut scratch = [0u8; MAX_READ + 1];
+                let n = match tgt.async_respond_to_write(&mut scratch).await.unwrap() {
                     WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
                     _ => 0,
                 };
-                let count = count.min(BUF_LEN);
-                buf[..count].copy_from_slice(&scratch[..count]);
-                defmt::trace!("[T W {:02x}] <- {:02x}", addr, buf[..count]);
+                let n = n.min(scratch.len());
+                // Commit in 32-byte chunks, mirroring `Model::write`.
+                for chunk in scratch[..n].chunks(BUF_LEN) {
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                }
+                defmt::trace!("[T] W {} -> {:02x}", n, buf[..2]);
             }
             _ => {}
         }
@@ -83,7 +144,8 @@ pub async fn target_task(
 ///
 /// Both `I2c<'_, Async>` and `I2c<'_, Dma<'_>>` implement
 /// `embedded_hal_async::i2c::I2c` and `SetConfig`, so the same suite runs
-/// against the interrupt-driven and the DMA controller.
+/// against the interrupt-driven and the DMA controller. The blocking
+/// controller runs a parallel battery via [`harness::run_blocking`].
 pub trait Controller:
     embedded_hal_async::i2c::I2c<Error = ControllerIOError> + SetConfig<Config = CtrlConfig, ConfigError = SetupError>
 {
@@ -100,12 +162,23 @@ pub struct Model {
 }
 
 impl Model {
+    /// Mirror of the target's write handling: data is committed in
+    /// 32-byte chunks, each overwriting the front of the buffer, so a
+    /// long write leaves the last chunk (plus any surviving tail of the
+    /// chunk before it) in place.
     fn write(&mut self, data: &[u8]) {
-        self.buf[..data.len()].copy_from_slice(data);
+        for chunk in data.chunks(BUF_LEN) {
+            self.buf[..chunk.len()].copy_from_slice(chunk);
+        }
     }
 
+    /// Expected read data: the target serves its buffer cyclically and
+    /// restarts from the front on every (repeated) START. The driver's
+    /// 256-byte read chunks are a multiple of the 32-byte buffer, so
+    /// position `i` of any read must equal `buf[i % BUF_LEN]` regardless
+    /// of where the chunk seams fall.
     fn check(&self, read: &[u8]) -> bool {
-        read == &self.buf[..read.len()]
+        read.iter().enumerate().all(|(i, b)| *b == self.buf[i % BUF_LEN])
     }
 }
 
@@ -155,30 +228,76 @@ pub mod harness {
         run_test!("burst", tests::t_burst(ctrl, &mut model, &mut stats));
         run_test!("edges", tests::t_edges(ctrl, &mut model, &mut stats));
         run_test!("speed_sweep", tests::t_speed_sweep(ctrl, &mut model, &mut stats));
+        run_test!("long_transfers", tests::t_long_transfers(ctrl, &mut model, &mut stats));
+        run_test!("isr_latency", tests::t_isr_latency(ctrl, &mut model, &mut stats));
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
 
         defmt::info!(
-            "== two-board i2c suite [{=str}] ALL PASS ({=u32} arbitration-loss retries) ==",
+            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF retries) ==",
             mode,
-            stats.alf_retries
+            stats.alf_retries,
+            stats.fef_retries
+        );
+    }
+
+    /// Blocking-path battery: the polled driver has no interrupt path, so
+    /// this focuses on transfer correctness — basic traffic, every long
+    /// length, consecutive reads, repeated-START, and NACK recovery.
+    /// Panics on failure, like [`run`].
+    pub fn run_blocking(mode: &str, ctrl: &mut ControllerI2c<'_, Blocking>) {
+        defmt::info!("== two-board i2c suite [{=str}] start ==", mode);
+
+        let mut model = Model { buf: [FILL; BUF_LEN] };
+        if ctrl.blocking_write(TARGET_ADDR, &model.buf).is_err() {
+            defmt::error!("[{=str}] sync write failed — is the target board up?", mode);
+            panic!("target sync failed");
+        }
+
+        let mut stats = tests::RetryStats::default();
+        let t0 = Instant::now();
+        match tests::t_blocking_battery(ctrl, &mut model, &mut stats) {
+            Ok(()) => defmt::info!("[{=str}] battery PASS ({=u64} ms)", mode, t0.elapsed().as_millis()),
+            Err(e) => {
+                defmt::error!("[{=str}] battery FAIL: {=str}", mode, e);
+                panic!("test failure");
+            }
+        }
+
+        defmt::info!(
+            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF retries) ==",
+            mode,
+            stats.alf_retries,
+            stats.fef_retries
         );
     }
 }
 
 pub mod tests {
+    use core::sync::atomic::Ordering;
+
     use super::*;
 
     type TestResult = Result<(), &'static str>;
 
-    /// Spurious-ArbitrationLoss retry accounting for one suite run.
+    /// Read lengths that straddle the driver's 256-byte RECEIVE-command
+    /// chunk boundary, where >256-byte reads are documented to risk
+    /// silent data loss if the controller chains receive commands.
+    const LONG_LENGTHS: &[usize] = &[255, 256, 257, 260, 300, 512];
+
+    /// Spurious-error retry accounting for one suite run.
     #[derive(Default)]
     pub struct RetryStats {
         /// Total operations retried after an `ArbitrationLoss`.
         pub alf_retries: u32,
+        /// Total operations retried after a latched `FifoError` (blocking
+        /// path: a transient FEF left by the auto-NACK ending a fully
+        /// consumed RECEIVE can trip the next transfer's START check; the
+        /// reporting status read also clears it, so a retry runs clean).
+        pub fef_retries: u32,
     }
 
     /// Retries per operation before giving up on `ArbitrationLoss`.
-    const MAX_RETRIES: u32 = 3;
+    const MAX_RETRIES: u32 = 15;
 
     async fn op_write<C: Controller>(ctrl: &mut C, data: &[u8], stats: &mut RetryStats) -> TestResult {
         for _ in 0..=MAX_RETRIES {
@@ -223,7 +342,15 @@ pub mod tests {
             let mut r = [0u8; 2];
             op_read(ctrl, &mut r, stats).await?;
             if !model.check(&r) {
-                defmt::error!("iter {}: read mismatch got={:02x}", i, r);
+                defmt::error!("iter {}: read mismatch got={:02x} want={:02x}", i, r, model.buf[..2]);
+                // Diagnostic: re-read twice to distinguish a corrupted
+                // target buffer (stable wrong data) from a transient
+                // read corruption (subsequent reads correct).
+                let mut r2 = [0u8; 4];
+                let _ = ctrl.read(TARGET_ADDR, &mut r2).await;
+                defmt::error!("  re-read 1: {:02x}", r2);
+                let _ = ctrl.read(TARGET_ADDR, &mut r2).await;
+                defmt::error!("  re-read 2: {:02x}", r2);
                 return Err("read mismatch");
             }
         }
@@ -301,14 +428,12 @@ pub mod tests {
     /// The bad-address probes are deliberate raw calls (no retry): any
     /// error is the expected outcome there.
     pub async fn t_edges<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
-        const BAD: u8 = 0x33;
-
-        if ctrl.write(BAD, &[0x00]).await.is_ok() {
+        if ctrl.write(BAD_ADDR, &[0x00]).await.is_ok() {
             return Err("E1: expected NACK on bad-addr write");
         }
 
         let mut r = [0u8; 2];
-        if ctrl.read(BAD, &mut r).await.is_ok() {
+        if ctrl.read(BAD_ADDR, &mut r).await.is_ok() {
             return Err("E2: expected NACK on bad-addr read");
         }
 
@@ -365,6 +490,124 @@ pub mod tests {
 
         let cfg = CtrlConfig::default();
         ctrl.set_config(&cfg).map_err(|_| "set_config restore failed")?;
+        Ok(())
+    }
+
+    /// Long transfers across the 256-byte RECEIVE chunk boundary, with
+    /// every byte checked against the cyclic model:
+    /// - reads of 255/256/257/260/300/512 bytes;
+    /// - consecutive long reads separated by STOP;
+    /// - repeated-START (write_read) into a 300-byte read;
+    /// - wrong-address NACK immediately followed by a 257-byte read;
+    /// - a 512-byte write streamed in one transaction, read back.
+    pub async fn t_long_transfers<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        // MSB-rich cyclic pattern so the spurious-ALF path stays stressed.
+        let mut pat = [0u8; BUF_LEN];
+        for (i, b) in pat.iter_mut().enumerate() {
+            *b = 0x80 | (i as u8).wrapping_mul(7);
+        }
+        op_write(ctrl, &pat, stats).await?;
+        model.write(&pat);
+
+        let mut big = [0u8; MAX_READ];
+        for &l in LONG_LENGTHS {
+            let r = &mut big[..l];
+            op_read(ctrl, r, stats).await?;
+            if !model.check(r) {
+                defmt::error!("long L={}: mismatch head={:02x}", l, r[..8]);
+                return Err("long read mismatch");
+            }
+        }
+
+        // Consecutive long reads separated by STOP.
+        op_read(ctrl, &mut big[..257], stats).await?;
+        if !model.check(&big[..257]) {
+            return Err("consecutive read 1 mismatch");
+        }
+        op_read(ctrl, &mut big[..31], stats).await?;
+        if !model.check(&big[..31]) {
+            return Err("consecutive read 2 mismatch");
+        }
+
+        // Repeated START into a long read. The 4-byte write re-sends the
+        // pattern's own prefix, so the model is unchanged by design.
+        let w = [pat[0], pat[1], pat[2], pat[3]];
+        op_write_read(ctrl, &w, &mut big[..300], stats).await?;
+        model.write(&w);
+        if !model.check(&big[..300]) {
+            return Err("wr long read mismatch");
+        }
+
+        // Error recovery into a long read.
+        if ctrl.write(BAD_ADDR, &[0x00]).await.is_ok() {
+            return Err("expected NACK before long read");
+        }
+        op_read(ctrl, &mut big[..257], stats).await?;
+        if !model.check(&big[..257]) {
+            return Err("post-NACK long read mismatch");
+        }
+
+        // Long write: 512 bytes streamed in one transaction; the target
+        // commits 32-byte chunks, so the buffer ends as the final chunk.
+        let mut w512 = [0u8; 512];
+        for (i, b) in w512.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0x5A;
+        }
+        op_write(ctrl, &w512, stats).await?;
+        model.write(&w512);
+        op_read(ctrl, &mut big[..BUF_LEN], stats).await?;
+        if !model.check(&big[..BUF_LEN]) {
+            defmt::error!("long write readback: got={:02x}", big[..BUF_LEN]);
+            return Err("long write mismatch");
+        }
+
+        Ok(())
+    }
+
+    /// Re-runs short and long traffic while `interference::task` blocks
+    /// all interrupts ~0.5 ms at a time, delaying LPI2C and DMA ISR entry
+    /// on the controller. (The target board runs its own interference
+    /// constantly.) Requires the controller binary to have spawned the
+    /// task; without it this is a plain re-run, which is harmless.
+    pub async fn t_isr_latency<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        interference::ACTIVE.store(true, Ordering::Relaxed);
+        let res = isr_latency_inner(ctrl, model, stats).await;
+        interference::ACTIVE.store(false, Ordering::Relaxed);
+        res
+    }
+
+    async fn isr_latency_inner<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        for i in 0..20u16 {
+            let w = [i as u8, 0xE0 | (i as u8 & 0x0F)];
+            op_write(ctrl, &w, stats).await?;
+            model.write(&w);
+            let mut r = [0u8; 2];
+            op_read(ctrl, &mut r, stats).await?;
+            if !model.check(&r) {
+                defmt::error!("isr i={}: got={:02x}", i, r);
+                return Err("isr: mismatch");
+            }
+        }
+
+        let mut big = [0u8; MAX_READ];
+        for &l in &[257usize, 512] {
+            op_read(ctrl, &mut big[..l], stats).await?;
+            if !model.check(&big[..l]) {
+                return Err("isr: long read mismatch");
+            }
+        }
+
+        let w = [model.buf[0], model.buf[1]];
+        op_write_read(ctrl, &w, &mut big[..300], stats).await?;
+        model.write(&w);
+        if !model.check(&big[..300]) {
+            return Err("isr: wr mismatch");
+        }
+
         Ok(())
     }
 
@@ -428,6 +671,129 @@ pub mod tests {
             bytes,
             bytes as u64 * 1000 / ms
         );
+        Ok(())
+    }
+
+    // ---- blocking-path battery ------------------------------------------
+
+    fn b_write(ctrl: &mut ControllerI2c<'_, Blocking>, data: &[u8], stats: &mut RetryStats) -> TestResult {
+        for _ in 0..=MAX_RETRIES {
+            match ctrl.blocking_write(TARGET_ADDR, data) {
+                Ok(()) => return Ok(()),
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(e) => {
+                    defmt::error!("blocking write err: {} (len {})", e, data.len());
+                    return Err("write failed");
+                }
+            }
+        }
+        Err("write: retries exhausted")
+    }
+
+    fn b_read(ctrl: &mut ControllerI2c<'_, Blocking>, buf: &mut [u8], stats: &mut RetryStats) -> TestResult {
+        for _ in 0..=MAX_RETRIES {
+            match ctrl.blocking_read(TARGET_ADDR, buf) {
+                Ok(()) => return Ok(()),
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(e) => {
+                    defmt::error!("blocking read err: {} (len {})", e, buf.len());
+                    return Err("read failed");
+                }
+            }
+        }
+        Err("read: retries exhausted")
+    }
+
+    fn b_write_read(
+        ctrl: &mut ControllerI2c<'_, Blocking>,
+        w: &[u8],
+        r: &mut [u8],
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        for _ in 0..=MAX_RETRIES {
+            match ctrl.blocking_write_read(TARGET_ADDR, w, r) {
+                Ok(()) => return Ok(()),
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(_) => return Err("write_read failed"),
+            }
+        }
+        Err("write_read: retries exhausted")
+    }
+
+    /// Blocking-path condensation of the async suite: short W/R traffic,
+    /// every long read length, consecutive reads, repeated-START into a
+    /// long read, NACK recovery into a long read, and a 512-byte write.
+    pub fn t_blocking_battery(
+        ctrl: &mut ControllerI2c<'_, Blocking>,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        for i in 0..20u16 {
+            let w = [i as u8, 0xB0 | (i as u8 & 0x0F)];
+            b_write(ctrl, &w, stats)?;
+            model.write(&w);
+            let mut r = [0u8; 2];
+            b_read(ctrl, &mut r, stats)?;
+            if !model.check(&r) {
+                defmt::error!("blk i={}: got={:02x}", i, r);
+                return Err("mismatch");
+            }
+        }
+
+        let mut pat = [0u8; BUF_LEN];
+        for (i, b) in pat.iter_mut().enumerate() {
+            *b = 0x80 | (i as u8).wrapping_mul(11);
+        }
+        b_write(ctrl, &pat, stats)?;
+        model.write(&pat);
+
+        let mut big = [0u8; MAX_READ];
+        for &l in LONG_LENGTHS {
+            b_read(ctrl, &mut big[..l], stats)?;
+            if !model.check(&big[..l]) {
+                defmt::error!("blk long L={}: head={:02x}", l, big[..8]);
+                return Err("long read mismatch");
+            }
+        }
+
+        b_read(ctrl, &mut big[..257], stats)?;
+        if !model.check(&big[..257]) {
+            return Err("consecutive read 1 mismatch");
+        }
+        b_read(ctrl, &mut big[..31], stats)?;
+        if !model.check(&big[..31]) {
+            return Err("consecutive read 2 mismatch");
+        }
+
+        let w = [pat[0], pat[1], pat[2], pat[3]];
+        b_write_read(ctrl, &w, &mut big[..300], stats)?;
+        model.write(&w);
+        if !model.check(&big[..300]) {
+            return Err("wr long read mismatch");
+        }
+
+        if ctrl.blocking_write(BAD_ADDR, &[0x00]).is_ok() {
+            return Err("expected NACK");
+        }
+        b_read(ctrl, &mut big[..257], stats)?;
+        if !model.check(&big[..257]) {
+            return Err("post-NACK long read mismatch");
+        }
+
+        let mut w512 = [0u8; 512];
+        for (i, b) in w512.iter_mut().enumerate() {
+            *b = (i as u8) ^ 0xC3;
+        }
+        b_write(ctrl, &w512, stats)?;
+        model.write(&w512);
+        b_read(ctrl, &mut big[..BUF_LEN], stats)?;
+        if !model.check(&big[..BUF_LEN]) {
+            return Err("long write mismatch");
+        }
+
         Ok(())
     }
 }
