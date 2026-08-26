@@ -79,16 +79,6 @@ use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::{Dozen, Prescale};
 
-/// Upper bound on the wait for one byte of receive progress.
-///
-/// Every legitimate stall (clock stretching, ADRSTALL, a busy target's
-/// ISR latency) resolves within a few milliseconds; a transfer that
-/// makes no progress for this long has died silently — the silicon's
-/// spurious-flag quirk family can terminate a transfer without raising
-/// any error flag, and no interrupt will ever come. The bounded wait
-/// converts that into [`IOError::UnexpectedStop`] instead of a hang.
-const RX_BYTE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
-
 /// Errors exclusive to HW initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -125,8 +115,27 @@ pub enum IOError {
     /// received bytes still owed and no fault flagged. Observed on
     /// FRDM-MCXA577 under interrupt-latency stress during chained
     /// multi-command reads; same spurious-flag silicon family as the
-    /// ArbitrationLoss quirk, and safe to retry.
+    /// ArbitrationLoss quirk.
+    ///
+    /// The transfer is already broken on the wire. Whether re-reading is
+    /// safe depends on the device (a cursor has already advanced;
+    /// destructive reads have already consumed data), so the driver does
+    /// not retry on its own — see [`Config::allow_chunked_reads`].
     UnexpectedStop,
+    /// The bus made no forward progress within
+    /// [`Config::transfer_timeout`] — e.g. a target clock-stretching
+    /// longer than the configured budget, or a transfer that died with
+    /// no status flag at all.
+    Timeout,
+    /// The requested read cannot be performed as a single atomic bus
+    /// transaction, and non-atomic chunking is not enabled.
+    ///
+    /// Raised by the DMA path for reads longer than the command FIFO can
+    /// hold in RECEIVE commands (nothing refills the FIFO while the CPU
+    /// sleeps on the DMA completion). Use a shorter read, an
+    /// interrupt-driven `I2c<Async>`, or opt in via
+    /// [`Config::allow_chunked_reads`].
+    ChunkingRequired,
     /// Address out of range.
     AddressOutOfRange(u8),
     /// Invalid write buffer length.
@@ -283,7 +292,7 @@ enum SendStop {
 }
 
 /// I2C controller configuration
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct Config {
     /// Bus speed
@@ -291,6 +300,59 @@ pub struct Config {
 
     /// Clock configuration
     pub clock_config: ClockConfig,
+
+    /// Allow a read to be split into several bus transactions.
+    ///
+    /// **Off by default, and unsafe for many devices.** Reads longer
+    /// than one RECEIVE command (256 bytes) are normally issued as a
+    /// single addressed transaction with chained commands. Two
+    /// situations cannot be served that way:
+    ///
+    /// * the DMA path cannot chain more commands than the transmit FIFO
+    ///   holds, because nothing refills it while the CPU sleeps on the
+    ///   DMA completion;
+    /// * the silicon can terminate a chained read early and silently
+    ///   (see [`IOError::UnexpectedStop`]).
+    ///
+    /// With this disabled the driver reports [`IOError::ChunkingRequired`]
+    /// or the underlying error and leaves the decision to the caller.
+    /// With it enabled the driver falls back to re-addressed,
+    /// STOP-separated 256-byte chunks, which:
+    ///
+    /// * releases the bus between chunks, so another controller may
+    ///   interleave and disturb the device;
+    /// * re-reads from the caller's buffer start after a partial
+    ///   transfer, so a device with an auto-incrementing pointer returns
+    ///   **shifted data**, and a destructive read (FIFO pop,
+    ///   clear-on-read) has already lost the bytes consumed by the
+    ///   partial attempt.
+    ///
+    /// Only enable it for stateless-read devices on a single-controller
+    /// bus.
+    pub allow_chunked_reads: bool,
+
+    /// Budget for forward progress within a transfer: the wait for one
+    /// received byte, for the command FIFO to drain, or for a DMA
+    /// transfer to complete (scaled by length).
+    ///
+    /// Exceeding it yields [`IOError::Timeout`] rather than hanging.
+    /// I2C places no upper bound on clock stretching, so raise this for
+    /// devices that stretch heavily (EEPROM write cycles, slow ADC
+    /// conversions).
+    pub transfer_timeout: embassy_time::Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            speed: Speed::default(),
+            clock_config: ClockConfig::default(),
+            // Atomic transactions by default; opting out is a deliberate
+            // per-device decision.
+            allow_chunked_reads: false,
+            transfer_timeout: embassy_time::Duration::from_millis(100),
+        }
+    }
 }
 
 /// I2C controller clock configuration
@@ -322,6 +384,10 @@ pub struct I2c<'d, M: Mode> {
     _sda: Peri<'d, AnyPin>,
     mode: M,
     is_hs: bool,
+    /// See [`Config::allow_chunked_reads`].
+    allow_chunked_reads: bool,
+    /// See [`Config::transfer_timeout`].
+    timeout: embassy_time::Duration,
     /// Peripheral input clock frequency in Hz, captured at construction.
     /// Used to compute MCCR0 timing parameters (e.g. when [`set_config`]
     /// changes the bus speed).
@@ -405,6 +471,8 @@ impl<'d, M: Mode> I2c<'d, M> {
             _sda,
             mode,
             is_hs: config.speed == Speed::UltraFast,
+            allow_chunked_reads: config.allow_chunked_reads,
+            timeout: config.transfer_timeout,
             freq: parts.freq,
             _wg: parts.wake_guard,
         };
@@ -486,10 +554,19 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().write_command(ControllerCommand::Stop, 0);
 
         // Wait for the STOP to be consumed. `tx_settled` also returns on
-        // a fault, so this cannot spin forever — but in that case the
+        // a fault, but a target holding SCL low satisfies neither
+        // condition, so the wait is bounded like every other: recovery
+        // must not be the one path that can still hang. Either way the
         // STOP may still sit in the TX FIFO, ready to confuse the next
-        // transaction. Reset again to guarantee a clean slate.
-        while !self.registers().tx_settled() {}
+        // transaction, so reset again to guarantee a clean slate.
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        while !self.registers().tx_settled() {
+            if embassy_time::Instant::now() > deadline {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("recovery STOP did not drain within the transfer timeout");
+                break;
+            }
+        }
         self.reset_fifos();
 
         // Clear any residual MSR flags raised by the recovery STOP
@@ -511,12 +588,30 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().clear_all_status();
     }
 
+    /// Blocking wait for the command FIFO to drain (or a fault to
+    /// appear), bounded by [`Config::transfer_timeout`]: a target
+    /// holding SCL low satisfies neither condition and would otherwise
+    /// spin forever.
+    fn wait_tx_settled(&self) -> Result<(), IOError> {
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        while !self.registers().tx_settled() {
+            if embassy_time::Instant::now() > deadline {
+                return Err(IOError::Timeout);
+            }
+        }
+        Ok(())
+    }
+
     /// Blocking wait for room in the command FIFO, honoring faults: a
     /// halted transfer never frees space, so a data-only wait here would
     /// spin forever. On a fault, the standard classification/recovery
     /// path runs before the error is returned.
     fn wait_tx_room(&self) -> Result<(), IOError> {
+        let deadline = embassy_time::Instant::now() + self.timeout;
         loop {
+            if embassy_time::Instant::now() > deadline {
+                return Err(IOError::Timeout);
+            }
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => return Ok(()),
                 Some(TxStep::Fault(_)) => {
@@ -609,7 +704,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         );
 
         // Wait for TxFIFO to be drained
-        while !self.registers().tx_settled() {}
+        self.wait_tx_settled()?;
 
         // Check controller status
         let res = self.status_and_act();
@@ -643,7 +738,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.send_cmd(ControllerCommand::Stop, 0);
 
         // Wait for TxFIFO to be drained
-        while !self.registers().tx_settled() {}
+        self.wait_tx_settled()?;
 
         self.status_and_act()
     }
@@ -653,19 +748,18 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        // Chained reads keep >256-byte transfers atomic, but on this
-        // silicon a chained command boundary can terminate the transfer
-        // early under heavy interrupt latency (silent, no error flag —
-        // surfaced as UnexpectedStop by the bounded waits). When that
-        // happens the transaction is already broken mid-way, so nothing
-        // further is lost by retrying in seamed mode: each 256-byte
-        // chunk as its own STOP-terminated, re-addressed transfer,
-        // which is immune to the boundary quirk.
+        // A chained read that died mid-transfer leaves the device in an
+        // unknown state: its pointer has advanced by however many bytes
+        // were clocked out, and destructive reads have already consumed
+        // them. Re-reading from the caller's buffer start would return
+        // shifted data as success, so it happens only when the caller
+        // has explicitly accepted that trade.
         match self.blocking_read_chained(address, read) {
             Ok(()) => {}
-            Err(IOError::UnexpectedStop) => {
+            Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                 #[cfg(feature = "defmt")]
-                defmt::trace!("chained read terminated early; retrying seamed");
+                defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
+                let _ = e;
                 self.blocking_read_seamed(address, read)?;
             }
             Err(e) => return Err(e),
@@ -702,7 +796,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             // transaction atomicity and let another controller interleave).
             let mut queued = 0usize;
             let mut drained = 0usize;
-            let mut deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+            let mut deadline = embassy_time::Instant::now() + self.timeout;
             while drained < total {
                 // Top up the command pipeline whenever there is room.
                 while queued < total {
@@ -726,14 +820,14 @@ impl<'d, M: Mode> I2c<'d, M> {
                     Some(RxStep::Byte(b)) => {
                         read[drained] = b;
                         drained += 1;
-                        deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+                        deadline = embassy_time::Instant::now() + self.timeout;
                     }
                     Some(RxStep::Fault(e)) => return Err(e.into()),
                     Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                     // No progress for a full timeout window: the
                     // transfer died without a flag.
                     None if embassy_time::Instant::now() > deadline => {
-                        return Err(IOError::UnexpectedStop);
+                        return Err(IOError::Timeout);
                     }
                     None => {}
                 }
@@ -760,12 +854,12 @@ impl<'d, M: Mode> I2c<'d, M> {
                 self.wait_tx_room()?;
                 self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
 
-                let mut deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+                let mut deadline = embassy_time::Instant::now() + self.timeout;
                 for byte in chunk.iter_mut() {
                     *byte = loop {
                         match self.registers().rx_step() {
                             Some(RxStep::Byte(b)) => {
-                                deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+                                deadline = embassy_time::Instant::now() + self.timeout;
                                 break b;
                             }
                             Some(RxStep::Fault(e)) => return Err(e.into()),
@@ -1179,7 +1273,7 @@ impl<'d> I2c<'d, Async> {
             }
 
             let timed_out = match embassy_time::with_timeout(
-                RX_BYTE_TIMEOUT,
+                self.timeout,
                 self.info.wait_cell().wait_for(|| {
                     // enable interrupts
                     self.enable_rx_ints();
@@ -1205,8 +1299,8 @@ impl<'d> I2c<'d, Async> {
                 Some(RxStep::Fault(e)) => return Err(e.into()),
                 Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // Nothing pending after a full timeout window: the
-                // transfer died without a flag.
-                None if timed_out => return Err(IOError::UnexpectedStop),
+                // transfer stalled or died without a flag.
+                None if timed_out => return Err(IOError::Timeout),
                 None => {}
             }
         }
@@ -1232,7 +1326,7 @@ impl<'d> I2c<'d, Async> {
             for byte in chunk.iter_mut() {
                 loop {
                     let timed_out = match embassy_time::with_timeout(
-                        RX_BYTE_TIMEOUT,
+                        self.timeout,
                         self.info.wait_cell().wait_for(|| {
                             self.enable_rx_ints();
                             self.registers().rx_ready()
@@ -1252,7 +1346,7 @@ impl<'d> I2c<'d, Async> {
                         }
                         Some(RxStep::Fault(e)) => return Err(e.into()),
                         Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
-                        None if timed_out => return Err(IOError::UnexpectedStop),
+                        None if timed_out => return Err(IOError::Timeout),
                         None => {}
                     }
                 }
@@ -1277,18 +1371,18 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        // Chained reads keep >256-byte transfers atomic, but on this
-        // silicon a chained command boundary can terminate the transfer
-        // early under heavy interrupt latency (silent, no error flag —
-        // surfaced as UnexpectedStop by the bounded waits). When that
-        // happens the transaction is already broken mid-way, so nothing
-        // further is lost by retrying in seamed mode, which is immune
-        // to the boundary quirk.
+        // A chained read that died mid-transfer leaves the device in an
+        // unknown state: its pointer has advanced by however many bytes
+        // were clocked out, and destructive reads have already consumed
+        // them. Re-reading from the caller's buffer start would return
+        // shifted data as success, so it happens only when the caller
+        // has explicitly accepted that trade.
         match self.async_read_chained(address, read).await {
             Ok(()) => {}
-            Err(IOError::UnexpectedStop) => {
+            Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                 #[cfg(feature = "defmt")]
-                defmt::trace!("chained read terminated early; retrying seamed");
+                defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
+                let _ = e;
                 self.async_read_seamed(address, read).await?;
             }
             Err(e) => return Err(e),
@@ -1480,20 +1574,18 @@ impl<'d> I2c<'d, Dma<'d>> {
             core::task::Poll::Pending
         });
         // ~1 ms/byte of margin on top of a generous floor.
-        let bound = RX_BYTE_TIMEOUT + embassy_time::Duration::from_millis(buf.len() as u64);
+        let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
         match embassy_time::with_timeout(bound, wait).await {
             Ok(r) => r?,
-            Err(_) => return Err(IOError::UnexpectedStop),
+            Err(_) => return Err(IOError::Timeout),
         }
 
         // Ensure DMA writes are visible to CPU
         cortex_m::asm::dsb();
-        // Cleanup
+        // Cleanup: quiesce rather than merely disabling requests, so the
+        // channel is provably idle before `buf`'s borrow ends.
         self.registers().set_rx_dma(false);
-        unsafe {
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-        }
+        self.mode.rx_dma.quiesce();
 
         Ok(())
     }
@@ -1508,16 +1600,14 @@ impl<'d> I2c<'d, Dma<'d>> {
 
         // NOTE: OnDrop *after* async_start — see the seamed branch.
         let on_drop = OnDrop::new(|| {
-            // Stop the DMA request path before any recovery:
-            // remediation resets the FIFOs, which can reassert the
-            // peripheral request while the eDMA channel is still
-            // enabled — letting DMA touch the caller's buffer after
-            // this future has unwound.
+            // Stop the DMA request path and wait for the channel to go
+            // inactive before any recovery: remediation resets the
+            // FIFOs, which can reassert the peripheral request, and
+            // `read` is about to be released — an in-flight minor loop
+            // would write into it after this future unwound.
+            // `disable_request` alone does not wait for that loop.
             self.registers().set_rx_dma(false);
-            unsafe {
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-            }
+            self.mode.rx_dma.quiesce();
             self.remediation();
         });
 
@@ -1554,20 +1644,27 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // they fit the command FIFO: the controller ACKs across a
         // command boundary only when the next command is already
         // queued, so a read up to capacity*256 bytes stays ONE bus
-        // transaction. Fall back to re-addressed 256-byte chunks for
-        // longer reads (nothing refills the command FIFO while the CPU
-        // sleeps on the DMA completion), or when a chained boundary
-        // terminates the transfer early (silicon quirk, surfaced as
-        // UnexpectedStop) — the transaction is already broken then, so
-        // the seamed retry loses nothing further.
+        // transaction. Longer reads cannot be served atomically here at
+        // all, because nothing refills the command FIFO while the CPU
+        // sleeps on the DMA completion.
         let ncmds = read.len().div_ceil(256);
         let mut seamed = ncmds > self.registers().tx_fifo_capacity();
+        if seamed && !self.allow_chunked_reads {
+            return Err(IOError::ChunkingRequired);
+        }
         if !seamed {
             match self.dma_read_chained(address, read).await {
                 Ok(()) => {}
-                Err(IOError::UnexpectedStop) => {
+                // A chained read that died mid-transfer leaves the device in an
+                // unknown state: its pointer has advanced by however many bytes
+                // were clocked out, and destructive reads have already consumed
+                // them. Re-reading from the caller's buffer start would return
+                // shifted data as success, so it happens only when the caller
+                // has explicitly accepted that trade.
+                Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                     #[cfg(feature = "defmt")]
-                    defmt::trace!("chained DMA read terminated early; retrying seamed");
+                    defmt::trace!("chained DMA read failed ({}); retrying chunked (opted in)", e);
+                    let _ = e;
                     seamed = true;
                 }
                 Err(e) => return Err(e),
@@ -1588,12 +1685,10 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 // a second time and corrupt the controller state for the
                 // next transaction.
                 let on_drop = OnDrop::new(|| {
-                    // Request path off before recovery — see above.
+                    // Request path off and channel quiesced before
+                    // recovery — see `dma_read_chained`.
                     self.registers().set_rx_dma(false);
-                    unsafe {
-                        self.mode.rx_dma.disable_request();
-                        self.mode.rx_dma.clear_done();
-                    }
+                    self.mode.rx_dma.quiesce();
                     self.remediation();
                 });
 
@@ -1645,13 +1740,12 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
-            // Same ordering rationale as the DMA read path: kill the
-            // request path before recovery touches the FIFOs.
+            // Same rationale as the DMA read path: kill the request
+            // path and wait for the channel to go inactive before
+            // recovery touches the FIFOs, since `write` is about to be
+            // released.
             self.registers().set_tx_dma(false);
-            unsafe {
-                self.mode.tx_dma.disable_request();
-                self.mode.tx_dma.clear_done();
-            }
+            self.mode.tx_dma.quiesce();
             self.remediation();
         });
 
@@ -1704,12 +1798,11 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
-            // Cleanup
+            // Cleanup: quiesce rather than merely disabling requests, so
+            // the channel is provably idle before this chunk's borrow
+            // ends.
             self.registers().set_tx_dma(false);
-            unsafe {
-                self.mode.tx_dma.disable_request();
-                self.mode.tx_dma.clear_done();
-            }
+            self.mode.tx_dma.quiesce();
         }
 
         if send_stop == SendStop::Yes {
@@ -1891,6 +1984,9 @@ impl<'d, M: Mode> embassy_embedded_hal::SetConfig for I2c<'d, M> {
     type ConfigError = SetupError;
 
     fn set_config(&mut self, config: &Self::Config) -> Result<(), SetupError> {
+        self.is_hs = config.speed == Speed::UltraFast;
+        self.allow_chunked_reads = config.allow_chunked_reads;
+        self.timeout = config.transfer_timeout;
         self.set_configuration(config);
         Ok(())
     }

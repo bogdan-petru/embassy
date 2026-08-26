@@ -551,18 +551,9 @@ impl<'d, M: Mode> I2c<'d, M> {
     pub fn blocking_listen(&mut self) -> Result<Request, IOError> {
         self.clear_status();
 
-        // Wait for Address Valid
-        loop {
-            let ssr = self.info.regs().ssr().read();
-            let avr = ssr.avf();
-            let sarf = ssr.sarf();
-            let gcf = ssr.gcf();
-            let sdf = ssr.sdf();
-
-            if avr || sarf || gcf || sdf {
-                break;
-            }
-        }
+        // Wait for an address match, a STOP, or a fault (see
+        // `listen_ready`; the status read below classifies and clears).
+        while !self.registers().listen_ready() {}
 
         let event = self.status()?;
 
@@ -848,7 +839,10 @@ impl<'d> I2c<'d, Dma<'d>> {
         )
     }
 
-    async fn read_dma_chunk(&mut self, data: &mut [u8]) -> Result<RxChunkOutcome, IOError> {
+    // Takes `&self`: every DMA setup call is `&self`, and the caller's
+    // cancellation `OnDrop` closure holds the channel by shared
+    // reference to quiesce it.
+    async fn read_dma_chunk(&self, data: &mut [u8]) -> Result<RxChunkOutcome, IOError> {
         let peri_addr = self.info.regs().srdr().as_ptr() as *const u8;
         let chunk_len = data.len();
 
@@ -929,7 +923,8 @@ impl<'d> I2c<'d, Dma<'d>> {
         }
     }
 
-    async fn write_dma_chunk(&mut self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
+    // Takes `&self` — see `read_dma_chunk`.
+    async fn write_dma_chunk(&self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
         let peri_addr = self.info.regs().stdr().as_ptr() as *mut u8;
         let chunk_len = data.len();
 
@@ -1060,8 +1055,8 @@ where
             .wait_cell()
             .wait_for(|| {
                 self.enable_listen_ints();
-                let status = self.info.regs().ssr().read();
-                status.avf() || status.sarf() || status.gcf() || status.sdf()
+                // Includes BEF/FEF — see `listen_ready`.
+                self.registers().listen_ready()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -1286,7 +1281,11 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
+            // Disabling the peripheral request is not enough: an
+            // in-flight minor loop would keep reading the caller's
+            // buffer after this future unwound.
             self.info.regs().sder().modify(|w| w.set_tdde(false));
+            self.mode.tx_dma.quiesce();
         });
 
         let total = buf.len();
@@ -1337,7 +1336,11 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
+            // Disabling the peripheral request is not enough: an
+            // in-flight minor loop would keep writing into the caller's
+            // buffer after this future unwound.
             self.info.regs().sder().modify(|w| w.set_rdde(false));
+            self.mode.rx_dma.quiesce();
         });
 
         let total = buf.len();

@@ -1103,6 +1103,47 @@ impl DmaChannel<'_> {
         t.ch_csr().read().done()
     }
 
+    /// Stop the channel and wait until it is genuinely inactive.
+    ///
+    /// `disable_request` only stops *new* service requests; a minor loop
+    /// already in flight keeps writing to the destination buffer. Any
+    /// caller that is about to release a borrowed buffer (a cancelled
+    /// transfer, an error path) must use this instead, or the DMA can
+    /// write into memory the borrow checker believes is free again.
+    ///
+    /// Mirrors the shutdown sequence of `Transfer::drop`, which owns the
+    /// same problem for the RAII path: clear ERQ/EARQ and the major/half
+    /// interrupt enables under a critical section, drop any NVIC
+    /// dispatch queued while masked, then spin on `CH_CSR.ACTIVE` (a
+    /// single minor loop — microseconds at most), and finally clear the
+    /// W1C DONE/INT bookkeeping so the next user of this channel starts
+    /// clean and the IRQ handler cannot leave a stale wake behind.
+    /// Takes `&self` like its sibling channel helpers: a live
+    /// `Transfer` borrows the channel, so this cannot run concurrently
+    /// with one, and it only ever makes the channel more quiescent.
+    pub(crate) fn quiesce(&self) {
+        let t = self.tcd();
+        let irq = self.channel.interrupt();
+
+        critical_section::with(|_| {
+            t.ch_csr().modify(|w| {
+                w.set_erq(false);
+                w.set_earq(false);
+            });
+            t.tcd_csr().modify(|w| {
+                w.set_intmajor(false);
+                w.set_inthalf(false);
+            });
+            cortex_m::peripheral::NVIC::unpend(irq);
+        });
+
+        while t.ch_csr().read().active() {}
+
+        t.ch_csr().modify(|w| w.set_done(true));
+        t.ch_int().write(|w| w.set_int(true));
+        fence(Ordering::SeqCst);
+    }
+
     /// Clear the DONE flag for this channel.
     ///
     /// Uses modify to preserve other bits (especially ERQ) unlike write

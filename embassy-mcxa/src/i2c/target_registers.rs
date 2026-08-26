@@ -169,6 +169,25 @@ impl TargetRegisters {
             || ssr.is_set(SSR::FEF)
     }
 
+    /// Readiness for `listen`: any event that ends the wait for a new
+    /// transaction — an address match (or its general-call / SMBus-alert
+    /// classifications), a STOP, **or a fault**.
+    ///
+    /// BEF/FEF belong here because `enable_listen_ints` arms BEIE/FEIE:
+    /// a fault that wakes the ISR but is not part of the wake condition
+    /// leaves the waiter re-arming a still-latched, level-triggered
+    /// source forever. The caller's status read classifies and clears
+    /// them.
+    pub(super) fn listen_ready(&self) -> bool {
+        let ssr = self.regs.ssr.extract();
+        ssr.is_set(SSR::AVF)
+            || ssr.is_set(SSR::SARF)
+            || ssr.is_set(SSR::GCF)
+            || ssr.is_set(SSR::SDF)
+            || ssr.is_set(SSR::BEF)
+            || ssr.is_set(SSR::FEF)
+    }
+
     /// Push one byte into the target transmit register.
     pub(super) fn push_tx(&self, byte: u8) {
         self.regs.stdr.write(STDR::DATA.val(byte as u32));
