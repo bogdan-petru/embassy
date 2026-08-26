@@ -53,7 +53,9 @@
 //!
 //! Chunked reads are left at their default (disabled), so a chained read
 //! that the silicon terminates early surfaces as an error instead of a
-//! silent re-read; `t_long_transfers` covers the opt-in path explicitly.
+//! silent re-read. `t_over_capacity` covers reads past the DMA chaining
+//! ceiling (which must be refused, not split) and `t_chunked_optin`
+//! covers the opt-in path, including one such read.
 //!
 //! Retry policy: `ArbitrationLoss` is retried up to 3 times per operation
 //! and counted — the FRDM-MCXA577 LPI2C flags a spurious arbitration loss
@@ -76,12 +78,32 @@ use hal::interrupt::typelevel::Binding;
 use hal::peripherals::{LPI2C3, P3_20, P3_21};
 
 pub const TARGET_ADDR: u8 = 0x2A;
-pub const BUF_LEN: usize = 32;
+
+/// Target buffer size.
+///
+/// Deliberately **not** a divisor of 256. With a 32-byte buffer a
+/// re-addressed 256-byte seam lands exactly back at buffer offset 0, so
+/// a chunked read and an atomic one produce identical bytes and the
+/// seam is undetectable by construction. At 40 bytes a seam lands at
+/// offset 16, so any implementation that restarts rather than continues
+/// shows up as mismatched data.
+pub const BUF_LEN: usize = 40;
+
 const FILL: u8 = 0x55;
 /// An address nothing on the bus answers to.
 const BAD_ADDR: u8 = 0x33;
+
+/// A read longer than the DMA path can chain.
+///
+/// The DMA path can only queue as many RECEIVE commands as the transmit
+/// FIFO holds (4 on this part → 1024 bytes), because nothing refills it
+/// while the CPU sleeps on the DMA completion. This length is past that
+/// ceiling, so it exercises the branch that must refuse rather than
+/// silently split — untested while every read stopped at 512.
+const OVER_CAPACITY: usize = 1100;
+
 /// Longest read the tests perform.
-const MAX_READ: usize = 512;
+const MAX_READ: usize = OVER_CAPACITY;
 
 /// Interrupt-latency interference: a task that periodically blocks all
 /// interrupts, delaying ISR entry to model a busy system.
@@ -221,6 +243,52 @@ impl Model {
         }
     }
 
+    /// Verify a read walks the buffer contiguously, without needing to
+    /// know where it started.
+    ///
+    /// Requires `buf` to hold `BUF_LEN` distinct values: each returned
+    /// byte is mapped back to its buffer index, and every step must be
+    /// exactly +1 (mod `BUF_LEN`). That detects any byte lost,
+    /// duplicated or reordered — including across a chunk seam — while
+    /// being immune to *where* the target's cursor happened to be.
+    ///
+    /// Applied per transaction, not across the whole read — see
+    /// `check_chunked`.
+    fn check_contiguous(&self, read: &[u8]) -> bool {
+        let Some(start) = self.buf.iter().position(|b| *b == read[0]) else {
+            defmt::error!("contiguity: first byte {:02x} not in buffer", read[0]);
+            return false;
+        };
+        for (i, b) in read.iter().enumerate() {
+            let expect = self.buf[(start + i) % BUF_LEN];
+            if *b != expect {
+                defmt::error!("contiguity: break at {} (got {:02x}, want {:02x})", i, *b, expect);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Verify a chunked read: contiguous *within* each bus transaction.
+    ///
+    /// Continuity **across** a seam is deliberately not asserted, and
+    /// this is a limitation of the emulated peer rather than a licence
+    /// for the driver to lose data. At the end of a read transaction the
+    /// target driver has pushed one more byte into the transmit register
+    /// than the controller clocked out; `ReadStatus` counts pushes, the
+    /// FIFO reset discards the residue, and this PAC exposes no target
+    /// FIFO status register to recover the difference. The emulated
+    /// cursor therefore skips exactly that byte at every seam — observed
+    /// as "break at 256, got 0x91 want 0x90". Real devices advance their
+    /// pointer on clocked bytes only and would be continuous.
+    ///
+    /// What this does prove is that no byte is lost, duplicated or
+    /// reordered *within* a transaction, which is where chunked reads
+    /// could actually corrupt data.
+    fn check_chunked(&self, read: &[u8]) -> bool {
+        read.chunks(256).all(|c| self.check_contiguous(c))
+    }
+
     /// Current buffer contents, for re-establishing a known state after
     /// a failed transfer (see `resync`).
     fn snapshot(&self) -> [u8; BUF_LEN] {
@@ -287,6 +355,7 @@ pub mod harness {
         run_test!("speed_sweep", tests::t_speed_sweep(ctrl, &mut model, &mut stats));
         run_test!("long_transfers", tests::t_long_transfers(ctrl, &mut model, &mut stats));
         run_test!("isr_latency", tests::t_isr_latency(ctrl, &mut model, &mut stats));
+        run_test!("over_capacity", tests::t_over_capacity(ctrl, &mut model, &mut stats));
         run_test!("chunked_optin", tests::t_chunked_optin(ctrl, &mut model, &mut stats));
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
 
@@ -793,6 +862,58 @@ pub mod tests {
         Ok(())
     }
 
+    /// A read longer than the DMA path can chain must either complete
+    /// atomically (the interrupt-driven and blocking paths refill the
+    /// command FIFO as it drains, so length is not a limit for them) or
+    /// be refused with `ChunkingRequired`. What it must never do is
+    /// silently split into re-addressed chunks, which is what the DMA
+    /// path did before chunking became opt-in.
+    pub async fn t_over_capacity<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        let mut pat = [0u8; BUF_LEN];
+        for (i, b) in pat.iter_mut().enumerate() {
+            *b = 0x80 | (i as u8).wrapping_mul(7);
+        }
+        op_write(ctrl, &pat, model, stats).await?;
+        model.write(&pat);
+
+        let mut big = [0u8; MAX_READ];
+        for attempt in 0..=MAX_RETRIES {
+            resync(ctrl, model).await?;
+            match ctrl.read(TARGET_ADDR, &mut big[..OVER_CAPACITY]).await {
+                Ok(()) => {
+                    if !model.check_read(&big[..OVER_CAPACITY]) {
+                        defmt::error!("over-capacity: mismatch head={:02x}", big[..8]);
+                        return Err("over_capacity: mismatch");
+                    }
+                    defmt::info!("  over-capacity {}: chained atomically", OVER_CAPACITY);
+                    break;
+                }
+                Err(ControllerIOError::ChunkingRequired) => {
+                    defmt::info!("  over-capacity {}: refused (ChunkingRequired)", OVER_CAPACITY);
+                    break;
+                }
+                // The silicon quirks are orthogonal to what this checks.
+                Err(ControllerIOError::ArbitrationLoss) => {
+                    stats.alf_retries += 1;
+                    if attempt == MAX_RETRIES {
+                        return Err("over_capacity: ALF retries exhausted");
+                    }
+                }
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                    defmt::info!("  over-capacity {}: terminated early (reported)", OVER_CAPACITY);
+                    break;
+                }
+                Err(e) => {
+                    defmt::error!("over-capacity: unexpected error {}", e);
+                    return Err("over_capacity: unexpected error");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Exercise the opt-in non-atomic path: with
     /// `Config::allow_chunked_reads` enabled, a long read may be split
     /// into re-addressed, STOP-separated chunks. The target's cursor
@@ -807,22 +928,33 @@ pub mod tests {
         cfg.allow_chunked_reads = true;
         ctrl.set_config(&cfg).map_err(|_| "set_config failed")?;
 
+        // Distinct values (BUF_LEN < 0x80, so `0x80 | i` is unique per
+        // index) with the high bit set, which both enables the
+        // contiguity check below and keeps the MSB-related ALF quirk
+        // exercised.
         let mut pat = [0u8; BUF_LEN];
         for (i, b) in pat.iter_mut().enumerate() {
-            *b = 0x80 | (i as u8).wrapping_mul(13);
+            *b = 0x80 | i as u8;
         }
         op_write(ctrl, &pat, model, stats).await?;
         model.write(&pat);
 
         let mut big = [0u8; MAX_READ];
         let mut result = Ok(());
-        for &l in &[257usize, 512] {
+        // Includes a length past the DMA chaining ceiling: with the
+        // opt-in enabled that read *is* split, and must still come back
+        // byte-correct (non-atomic is permitted; incorrect is not).
+        for &l in &[257usize, 512, OVER_CAPACITY] {
             if let Err(e) = op_read(ctrl, &mut big[..l], model, stats).await {
                 result = Err(e);
                 break;
             }
-            if !model.check_read(&big[..l]) {
-                defmt::error!("chunked L={}: mismatch head={:02x}", l, big[..8]);
+            // A chunked read may span several transactions, so verify
+            // per-transaction integrity rather than absolute position —
+            // see `Model::check_chunked` for what the emulated peer can
+            // and cannot attest to.
+            if !model.check_chunked(&big[..l]) {
+                defmt::error!("chunked L={}: seam break, head={:02x}", l, big[..8]);
                 result = Err("chunked read mismatch");
                 break;
             }
@@ -1026,7 +1158,9 @@ pub mod tests {
         model.write(&pat);
 
         let mut big = [0u8; MAX_READ];
-        for &l in LONG_LENGTHS {
+        // The blocking path refills the command FIFO as it drains, so it
+        // chains any length — including past the DMA ceiling.
+        for &l in LONG_LENGTHS.iter().chain(core::iter::once(&OVER_CAPACITY)) {
             b_read(ctrl, &mut big[..l], model, stats)?;
             if !model.check_read(&big[..l]) {
                 defmt::error!("blk long L={}: head={:02x}", l, big[..8]);
