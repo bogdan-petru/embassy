@@ -47,6 +47,12 @@ impl ControllerStatus {
             Some(ControllerStatusError::ArbitrationLoss)
         } else if msr.is_set(MSR::FEF) {
             Some(ControllerStatusError::Fifo)
+        } else if msr.is_set(MSR::PLTF) {
+            // Fires only when MCFGR3[PINLOW] is configured, but the
+            // interrupt masks enable PLTIE, so it must be part of the
+            // fault set: an unsurfaced wake-without-error would loop
+            // the waiter forever.
+            Some(ControllerStatusError::PinLowTimeout)
         } else {
             None
         };
@@ -65,6 +71,7 @@ pub(super) enum ControllerStatusError {
     AddressNack,
     ArbitrationLoss,
     Fifo,
+    PinLowTimeout,
 }
 
 /// One step of receive progress. Data drains before faults surface:
@@ -74,6 +81,14 @@ pub(super) enum ControllerStatusError {
 pub(super) enum RxStep {
     Byte(u8),
     Fault(ControllerStatusError),
+    /// The transfer terminated (EPF/SDF latched) with no data pending
+    /// and no fault flagged. Observed on FRDM-MCXA577 during chained
+    /// multi-command reads under interrupt-latency stress: the transfer
+    /// ends mid-read with SDF+EPF and the remaining queued commands
+    /// discarded — the same silicon quirk family as the spurious
+    /// arbitration loss. Without this variant the reader waits forever
+    /// for bytes that will never arrive.
+    Ended,
 }
 
 /// One step of transmit-space progress. Faults surface before space:
@@ -114,12 +129,18 @@ impl ControllerRegisters {
     /// TDF/RDF service the DMA engine but an error still needs to wake
     /// the waiting task.
     pub(super) fn enable_error_interrupts(&self) {
+        // Note: deliberately no EPIE/SDIE. Both are level-latched and
+        // polluted by the silicon's spurious-flag quirks (false STOP
+        // detection; EPF from repeated STARTs), so arming them storms
+        // the waker. Silent early termination is handled by bounded
+        // waits in the driver instead.
         self.regs
             .mier
             .write(MIER::NDIE::SET + MIER::ALIE::SET + MIER::FEIE::SET + MIER::PLTIE::SET);
     }
 
     pub(super) fn enable_receive_interrupts(&self) {
+        // No EPIE/SDIE — see `enable_error_interrupts`.
         self.regs
             .mier
             .write(MIER::RDIE::SET + MIER::NDIE::SET + MIER::ALIE::SET + MIER::FEIE::SET + MIER::PLTIE::SET);
@@ -188,13 +209,33 @@ impl ControllerRegisters {
         if let Some(e) = self.read_status().error() {
             return Some(RxStep::Fault(e));
         }
+        if self.transfer_ended() {
+            return Some(RxStep::Ended);
+        }
         None
     }
 
     /// Non-consuming readiness check for [`Self::rx_step`], for use in
-    /// wake conditions. True when a byte or a fault is pending.
+    /// wake conditions. True when a byte, a fault, or an early transfer
+    /// termination is pending.
     pub(super) fn rx_ready(&self) -> bool {
-        self.regs.mfsr.read(MFSR::RXCOUNT) != 0 || self.read_status().error().is_some()
+        self.regs.mfsr.read(MFSR::RXCOUNT) != 0 || self.read_status().error().is_some() || self.transfer_ended()
+    }
+
+    /// True when this controller has ended the packet (EPF) and gone
+    /// idle (MBF clear) — i.e. the transfer terminated for real.
+    ///
+    /// Deliberately NOT based on SDF: the same silicon quirk that raises
+    /// spurious ArbitrationLoss is a false STOP *detection*, so SDF can
+    /// latch mid-transfer while the read continues perfectly well
+    /// (observed with MSB-rich data). EPF is set only by this master's
+    /// own end-of-packet, and the MBF guard rejects any transient state
+    /// while a transfer is still active. Flags from a *previous*
+    /// transaction are cleared by the `take_status` inside the START's
+    /// own status check.
+    pub(super) fn transfer_ended(&self) -> bool {
+        let msr = self.regs.msr.extract();
+        msr.is_set(MSR::EPF) && !msr.is_set(MSR::MBF)
     }
 
     /// One step of transmit-space progress: room in the command FIFO, a
@@ -208,6 +249,11 @@ impl ControllerRegisters {
             return Some(TxStep::Room);
         }
         None
+    }
+
+    /// Capacity of the shared command/transmit FIFO, in entries.
+    pub(super) fn tx_fifo_capacity(&self) -> usize {
+        1usize << self.regs.param.read(PARAM::MTXFIFO)
     }
 
     /// True when the command FIFO has fully drained *or* a fault is

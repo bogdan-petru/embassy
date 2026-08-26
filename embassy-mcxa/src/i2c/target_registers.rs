@@ -19,12 +19,28 @@ use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use super::lpi2c_regs::{self, LpI2cRegisters, SCR, SIER, SRDR, SSR, STDR};
 use crate::pac;
 
+/// Hardware faults the target status register can report mid-transfer.
+///
+/// The interrupt masks enable BEIE/FEIE, so these MUST be part of every
+/// readiness/event check: a fault that wakes the waiter without
+/// surfacing as an event would re-arm and wake forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TargetFault {
+    /// Bit error: the target saw a bus level conflicting with what it
+    /// was driving.
+    Bit,
+    /// FIFO error (receive overflow / transmit underflow).
+    Fifo,
+}
+
 /// One step of target receive progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub(super) enum TargetRxEvent {
     /// A byte the controller wrote, popped from the RX FIFO.
     Byte(u8),
+    /// A fault; bytes already drained are valid, nothing further is.
+    Fault(TargetFault),
     /// The controller issued a STOP (no data left pending).
     Stopped,
     /// The controller issued a repeated START (no data left pending).
@@ -37,6 +53,8 @@ pub(super) enum TargetRxEvent {
 pub(super) enum TargetTxStep {
     /// The transmit register has room for the next byte.
     Room,
+    /// A fault; the transfer is compromised, push nothing more.
+    Fault(TargetFault),
     /// The transfer ended (STOP or repeated START); push nothing more.
     Ended,
 }
@@ -86,13 +104,20 @@ impl TargetRegisters {
     }
 
     /// One step of receive progress, in the only correct order: pending
-    /// data first, then termination flags. Returns `None` to keep
-    /// waiting. SDF/RSF are not consumed here; the respond flow's status
-    /// lifecycle owns their clearing, exactly as before.
+    /// data drains first (bytes received before a fault or STOP are
+    /// valid), then faults, then termination flags. Returns `None` to
+    /// keep waiting. SDF/RSF/BEF/FEF are not consumed here; the respond
+    /// flow's status lifecycle owns their clearing, exactly as before.
     pub(super) fn rx_event(&self) -> Option<TargetRxEvent> {
         let ssr = self.regs.ssr.extract();
         if ssr.is_set(SSR::RDF) {
             return Some(TargetRxEvent::Byte(self.regs.srdr.read(SRDR::DATA) as u8));
+        }
+        if ssr.is_set(SSR::BEF) {
+            return Some(TargetRxEvent::Fault(TargetFault::Bit));
+        }
+        if ssr.is_set(SSR::FEF) {
+            return Some(TargetRxEvent::Fault(TargetFault::Fifo));
         }
         if ssr.is_set(SSR::SDF) {
             return Some(TargetRxEvent::Stopped);
@@ -107,12 +132,23 @@ impl TargetRegisters {
     /// wake conditions.
     pub(super) fn rx_ready(&self) -> bool {
         let ssr = self.regs.ssr.extract();
-        ssr.is_set(SSR::RDF) || ssr.is_set(SSR::SDF) || ssr.is_set(SSR::RSF)
+        ssr.is_set(SSR::RDF)
+            || ssr.is_set(SSR::SDF)
+            || ssr.is_set(SSR::RSF)
+            || ssr.is_set(SSR::BEF)
+            || ssr.is_set(SSR::FEF)
     }
 
-    /// One step of transmit progress: termination first, then room.
+    /// One step of transmit progress: faults first (the transfer is
+    /// compromised), then termination, then room.
     pub(super) fn tx_step(&self) -> Option<TargetTxStep> {
         let ssr = self.regs.ssr.extract();
+        if ssr.is_set(SSR::BEF) {
+            return Some(TargetTxStep::Fault(TargetFault::Bit));
+        }
+        if ssr.is_set(SSR::FEF) {
+            return Some(TargetTxStep::Fault(TargetFault::Fifo));
+        }
         if ssr.is_set(SSR::SDF) || ssr.is_set(SSR::RSF) {
             return Some(TargetTxStep::Ended);
         }
@@ -126,7 +162,11 @@ impl TargetRegisters {
     /// wake conditions.
     pub(super) fn tx_ready(&self) -> bool {
         let ssr = self.regs.ssr.extract();
-        ssr.is_set(SSR::TDF) || ssr.is_set(SSR::SDF) || ssr.is_set(SSR::RSF)
+        ssr.is_set(SSR::TDF)
+            || ssr.is_set(SSR::SDF)
+            || ssr.is_set(SSR::RSF)
+            || ssr.is_set(SSR::BEF)
+            || ssr.is_set(SSR::FEF)
     }
 
     /// Push one byte into the target transmit register.

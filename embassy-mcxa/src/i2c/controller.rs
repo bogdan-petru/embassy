@@ -79,6 +79,16 @@ use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::{Dozen, Prescale};
 
+/// Upper bound on the wait for one byte of receive progress.
+///
+/// Every legitimate stall (clock stretching, ADRSTALL, a busy target's
+/// ISR latency) resolves within a few milliseconds; a transfer that
+/// makes no progress for this long has died silently — the silicon's
+/// spurious-flag quirk family can terminate a transfer without raising
+/// any error flag, and no interrupt will ever come. The bounded wait
+/// converts that into [`IOError::UnexpectedStop`] instead of a hang.
+const RX_BYTE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_millis(100);
+
 /// Errors exclusive to HW initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -108,6 +118,15 @@ pub enum IOError {
     AddressNack,
     /// Bus level arbitration loss.
     ArbitrationLoss,
+    /// SCL or SDA held low longer than the configured pin-low timeout
+    /// (MCFGR3\[PINLOW\]).
+    PinLowTimeout,
+    /// The transfer terminated early: a STOP/end-of-packet latched with
+    /// received bytes still owed and no fault flagged. Observed on
+    /// FRDM-MCXA577 under interrupt-latency stress during chained
+    /// multi-command reads; same spurious-flag silicon family as the
+    /// ArbitrationLoss quirk, and safe to retry.
+    UnexpectedStop,
     /// Address out of range.
     AddressOutOfRange(u8),
     /// Invalid write buffer length.
@@ -130,6 +149,7 @@ impl From<ControllerStatusError> for IOError {
             ControllerStatusError::AddressNack => IOError::AddressNack,
             ControllerStatusError::ArbitrationLoss => IOError::ArbitrationLoss,
             ControllerStatusError::Fifo => IOError::FifoError,
+            ControllerStatusError::PinLowTimeout => IOError::PinLowTimeout,
         }
     }
 }
@@ -449,9 +469,16 @@ impl<'d, M: Mode> I2c<'d, M> {
         // overflows. Everything below is self-contained.
         //
         // Reset the FIFOs first: this drops whatever the aborted transfer
-        // left queued and guarantees room for the recovery STOP. After an
-        // address NACK with autostop disabled, the STOP releases the bus.
+        // left queued and guarantees room for the recovery STOP. Then
+        // clear any still-latched fault *before* queueing the STOP —
+        // `tx_settled` below exits on any error flag, and a stale fault
+        // would trip it immediately, after which the trailing FIFO reset
+        // would discard the STOP before it ever reached the bus, leaving
+        // the transaction active. (Callers that arrive via
+        // `status_and_act` already cleared the flags; callers that arrive
+        // via a non-clearing `read_status` fault have not.)
         self.reset_fifos();
+        self.registers().clear_all_status();
         self.registers().write_command(ControllerCommand::Stop, 0);
 
         // Wait for the STOP to be consumed. `tx_settled` also returns on
@@ -491,7 +518,10 @@ impl<'d, M: Mode> I2c<'d, M> {
                 Some(TxStep::Fault(_)) => {
                     let res = self.status_and_act();
                     if let Err(e) = res {
-                        if matches!(e, IOError::ArbitrationLoss | IOError::FifoError) {
+                        if matches!(
+                            e,
+                            IOError::ArbitrationLoss | IOError::FifoError | IOError::PinLowTimeout
+                        ) {
                             self.remediation();
                         }
                         return Err(e);
@@ -586,7 +616,10 @@ impl<'d, M: Mode> I2c<'d, M> {
         // subsequent transfer would then spin forever waiting for data
         // that never arrives. Recover here so a failed start always
         // returns with the controller in a clean state.
-        if matches!(res, Err(IOError::ArbitrationLoss) | Err(IOError::FifoError)) {
+        if matches!(
+            res,
+            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
+        ) {
             self.remediation();
         }
 
@@ -616,44 +649,134 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
+        // Chained reads keep >256-byte transfers atomic, but on this
+        // silicon a chained command boundary can terminate the transfer
+        // early under heavy interrupt latency (silent, no error flag —
+        // surfaced as UnexpectedStop by the bounded waits). When that
+        // happens the transaction is already broken mid-way, so nothing
+        // further is lost by retrying in seamed mode: each 256-byte
+        // chunk as its own STOP-terminated, re-addressed transfer,
+        // which is immune to the boundary quirk.
+        match self.blocking_read_chained(address, read) {
+            Ok(()) => {}
+            Err(IOError::UnexpectedStop) => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("chained read terminated early; retrying seamed");
+                self.blocking_read_seamed(address, read)?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        if send_stop == SendStop::Yes {
+            self.stop()?;
+        }
+
+        Ok(())
+    }
+
+    /// One read as a single addressed transaction with chained RECEIVE
+    /// commands. Does not send the trailing STOP.
+    fn blocking_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+        // NOTE: start() is outside the recovery guard below —
+        // `status_and_act` inside it already remediates a NACK, and
+        // remediating twice corrupts the controller state for the
+        // next transaction (see the async path's OnDrop note).
+        self.start(address, true)?;
+
+        let total = read.len();
+        // Mirror the async path's OnDrop: an error past this point
+        // aborts mid-transaction, and without recovery the bus is
+        // left in a state that fails the next transfer.
+        let mut drain = || -> Result<(), IOError> {
+            // Chain RECEIVE commands under the single address phase: the
+            // controller ACKs across a command boundary only when the next
+            // command is already queued (otherwise it NACKs and terminates
+            // the read early), so the command pipeline is kept ahead of the
+            // data. This preserves >256-byte reads as ONE bus transaction —
+            // no repeated START (unreliable after the auto-NACK on this
+            // silicon) and no STOP seams (which would break embedded-hal
+            // transaction atomicity and let another controller interleave).
+            let mut queued = 0usize;
+            let mut drained = 0usize;
+            let mut deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+            while drained < total {
+                // Top up the command pipeline whenever there is room.
+                while queued < total {
+                    match self.registers().tx_room_step() {
+                        Some(TxStep::Room) => {
+                            let chunk = (total - queued).min(256);
+                            self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                            queued += chunk;
+                        }
+                        Some(TxStep::Fault(e)) => return Err(e.into()),
+                        // Command FIFO full: plenty is queued ahead of
+                        // the data; go drain some of it.
+                        None => break,
+                    }
+                }
+
+                // Receive one byte, or bail out on a fault (NACK,
+                // arbitration loss, FIFO error): no more data will
+                // arrive, and a data-only wait would spin forever.
+                match self.registers().rx_step() {
+                    Some(RxStep::Byte(b)) => {
+                        read[drained] = b;
+                        drained += 1;
+                        deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+                    }
+                    Some(RxStep::Fault(e)) => return Err(e.into()),
+                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                    // No progress for a full timeout window: the
+                    // transfer died without a flag.
+                    None if embassy_time::Instant::now() > deadline => {
+                        return Err(IOError::UnexpectedStop);
+                    }
+                    None => {}
+                }
+            }
+            Ok(())
+        };
+        if let Err(e) = drain() {
+            self.remediation();
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Fallback: one read as re-addressed 256-byte chunks, each ended
+    /// with a STOP. Not atomic, but immune to the chained-boundary
+    /// early-termination quirk. Does not send the trailing STOP.
+    fn blocking_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
         let nchunks = read.len().div_ceil(256);
         for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            // NOTE: start() is outside the recovery guard below —
-            // `status_and_act` inside it already remediates a NACK, and
-            // remediating twice corrupts the controller state for the
-            // next transaction (see the async path's OnDrop note).
             self.start(address, true)?;
 
-            // Mirror the async path's OnDrop: an error past this point
-            // aborts mid-transaction, and without recovery the bus is
-            // left in a state that fails the next transfer (observed as
-            // FifoError when a retry followed an arbitration loss).
             let mut drain = || -> Result<(), IOError> {
-                // Wait until we have space in the TxFIFO
                 self.wait_tx_room()?;
-
                 self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
 
+                let mut deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
                 for byte in chunk.iter_mut() {
-                    // Receive one byte, or bail out on a fault (NACK,
-                    // arbitration loss, FIFO error): no more data will
-                    // arrive, and a data-only wait would spin forever.
                     *byte = loop {
                         match self.registers().rx_step() {
-                            Some(RxStep::Byte(b)) => break b,
+                            Some(RxStep::Byte(b)) => {
+                                deadline = embassy_time::Instant::now() + RX_BYTE_TIMEOUT;
+                                break b;
+                            }
                             Some(RxStep::Fault(e)) => return Err(e.into()),
+                            Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                            None if embassy_time::Instant::now() > deadline => {
+                                return Err(IOError::UnexpectedStop);
+                            }
                             None => {}
                         }
                     };
                 }
 
-                // End every non-final chunk with a STOP and address the
-                // next chunk fresh. The controller auto-NACKs the last
-                // byte of a consumed RECEIVE command (no adjacent receive
-                // queued), and a repeated START issued right after that
-                // NACK is not reliably accepted: the blocking path hit
-                // FEF at the 256-byte seam. A STOP/START boundary avoids
-                // depending on that marginal state entirely.
+                // End every non-final chunk with a STOP; a repeated START
+                // right after the auto-NACK of a consumed RECEIVE command
+                // is not reliably accepted on this silicon.
                 if idx + 1 < nchunks {
                     self.stop()?;
                 }
@@ -664,11 +787,6 @@ impl<'d, M: Mode> I2c<'d, M> {
                 return Err(e);
             }
         }
-
-        if send_stop == SendStop::Yes {
-            self.stop()?;
-        }
-
         Ok(())
     }
 
@@ -1013,76 +1131,163 @@ impl<'d> I2c<'d, Async> {
     }
 }
 
-impl<'d> AsyncEngine for I2c<'d, Async> {
-    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
-        if read.is_empty() {
-            return Err(IOError::InvalidReadBufferLength);
+impl<'d> I2c<'d, Async> {
+    /// One read as a single addressed transaction with chained RECEIVE
+    /// commands. Does not send the trailing STOP.
+    async fn async_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+        self.async_start(address, true).await?;
+
+        // perform corrective action if the future is dropped or an
+        // error happens between here and the end of the read.
+        //
+        // NOTE: this *must* be set up *after* async_start. async_start
+        // already runs `status_and_act`, which on NACK performs its
+        // own remediation; if we set OnDrop earlier, the early `?`
+        // return would invoke remediation a second time and corrupt
+        // the controller state for the next transaction.
+        let on_drop = OnDrop::new(|| self.remediation());
+
+        let total = read.len();
+        // Chain RECEIVE commands under the single address phase: the
+        // controller ACKs across a command boundary only when the next
+        // command is already queued (otherwise it NACKs and terminates
+        // the read early), so the command pipeline is kept ahead of the
+        // data. This preserves >256-byte reads as ONE bus transaction —
+        // no repeated START (unreliable after the auto-NACK on this
+        // silicon) and no STOP seams (which would break embedded-hal
+        // transaction atomicity and let another controller interleave).
+        let mut queued = 0usize;
+        let mut drained = 0usize;
+        while drained < total {
+            // Top up the command pipeline whenever there is room.
+            while queued < total {
+                match self.registers().tx_room_step() {
+                    Some(TxStep::Room) => {
+                        let chunk = (total - queued).min(256);
+                        self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                        queued += chunk;
+                    }
+                    Some(TxStep::Fault(e)) => return Err(e.into()),
+                    // Command FIFO full: plenty is queued ahead of the
+                    // data; go drain some of it.
+                    None => break,
+                }
+            }
+
+            let timed_out = match embassy_time::with_timeout(
+                RX_BYTE_TIMEOUT,
+                self.info.wait_cell().wait_for(|| {
+                    // enable interrupts
+                    self.enable_rx_ints();
+                    // wake on data, or on a fault that means no more
+                    // data will ever arrive
+                    self.registers().rx_ready()
+                }),
+            )
+            .await
+            {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) => return Err(IOError::ReadFail),
+                Err(_) => true,
+            };
+
+            match self.registers().rx_step() {
+                Some(RxStep::Byte(b)) => {
+                    read[drained] = b;
+                    drained += 1;
+                }
+                // Surface the fault that woke us. If the flag cleared
+                // in between, loop back and wait again.
+                Some(RxStep::Fault(e)) => return Err(e.into()),
+                Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                // Nothing pending after a full timeout window: the
+                // transfer died without a flag.
+                None if timed_out => return Err(IOError::UnexpectedStop),
+                None => {}
+            }
         }
 
+        on_drop.defuse();
+
+        Ok(())
+    }
+
+    /// Fallback: one read as re-addressed 256-byte chunks, each ended
+    /// with a STOP. Not atomic, but immune to the chained-boundary
+    /// early-termination quirk. Does not send the trailing STOP.
+    async fn async_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
         let nchunks = read.len().div_ceil(256);
         for (idx, chunk) in read.chunks_mut(256).enumerate() {
             self.async_start(address, true).await?;
 
-            // perform corrective action if the future is dropped or an
-            // error happens between here and the end of the read.
-            //
-            // NOTE: this *must* be set up *after* async_start. async_start
-            // already runs `status_and_act`, which on NACK performs its
-            // own remediation; if we set OnDrop earlier, the early `?`
-            // return would invoke remediation a second time and corrupt
-            // the controller state for the next transaction.
+            // See async_read_chained for the OnDrop placement rationale.
             let on_drop = OnDrop::new(|| self.remediation());
 
-            // send receive command
             self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
-
-            self.info
-                .wait_cell()
-                .wait_for(|| {
-                    // enable interrupts
-                    self.enable_tx_ints();
-                    // if the command FIFO is empty, we're done sending start
-                    self.registers().tx_settled()
-                })
-                .await
-                .map_err(|_| IOError::Other)?;
 
             for byte in chunk.iter_mut() {
                 loop {
-                    self.info
-                        .wait_cell()
-                        .wait_for(|| {
-                            // enable interrupts
+                    let timed_out = match embassy_time::with_timeout(
+                        RX_BYTE_TIMEOUT,
+                        self.info.wait_cell().wait_for(|| {
                             self.enable_rx_ints();
-                            // wake on data, or on a fault that means no
-                            // more data will ever arrive
                             self.registers().rx_ready()
-                        })
-                        .await
-                        .map_err(|_| IOError::ReadFail)?;
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => false,
+                        Ok(Err(_)) => return Err(IOError::ReadFail),
+                        Err(_) => true,
+                    };
 
                     match self.registers().rx_step() {
                         Some(RxStep::Byte(b)) => {
                             *byte = b;
                             break;
                         }
-                        // Surface the fault that woke us. If the flag
-                        // cleared in between, loop back and wait again.
                         Some(RxStep::Fault(e)) => return Err(e.into()),
+                        Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                        None if timed_out => return Err(IOError::UnexpectedStop),
                         None => {}
                     }
                 }
             }
 
-            // End every non-final chunk with a STOP (see the blocking
-            // path): a repeated START right after the auto-NACK of a
-            // consumed RECEIVE command is not reliably accepted.
+            // End every non-final chunk with a STOP; a repeated START
+            // right after the auto-NACK of a consumed RECEIVE command is
+            // not reliably accepted on this silicon.
             if idx + 1 < nchunks {
                 self.async_stop().await?;
             }
 
-            // defuse it; we'll re-arm on the next chunk if any.
             on_drop.defuse();
+        }
+        Ok(())
+    }
+}
+
+impl<'d> AsyncEngine for I2c<'d, Async> {
+    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+        if read.is_empty() {
+            return Err(IOError::InvalidReadBufferLength);
+        }
+
+        // Chained reads keep >256-byte transfers atomic, but on this
+        // silicon a chained command boundary can terminate the transfer
+        // early under heavy interrupt latency (silent, no error flag —
+        // surfaced as UnexpectedStop by the bounded waits). When that
+        // happens the transaction is already broken mid-way, so nothing
+        // further is lost by retrying in seamed mode, which is immune
+        // to the boundary quirk.
+        match self.async_read_chained(address, read).await {
+            Ok(()) => {}
+            Err(IOError::UnexpectedStop) => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("chained read terminated early; retrying seamed");
+                self.async_read_seamed(address, read).await?;
+            }
+            Err(e) => return Err(e),
         }
 
         if send_stop == SendStop::Yes {
@@ -1217,97 +1422,192 @@ impl<'d> I2c<'d, Dma<'d>> {
     }
 }
 
+impl<'d> I2c<'d, Dma<'d>> {
+    /// Run one RX DMA transfer covering `buf`, waking on completion or on
+    /// a bus fault (which would otherwise leave the DMA waiting forever).
+    /// The caller owns command queueing and recovery (OnDrop).
+    async fn dma_read_into(&self, buf: &mut [u8]) -> Result<(), IOError> {
+        let peri_addr = self.registers().rx_data_ptr();
+
+        unsafe {
+            // Clean up channel state
+            self.mode.rx_dma.disable_request();
+            self.mode.rx_dma.clear_done();
+            self.mode.rx_dma.clear_interrupt();
+
+            // Set DMA request source from instance type (type-safe)
+            self.mode.rx_dma.set_request_source(self.mode.rx_request);
+
+            // Configure TCD for peripheral-to-memory transfer
+            self.mode
+                .rx_dma
+                .setup_read_from_peripheral(peri_addr, buf, false, TransferOptions::COMPLETE_INTERRUPT)?;
+
+            // Enable I2C RX DMA request
+            self.registers().set_rx_dma(true);
+
+            // Enable DMA channel request
+            self.mode.rx_dma.enable_request();
+        }
+
+        // Wait for completion asynchronously — or for a bus error
+        // (NACK, arbitration loss, FIFO error) that stops the
+        // transfer, in which case the DMA would never complete and
+        // waiting on it alone would hang forever. The whole wait is
+        // bounded: the silicon can terminate a transfer silently (no
+        // flag, no interrupt), which only a timeout can catch.
+        let wait = core::future::poll_fn(|cx| {
+            let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
+            if self.mode.rx_dma.is_done() {
+                return core::task::Poll::Ready(Ok(()));
+            }
+            let _ = self.info.wait_cell().poll_wait(cx);
+            // The interrupt handler disables MIER on wake; re-arm the
+            // error sources for the next wait.
+            self.registers().enable_error_interrupts();
+            if let Err(e) = self.status() {
+                return core::task::Poll::Ready(Err(e));
+            }
+            // Early termination with the DMA incomplete: no more data
+            // will arrive and the DMA would wait forever.
+            if self.registers().transfer_ended() {
+                return core::task::Poll::Ready(Err(IOError::UnexpectedStop));
+            }
+            core::task::Poll::Pending
+        });
+        // ~1 ms/byte of margin on top of a generous floor.
+        let bound = RX_BYTE_TIMEOUT + embassy_time::Duration::from_millis(buf.len() as u64);
+        match embassy_time::with_timeout(bound, wait).await {
+            Ok(r) => r?,
+            Err(_) => return Err(IOError::UnexpectedStop),
+        }
+
+        // Ensure DMA writes are visible to CPU
+        cortex_m::asm::dsb();
+        // Cleanup
+        self.registers().set_rx_dma(false);
+        unsafe {
+            self.mode.rx_dma.disable_request();
+            self.mode.rx_dma.clear_done();
+        }
+
+        Ok(())
+    }
+}
+
+impl<'d> I2c<'d, Dma<'d>> {
+    /// One read as a single addressed transaction: every RECEIVE command
+    /// queued up front (caller checks they fit the FIFO), one DMA
+    /// transfer over the whole buffer. Does not send the trailing STOP.
+    async fn dma_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+        self.async_start(address, true).await?;
+
+        // NOTE: OnDrop *after* async_start — see the seamed branch.
+        let on_drop = OnDrop::new(|| {
+            // Stop the DMA request path before any recovery:
+            // remediation resets the FIFOs, which can reassert the
+            // peripheral request while the eDMA channel is still
+            // enabled — letting DMA touch the caller's buffer after
+            // this future has unwound.
+            self.registers().set_rx_dma(false);
+            unsafe {
+                self.mode.rx_dma.disable_request();
+                self.mode.rx_dma.clear_done();
+            }
+            self.remediation();
+        });
+
+        // Queue every RECEIVE command up front (they fit).
+        let total = read.len();
+        let mut queued = 0usize;
+        while queued < total {
+            match self.registers().tx_room_step() {
+                Some(TxStep::Room) => {
+                    let chunk = (total - queued).min(256);
+                    self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                    queued += chunk;
+                }
+                Some(TxStep::Fault(e)) => return Err(e.into()),
+                // Transiently full while the START drains.
+                None => {}
+            }
+        }
+
+        self.dma_read_into(read).await?;
+
+        on_drop.defuse();
+        Ok(())
+    }
+}
+
 impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
     async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        let nchunks = read.len().div_ceil(256);
-        for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            self.async_start(address, true).await?;
-
-            // perform corrective action if the future is dropped or an
-            // error happens between here and the end of the read.
-            //
-            // NOTE: this *must* be set up *after* async_start. async_start
-            // already runs `status_and_act`, which on NACK performs its
-            // own remediation; if we set OnDrop earlier, the early `?`
-            // return would invoke remediation a second time and corrupt
-            // the controller state for the next transaction.
-            let on_drop = OnDrop::new(|| {
-                self.remediation();
-                self.registers().set_rx_dma(false);
-            });
-
-            // send receive command
-            self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
-
-            let peri_addr = self.registers().rx_data_ptr();
-
-            // _rx_dma is guaranteed to be Some
-            unsafe {
-                // Clean up channel state
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-                self.mode.rx_dma.clear_interrupt();
-
-                // Set DMA request source from instance type (type-safe)
-                self.mode.rx_dma.set_request_source(self.mode.rx_request);
-
-                // Configure TCD for peripheral-to-memory transfer
-                self.mode.rx_dma.setup_read_from_peripheral(
-                    peri_addr,
-                    chunk,
-                    false,
-                    TransferOptions::COMPLETE_INTERRUPT,
-                )?;
-
-                // Enable I2C RX DMA request
-                self.registers().set_rx_dma(true);
-
-                // Enable DMA channel request
-                self.mode.rx_dma.enable_request();
-            }
-
-            // Wait for completion asynchronously — or for a bus error
-            // (NACK, arbitration loss, FIFO error) that stops the
-            // transfer, in which case the DMA would never complete and
-            // waiting on it alone would hang forever.
-            core::future::poll_fn(|cx| {
-                let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
-                if self.mode.rx_dma.is_done() {
-                    return core::task::Poll::Ready(Ok(()));
+        // Chain all RECEIVE commands under a single address phase when
+        // they fit the command FIFO: the controller ACKs across a
+        // command boundary only when the next command is already
+        // queued, so a read up to capacity*256 bytes stays ONE bus
+        // transaction. Fall back to re-addressed 256-byte chunks for
+        // longer reads (nothing refills the command FIFO while the CPU
+        // sleeps on the DMA completion), or when a chained boundary
+        // terminates the transfer early (silicon quirk, surfaced as
+        // UnexpectedStop) — the transaction is already broken then, so
+        // the seamed retry loses nothing further.
+        let ncmds = read.len().div_ceil(256);
+        let mut seamed = ncmds > self.registers().tx_fifo_capacity();
+        if !seamed {
+            match self.dma_read_chained(address, read).await {
+                Ok(()) => {}
+                Err(IOError::UnexpectedStop) => {
+                    #[cfg(feature = "defmt")]
+                    defmt::trace!("chained DMA read terminated early; retrying seamed");
+                    seamed = true;
                 }
-                let _ = self.info.wait_cell().poll_wait(cx);
-                // The interrupt handler disables MIER on wake; re-arm the
-                // error sources for the next wait.
-                self.registers().enable_error_interrupts();
-                if let Err(e) = self.status() {
-                    return core::task::Poll::Ready(Err(e));
+                Err(e) => return Err(e),
+            }
+        }
+        if seamed {
+            let nchunks = read.len().div_ceil(256);
+            for (idx, chunk) in read.chunks_mut(256).enumerate() {
+                self.async_start(address, true).await?;
+
+                // perform corrective action if the future is dropped or
+                // an error happens between here and the end of the read.
+                //
+                // NOTE: this *must* be set up *after* async_start.
+                // async_start already runs `status_and_act`, which on
+                // NACK performs its own remediation; if we set OnDrop
+                // earlier, the early `?` return would invoke remediation
+                // a second time and corrupt the controller state for the
+                // next transaction.
+                let on_drop = OnDrop::new(|| {
+                    // Request path off before recovery — see above.
+                    self.registers().set_rx_dma(false);
+                    unsafe {
+                        self.mode.rx_dma.disable_request();
+                        self.mode.rx_dma.clear_done();
+                    }
+                    self.remediation();
+                });
+
+                // send receive command
+                self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
+
+                self.dma_read_into(chunk).await?;
+
+                // End every non-final chunk with a STOP: a repeated START
+                // right after the auto-NACK of a consumed RECEIVE command
+                // is not reliably accepted on this silicon.
+                if idx + 1 < nchunks {
+                    self.async_stop().await?;
                 }
-                core::task::Poll::Pending
-            })
-            .await?;
 
-            // Ensure DMA writes are visible to CPU
-            cortex_m::asm::dsb();
-            // Cleanup
-            self.registers().set_rx_dma(false);
-            unsafe {
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
+                // defuse it; we'll re-arm on the next chunk if any.
+                on_drop.defuse();
             }
-
-            // End every non-final chunk with a STOP (see the blocking
-            // path): a repeated START right after the auto-NACK of a
-            // consumed RECEIVE command is not reliably accepted.
-            if idx + 1 < nchunks {
-                self.async_stop().await?;
-            }
-
-            // defuse it; we'll re-arm on the next chunk if any.
-            on_drop.defuse();
         }
 
         if send_stop == SendStop::Yes {
@@ -1341,8 +1641,14 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
-            self.remediation();
+            // Same ordering rationale as the DMA read path: kill the
+            // request path before recovery touches the FIFOs.
             self.registers().set_tx_dma(false);
+            unsafe {
+                self.mode.tx_dma.disable_request();
+                self.mode.tx_dma.clear_done();
+            }
+            self.remediation();
         });
 
         for chunk in write.chunks(DMA_MAX_TRANSFER_SIZE) {

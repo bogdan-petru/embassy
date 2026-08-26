@@ -73,7 +73,7 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::target_registers::{TargetRegisters, TargetRxEvent, TargetTxStep};
+use super::target_registers::{TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -117,6 +117,15 @@ pub enum IOError {
 impl From<crate::dma::InvalidParameters> for IOError {
     fn from(_value: crate::dma::InvalidParameters) -> Self {
         IOError::Other
+    }
+}
+
+impl From<TargetFault> for IOError {
+    fn from(value: TargetFault) -> Self {
+        match value {
+            TargetFault::Bit => IOError::BitError,
+            TargetFault::Fifo => IOError::FifoError,
+        }
     }
 }
 
@@ -593,6 +602,10 @@ impl<'d, M: Mode> I2c<'d, M> {
             // (the wrapper's tx_step encodes that order).
             loop {
                 match self.registers().tx_step() {
+                    Some(TargetTxStep::Fault(f)) => {
+                        self.reset_fifos();
+                        return Err(f.into());
+                    }
                     Some(TargetTxStep::Ended) => {
                         #[cfg(feature = "defmt")]
                         defmt::trace!("Early stop of Target Send routine. STOP or Repeated-start received");
@@ -612,6 +625,10 @@ impl<'d, M: Mode> I2c<'d, M> {
         // controller is done (NACK + STOP/RSTART) or whether it wants more.
         let ended = loop {
             match self.registers().tx_step() {
+                Some(TargetTxStep::Fault(f)) => {
+                    self.reset_fifos();
+                    return Err(f.into());
+                }
                 Some(TargetTxStep::Ended) => break true,
                 Some(TargetTxStep::Room) => break false,
                 None => {}
@@ -657,6 +674,10 @@ impl<'d, M: Mode> I2c<'d, M> {
                         *byte = b;
                         count += 1;
                         break;
+                    }
+                    Some(TargetRxEvent::Fault(f)) => {
+                        self.reset_fifos();
+                        return Err(f.into());
                     }
                     Some(TargetRxEvent::Stopped) => {
                         #[cfg(feature = "defmt")]
@@ -1143,6 +1164,10 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                     .map_err(|_| IOError::Other)?;
 
                 match self.registers().tx_step() {
+                    Some(TargetTxStep::Fault(f)) => {
+                        self.reset_fifos();
+                        return Err(f.into());
+                    }
                     Some(TargetTxStep::Ended) => {
                         #[cfg(feature = "defmt")]
                         defmt::trace!("Early stop of Target Send routine. STOP or Repeated-start received");
@@ -1176,6 +1201,10 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                 .map_err(|_| IOError::Other)?;
 
             match self.registers().tx_step() {
+                Some(TargetTxStep::Fault(f)) => {
+                    self.reset_fifos();
+                    return Err(f.into());
+                }
                 Some(TargetTxStep::Ended) => break true,
                 Some(TargetTxStep::Room) => break false,
                 None => {}
@@ -1219,6 +1248,10 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                         *byte = b;
                         count += 1;
                         break;
+                    }
+                    Some(TargetRxEvent::Fault(f)) => {
+                        self.reset_fifos();
+                        return Err(f.into());
                     }
                     Some(TargetRxEvent::Stopped) => {
                         #[cfg(feature = "defmt")]
