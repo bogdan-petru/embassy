@@ -13,8 +13,12 @@
 //! - `MSR`/`SSR` writes are W1C; [`LocalRegisterCopy`] makes the
 //!   read-once/write-back-the-same-snapshot pattern a first-class value.
 //!
-//! Layout drift against the PAC is guarded by `offset_of!` assertions at
-//! the bottom, transcribed from `nxp-pac`'s generated accessors.
+//! Layout drift is guarded twice: `offset_of!` assertions at the bottom
+//! pin this map against transcribed offsets at compile time, and
+//! [`check_layout`] compares every mapped register's address against the
+//! PAC's *generated* accessors at driver init — so a regenerated PAC
+//! with a changed layout (which the transcribed literals cannot see)
+//! panics at first construction instead of corrupting MMIO.
 
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
 use tock_registers::{register_bitfields, register_structs};
@@ -192,6 +196,44 @@ pub(super) fn from_pac(regs: crate::pac::lpi2c::Lpi2c) -> &'static LpI2cRegister
     // the whole address space this struct spans; the offset assertions
     // below pin the layout, and all register types are volatile accessors.
     unsafe { &*(regs.as_ptr() as *const LpI2cRegisters) }
+}
+
+/// Assert, against the PAC's *generated* accessors, that this map and
+/// the PAC agree on every mapped register address.
+///
+/// The `offset_of!` block below pins the Tock side against transcribed
+/// offsets at compile time, but both sides of that check come from the
+/// same manual transcription — it cannot catch the PAC itself drifting
+/// (a regenerated PAC with a changed layout). This check compares
+/// against the PAC's own accessor pointers, so drift in either layer
+/// trips it. Called once per driver construction; a handful of pointer
+/// comparisons, active in release builds too.
+pub(super) fn check_layout(regs: crate::pac::lpi2c::Lpi2c) {
+    let tock = from_pac(regs);
+
+    macro_rules! check {
+        ($accessor:ident, $field:ident) => {
+            assert!(
+                regs.$accessor().as_ptr() as usize == &tock.$field as *const _ as usize,
+                concat!("lpi2c_regs layout drift vs PAC: ", stringify!($field))
+            );
+        };
+    }
+
+    check!(param, param);
+    check!(mcr, mcr);
+    check!(msr, msr);
+    check!(mier, mier);
+    check!(mder, mder);
+    check!(mcfgr1, mcfgr1);
+    check!(mfsr, mfsr);
+    check!(mtdr, mtdr);
+    check!(mrdr, mrdr);
+    check!(scr, scr);
+    check!(ssr, ssr);
+    check!(sier, sier);
+    check!(stdr, stdr);
+    check!(srdr, srdr);
 }
 
 // Offsets transcribed from nxp-pac (nxp-pac/src/meta_peripherals/mcxa/LPI2C.rs).

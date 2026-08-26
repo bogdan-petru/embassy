@@ -350,6 +350,10 @@ impl<'d, M: Mode> I2c<'d, M> {
     }
 
     fn set_configuration(&self, config: &Config) -> Result<(), SetupError> {
+        // One-time cross-check of the Tock register map against the
+        // PAC's generated accessors (catches layout drift in either).
+        super::lpi2c_regs::check_layout(self.info.regs());
+
         critical_section::with(|_| {
             // Disable the target.
             self.info.regs().scr().modify(|w| w.set_sen(false));
