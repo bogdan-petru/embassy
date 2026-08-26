@@ -590,7 +590,13 @@ impl<'d, M: Mode> I2c<'d, M> {
     pub fn blocking_respond_to_read(&mut self, buf: &[u8]) -> Result<ReadStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         for byte in buf.iter() {
             // Wait until we can send data, honoring termination first
@@ -657,7 +663,13 @@ impl<'d, M: Mode> I2c<'d, M> {
     pub fn blocking_respond_to_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         for byte in buf.iter_mut() {
             // Wait for one receive event. The wrapper's rx_event drains
@@ -846,7 +858,13 @@ impl<'d> I2c<'d, Dma<'d>> {
         let peri_addr = self.info.regs().srdr().as_ptr() as *const u8;
         let chunk_len = data.len();
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         unsafe {
             // Clean up channel state
@@ -928,7 +946,13 @@ impl<'d> I2c<'d, Dma<'d>> {
         let peri_addr = self.info.regs().stdr().as_ptr() as *mut u8;
         let chunk_len = data.len();
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         unsafe {
             // Clean up channel state
@@ -1147,7 +1171,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
     async fn async_respond_to_read_internal(&mut self, buf: &[u8]) -> Result<ReadStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         for byte in buf.iter() {
             // Wait until we can send data, honoring termination first
@@ -1223,7 +1253,13 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
     async fn async_respond_to_write_internal(&mut self, buf: &mut [u8]) -> Result<WriteStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         for byte in buf.iter_mut() {
             // Wait for one receive event. The wrapper's rx_event drains
@@ -1277,7 +1313,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
     async fn async_respond_to_read_internal(&mut self, buf: &[u8]) -> Result<ReadStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {
@@ -1332,7 +1374,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
     async fn async_respond_to_write_internal<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<WriteStatus, IOError> {
         let mut count = 0;
 
-        self.clear_status();
+        // NOTE: deliberately no entry `clear_status()` here. The
+        // `listen` that announced this transaction already cleared
+        // the stale flags via `status()`, so anything latched now
+        // belongs to *this* transfer — including a STOP or repeated
+        // START that arrived between `listen` returning and this
+        // call. Clearing it would erase the only signal that the
+        // transfer is over and leave the wait below hanging.
 
         // perform corrective action if the future is dropped
         let on_drop = OnDrop::new(|| {

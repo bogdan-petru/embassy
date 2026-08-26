@@ -551,7 +551,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         // via a non-clearing `read_status` fault have not.)
         self.reset_fifos();
         self.registers().clear_all_status();
-        self.registers().write_command(ControllerCommand::Stop, 0);
+        self.registers().write_command(ControllerCommand::STOP, 0);
 
         // Wait for the STOP to be consumed. `tx_settled` also returns on
         // a fault, but a target holding SCL low satisfies neither
@@ -696,9 +696,9 @@ impl<'d, M: Mode> I2c<'d, M> {
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
             if self.is_hs {
-                ControllerCommand::StartHs
+                ControllerCommand::START_HS
             } else {
-                ControllerCommand::Start
+                ControllerCommand::START
             },
             addr_rw,
         );
@@ -735,7 +735,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         // Wait until we have space in the TxFIFO
         self.wait_tx_room()?;
 
-        self.send_cmd(ControllerCommand::Stop, 0);
+        self.send_cmd(ControllerCommand::STOP, 0);
 
         // Wait for TxFIFO to be drained
         self.wait_tx_settled()?;
@@ -803,7 +803,7 @@ impl<'d, M: Mode> I2c<'d, M> {
                     match self.registers().tx_room_step() {
                         Some(TxStep::Room) => {
                             let chunk = (total - queued).min(256);
-                            self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                            self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                             queued += chunk;
                         }
                         Some(TxStep::Fault(e)) => return Err(e.into()),
@@ -852,7 +852,7 @@ impl<'d, M: Mode> I2c<'d, M> {
 
             let mut drain = || -> Result<(), IOError> {
                 self.wait_tx_room()?;
-                self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
+                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
                 let mut deadline = embassy_time::Instant::now() + self.timeout;
                 for byte in chunk.iter_mut() {
@@ -914,7 +914,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Wait until we have space in the TxFIFO
             self.wait_tx_room()?;
 
-            self.send_cmd(ControllerCommand::Transmit, *byte);
+            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
         }
 
         if send_stop == SendStop::Yes {
@@ -1033,9 +1033,9 @@ where
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
             if self.is_hs {
-                ControllerCommand::StartHs
+                ControllerCommand::START_HS
             } else {
-                ControllerCommand::Start
+                ControllerCommand::START
             },
             addr_rw,
         );
@@ -1058,7 +1058,7 @@ where
 
     async fn async_stop(&self) -> Result<(), IOError> {
         // send the stop command
-        self.send_cmd(ControllerCommand::Stop, 0);
+        self.send_cmd(ControllerCommand::STOP, 0);
 
         self.info
             .wait_cell()
@@ -1262,7 +1262,7 @@ impl<'d> I2c<'d, Async> {
                 match self.registers().tx_room_step() {
                     Some(TxStep::Room) => {
                         let chunk = (total - queued).min(256);
-                        self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                        self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                         queued += chunk;
                     }
                     Some(TxStep::Fault(e)) => return Err(e.into()),
@@ -1321,7 +1321,7 @@ impl<'d> I2c<'d, Async> {
             // See async_read_chained for the OnDrop placement rationale.
             let on_drop = OnDrop::new(|| self.remediation());
 
-            self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
+            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
             for byte in chunk.iter_mut() {
                 loop {
@@ -1422,7 +1422,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
 
         for byte in write {
             // initiate transmit
-            self.send_cmd(ControllerCommand::Transmit, *byte);
+            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
 
             self.info
                 .wait_cell()
@@ -1618,7 +1618,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => {
                     let chunk = (total - queued).min(256);
-                    self.send_cmd(ControllerCommand::Receive, (chunk - 1) as u8);
+                    self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                     queued += chunk;
                 }
                 Some(TxStep::Fault(e)) => return Err(e.into()),
@@ -1693,7 +1693,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 });
 
                 // send receive command
-                self.send_cmd(ControllerCommand::Receive, (chunk.len() - 1) as u8);
+                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
                 self.dma_read_into(chunk).await?;
 

@@ -1,17 +1,20 @@
-//! Tock-style (`tock-registers`) register map for the LPI2C hot paths.
+//! Tock-style (`tock-registers`) MMIO cells for the LPI2C hot paths.
 //!
-//! This is a deliberate, second definition of the LPI2C register layout
-//! next to `nxp-pac`, limited to the registers the transfer hot paths
-//! touch. The PAC remains the layer for one-time configuration (clocks,
-//! timing, addresses); this map exists so the safe wrappers on top of it
-//! can use `tock-registers`' access typing:
+//! This module supplies **only** the two things `nxp-pac` does not give
+//! the safe wrappers: a `register_structs!` layout whose padding and
+//! offsets are checked by the compiler, and per-register access typing
+//! ([`ReadOnly`] / [`WriteOnly`] / [`ReadWrite`]) that makes a wrong-
+//! direction access unrepresentable — `MRDR`/`SRDR` reads *pop* a FIFO
+//! and must never be written, `MTDR`/`STDR` must never be read back.
 //!
-//! - `MRDR`/`SRDR` are [`ReadOnly`]: a read *pops* the RX FIFO, and the
-//!   type makes accidental writes unrepresentable.
-//! - `MTDR`/`STDR` are [`WriteOnly`]: reading them back is meaningless
-//!   and now impossible.
-//! - `MSR`/`SSR` writes are W1C; [`LocalRegisterCopy`] makes the
-//!   read-once/write-back-the-same-snapshot pattern a first-class value.
+//! Everything *semantic* stays in the PAC. There are deliberately no
+//! `register_bitfields!` here: field offsets, widths, enumerated values
+//! and command encodings would then exist in two places, and an address
+//! check cannot catch a bit that moved. The cells are therefore untyped
+//! `u32`, and the wrappers convert each raw word through the PAC's own
+//! value types (`pac::lpi2c::Msr`, `Mier`, `Cmd`, …), which are plain
+//! `pub struct X(pub u32)` newtypes over exactly this word. The PAC
+//! remains the single source of truth for what the bits mean.
 //!
 //! Layout drift is guarded twice: `offset_of!` assertions at the bottom
 //! pin this map against transcribed offsets at compile time, and
@@ -20,181 +23,62 @@
 //! with a changed layout (which the transcribed literals cannot see)
 //! panics at first construction instead of corrupting MMIO.
 
+use tock_registers::register_structs;
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
-use tock_registers::{register_bitfields, register_structs};
 
 register_structs! {
-    /// LPI2C register block (hot-path subset; gaps are config registers
-    /// still owned by the PAC).
+    /// LPI2C register block (hot-path subset; gaps are configuration
+    /// registers still accessed through the PAC).
     pub LpI2cRegisters {
         (0x000 => _reserved0),
-        /// Parameter Register (FIFO sizes).
-        (0x004 => pub param: ReadOnly<u32, PARAM::Register>),
+        /// Parameter Register (FIFO sizes). PAC type: `Param`.
+        (0x004 => pub param: ReadOnly<u32>),
         (0x008 => _reserved1),
-        /// Controller Control Register.
-        (0x010 => pub mcr: ReadWrite<u32, MCR::Register>),
-        /// Controller Status Register (W1C flags).
-        (0x014 => pub msr: ReadWrite<u32, MSR::Register>),
-        /// Controller Interrupt Enable Register.
-        (0x018 => pub mier: ReadWrite<u32, MIER::Register>),
-        /// Controller DMA Enable Register.
-        (0x01c => pub mder: ReadWrite<u32, MDER::Register>),
+        /// Controller Control Register. PAC type: `Mcr`.
+        (0x010 => pub mcr: ReadWrite<u32>),
+        /// Controller Status Register (W1C flags). PAC type: `Msr`.
+        (0x014 => pub msr: ReadWrite<u32>),
+        /// Controller Interrupt Enable Register. PAC type: `Mier`.
+        (0x018 => pub mier: ReadWrite<u32>),
+        /// Controller DMA Enable Register. PAC type: `Mder`.
+        (0x01c => pub mder: ReadWrite<u32>),
         (0x020 => _reserved2),
-        /// Controller Configuration 1 (read here only for AUTOSTOP).
-        (0x024 => pub mcfgr1: ReadWrite<u32, MCFGR1::Register>),
+        /// Controller Configuration 1. PAC type: `Mcfgr1`.
+        (0x024 => pub mcfgr1: ReadWrite<u32>),
         (0x028 => _reserved3),
-        /// Controller FIFO Status Register.
-        (0x05c => pub mfsr: ReadOnly<u32, MFSR::Register>),
+        /// Controller FIFO Status Register. PAC type: `Mfsr`.
+        (0x05c => pub mfsr: ReadOnly<u32>),
         /// Controller Transmit Data Register (command + data).
-        (0x060 => pub mtdr: WriteOnly<u32, MTDR::Register>),
+        /// Write-only: reading it back is meaningless. PAC type: `Mtdr`.
+        (0x060 => pub mtdr: WriteOnly<u32>),
         (0x064 => _reserved4),
-        /// Controller Receive Data Register (a read pops the RX FIFO).
-        (0x070 => pub mrdr: ReadOnly<u32, MRDR::Register>),
+        /// Controller Receive Data Register. Read-only, and a read
+        /// *pops* the RX FIFO. PAC type: `Mrdr`.
+        (0x070 => pub mrdr: ReadOnly<u32>),
         (0x074 => _reserved5),
-        /// Target Control Register.
-        (0x110 => pub scr: ReadWrite<u32, SCR::Register>),
-        /// Target Status Register (W1C flags).
-        (0x114 => pub ssr: ReadWrite<u32, SSR::Register>),
-        /// Target Interrupt Enable Register.
-        (0x118 => pub sier: ReadWrite<u32, SIER::Register>),
+        /// Target Control Register. PAC type: `Scr`.
+        (0x110 => pub scr: ReadWrite<u32>),
+        /// Target Status Register (W1C flags). PAC type: `Ssr`.
+        (0x114 => pub ssr: ReadWrite<u32>),
+        /// Target Interrupt Enable Register. PAC type: `Sier`.
+        (0x118 => pub sier: ReadWrite<u32>),
         (0x11c => _reserved6),
-        /// Target Transmit Data Register.
-        (0x160 => pub stdr: WriteOnly<u32, STDR::Register>),
+        /// Target Transmit Data Register. Write-only. PAC type: `Stdr`.
+        (0x160 => pub stdr: WriteOnly<u32>),
         (0x164 => _reserved7),
-        /// Target Receive Data Register (a read pops the RX FIFO).
-        (0x170 => pub srdr: ReadOnly<u32, SRDR::Register>),
+        /// Target Receive Data Register. Read-only, and a read *pops*
+        /// the RX FIFO. PAC type: `Srdr`.
+        (0x170 => pub srdr: ReadOnly<u32>),
         (0x174 => @END),
     }
 }
 
-register_bitfields![u32,
-    pub PARAM [
-        MTXFIFO OFFSET(0) NUMBITS(4) [],
-        MRXFIFO OFFSET(8) NUMBITS(4) [],
-    ],
-    pub MCR [
-        MEN OFFSET(0) NUMBITS(1) [],
-        RST OFFSET(1) NUMBITS(1) [],
-        DOZEN OFFSET(2) NUMBITS(1) [],
-        DBGEN OFFSET(3) NUMBITS(1) [],
-        RTF OFFSET(8) NUMBITS(1) [],
-        RRF OFFSET(9) NUMBITS(1) [],
-    ],
-    pub MSR [
-        TDF OFFSET(0) NUMBITS(1) [],
-        RDF OFFSET(1) NUMBITS(1) [],
-        EPF OFFSET(8) NUMBITS(1) [],
-        SDF OFFSET(9) NUMBITS(1) [],
-        NDF OFFSET(10) NUMBITS(1) [],
-        ALF OFFSET(11) NUMBITS(1) [],
-        FEF OFFSET(12) NUMBITS(1) [],
-        PLTF OFFSET(13) NUMBITS(1) [],
-        DMF OFFSET(14) NUMBITS(1) [],
-        STF OFFSET(15) NUMBITS(1) [],
-        MBF OFFSET(24) NUMBITS(1) [],
-        BBF OFFSET(25) NUMBITS(1) [],
-    ],
-    pub MIER [
-        TDIE OFFSET(0) NUMBITS(1) [],
-        RDIE OFFSET(1) NUMBITS(1) [],
-        EPIE OFFSET(8) NUMBITS(1) [],
-        SDIE OFFSET(9) NUMBITS(1) [],
-        NDIE OFFSET(10) NUMBITS(1) [],
-        ALIE OFFSET(11) NUMBITS(1) [],
-        FEIE OFFSET(12) NUMBITS(1) [],
-        PLTIE OFFSET(13) NUMBITS(1) [],
-        DMIE OFFSET(14) NUMBITS(1) [],
-        STIE OFFSET(15) NUMBITS(1) [],
-    ],
-    pub MDER [
-        TDDE OFFSET(0) NUMBITS(1) [],
-        RDDE OFFSET(1) NUMBITS(1) [],
-    ],
-    pub MCFGR1 [
-        PRESCALE OFFSET(0) NUMBITS(3) [],
-        AUTOSTOP OFFSET(8) NUMBITS(1) [],
-        IGNACK OFFSET(9) NUMBITS(1) [],
-    ],
-    pub MFSR [
-        TXCOUNT OFFSET(0) NUMBITS(3) [],
-        RXCOUNT OFFSET(16) NUMBITS(3) [],
-    ],
-    pub MTDR [
-        DATA OFFSET(0) NUMBITS(8) [],
-        CMD OFFSET(8) NUMBITS(3) [
-            Transmit = 0,
-            Receive = 1,
-            Stop = 2,
-            ReceiveAndDiscard = 3,
-            Start = 4,
-            StartExpectNack = 5,
-            StartHs = 6,
-            StartHsExpectNack = 7,
-        ],
-    ],
-    pub MRDR [
-        DATA OFFSET(0) NUMBITS(8) [],
-        RXEMPTY OFFSET(14) NUMBITS(1) [],
-    ],
-    pub SCR [
-        SEN OFFSET(0) NUMBITS(1) [],
-        RST OFFSET(1) NUMBITS(1) [],
-        FILTEN OFFSET(4) NUMBITS(1) [],
-        FILTDZ OFFSET(5) NUMBITS(1) [],
-        RTF OFFSET(8) NUMBITS(1) [],
-        RRF OFFSET(9) NUMBITS(1) [],
-    ],
-    pub SSR [
-        TDF OFFSET(0) NUMBITS(1) [],
-        RDF OFFSET(1) NUMBITS(1) [],
-        AVF OFFSET(2) NUMBITS(1) [],
-        TAF OFFSET(3) NUMBITS(1) [],
-        RSF OFFSET(8) NUMBITS(1) [],
-        SDF OFFSET(9) NUMBITS(1) [],
-        BEF OFFSET(10) NUMBITS(1) [],
-        FEF OFFSET(11) NUMBITS(1) [],
-        AM0F OFFSET(12) NUMBITS(1) [],
-        AM1F OFFSET(13) NUMBITS(1) [],
-        GCF OFFSET(14) NUMBITS(1) [],
-        SARF OFFSET(15) NUMBITS(1) [],
-        SBF OFFSET(24) NUMBITS(1) [],
-        BBF OFFSET(25) NUMBITS(1) [],
-    ],
-    pub SIER [
-        TDIE OFFSET(0) NUMBITS(1) [],
-        RDIE OFFSET(1) NUMBITS(1) [],
-        AVIE OFFSET(2) NUMBITS(1) [],
-        TAIE OFFSET(3) NUMBITS(1) [],
-        RSIE OFFSET(8) NUMBITS(1) [],
-        SDIE OFFSET(9) NUMBITS(1) [],
-        BEIE OFFSET(10) NUMBITS(1) [],
-        FEIE OFFSET(11) NUMBITS(1) [],
-        AM0IE OFFSET(12) NUMBITS(1) [],
-        AM1IE OFFSET(13) NUMBITS(1) [],
-        GCIE OFFSET(14) NUMBITS(1) [],
-        SARIE OFFSET(15) NUMBITS(1) [],
-    ],
-    pub STDR [
-        DATA OFFSET(0) NUMBITS(8) [],
-    ],
-    pub SRDR [
-        DATA OFFSET(0) NUMBITS(8) [],
-        RADDR OFFSET(8) NUMBITS(3) [],
-        RXEMPTY OFFSET(14) NUMBITS(1) [],
-        SOF OFFSET(15) NUMBITS(1) [],
-    ],
-];
-
 /// View the LPI2C block behind a PAC handle through the Tock map.
-///
-/// # Safety-relevant invariants (checked below)
-/// The struct layout must match the hardware layout the PAC describes;
-/// every offset is asserted against the value transcribed from
-/// `nxp-pac`'s generated accessors.
 pub(super) fn from_pac(regs: crate::pac::lpi2c::Lpi2c) -> &'static LpI2cRegisters {
     // SAFETY: `regs` wraps the peripheral's MMIO base address, valid for
-    // the whole address space this struct spans; the offset assertions
-    // below pin the layout, and all register types are volatile accessors.
+    // the whole address span this struct covers; the offsets are pinned
+    // by the assertions below and by `check_layout`, and every field is
+    // a volatile accessor.
     unsafe { &*(regs.as_ptr() as *const LpI2cRegisters) }
 }
 
@@ -208,6 +92,9 @@ pub(super) fn from_pac(regs: crate::pac::lpi2c::Lpi2c) -> &'static LpI2cRegister
 /// against the PAC's own accessor pointers, so drift in either layer
 /// trips it. Called once per driver construction; a handful of pointer
 /// comparisons, active in release builds too.
+///
+/// Field *positions* need no equivalent check: they are never
+/// transcribed here, only read through the PAC's own value types.
 pub(super) fn check_layout(regs: crate::pac::lpi2c::Lpi2c) {
     let tock = from_pac(regs);
 

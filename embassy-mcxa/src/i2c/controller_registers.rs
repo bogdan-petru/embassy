@@ -1,9 +1,11 @@
-//! Safe controller-side operations over the Tock-style LPI2C register map.
+//! Safe controller-side operations over the LPI2C register block.
 //!
-//! Built on [`super::lpi2c_regs`] (`tock-registers`), so register access
-//! typing is enforced by construction: `MRDR` is read-only and popping,
-//! `MTDR` is write-only, W1C status handling goes through
-//! [`LocalRegisterCopy`] snapshots.
+//! Two layers meet here. [`super::lpi2c_regs`] supplies `tock-registers`
+//! MMIO cells, so access direction is enforced by type: `MRDR` is
+//! read-only and popping, `MTDR` is write-only. The PAC supplies every
+//! field *meaning* — each raw word is converted through the PAC's own
+//! value type (`Msr`, `Mier`, `Cmd`, …), so bit positions and
+//! enumerated values are defined exactly once, in the generated code.
 //!
 //! The API is a deliberately *closed vocabulary*: there is no bare
 //! "FIFO empty" predicate to wait on. Every wait primitive couples data
@@ -12,23 +14,15 @@
 //! tests found in all three read paths — cannot be expressed against
 //! this interface.
 
-use tock_registers::LocalRegisterCopy;
-use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+use tock_registers::interfaces::{Readable, Writeable};
 
-use super::lpi2c_regs::{self, LpI2cRegisters, MCFGR1, MCR, MDER, MFSR, MIER, MRDR, MSR, MTDR, PARAM};
+use super::lpi2c_regs::{self, LpI2cRegisters};
 use crate::pac;
-
-/// Commands for the controller transmit FIFO (MTDR\[CMD\]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[repr(u32)]
-pub(super) enum ControllerCommand {
-    Transmit = 0,
-    Receive = 1,
-    Stop = 2,
-    Start = 4,
-    StartHs = 6,
-}
+pub(super) use crate::pac::lpi2c::Cmd as ControllerCommand;
+use crate::pac::lpi2c::{
+    Alf, Dmf, Epf, Mbf, Mcfgr1, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param,
+    Pltf, Stf,
+};
 
 /// A typed snapshot of the controller error flags relevant to transfers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,17 +31,17 @@ pub(super) struct ControllerStatus {
 }
 
 impl ControllerStatus {
-    fn from_snapshot(msr: &LocalRegisterCopy<u32, MSR::Register>) -> Self {
+    fn from_snapshot(msr: &Msr) -> Self {
         // Priority mirrors the hardware relevance order: an address NACK
         // explains everything after it, arbitration loss next, FIFO
         // error last.
-        let error = if msr.is_set(MSR::NDF) {
+        let error = if msr.ndf() == Ndf::IntYes {
             Some(ControllerStatusError::AddressNack)
-        } else if msr.is_set(MSR::ALF) {
+        } else if msr.alf() == Alf::IntYes {
             Some(ControllerStatusError::ArbitrationLoss)
-        } else if msr.is_set(MSR::FEF) {
+        } else if msr.fef() == MsrFef::IntYes {
             Some(ControllerStatusError::Fifo)
-        } else if msr.is_set(MSR::PLTF) {
+        } else if msr.pltf() == Pltf::IntYes {
             // Fires only when MCFGR3[PINLOW] is configured, but the
             // interrupt masks enable PLTIE, so it must be part of the
             // fault set: an unsurfaced wake-without-error would loop
@@ -81,13 +75,12 @@ pub(super) enum ControllerStatusError {
 pub(super) enum RxStep {
     Byte(u8),
     Fault(ControllerStatusError),
-    /// The transfer terminated (EPF/SDF latched) with no data pending
-    /// and no fault flagged. Observed on FRDM-MCXA577 during chained
-    /// multi-command reads under interrupt-latency stress: the transfer
-    /// ends mid-read with SDF+EPF and the remaining queued commands
-    /// discarded — the same silicon quirk family as the spurious
-    /// arbitration loss. Without this variant the reader waits forever
-    /// for bytes that will never arrive.
+    /// The transfer terminated with no data pending and no fault
+    /// flagged. Observed on FRDM-MCXA577 during chained multi-command
+    /// reads under interrupt-latency stress: the transfer ends mid-read
+    /// with the remaining queued commands discarded — the same silicon
+    /// quirk family as the spurious arbitration loss. Without this
+    /// variant the reader waits forever for bytes that never arrive.
     Ended,
 }
 
@@ -112,6 +105,39 @@ impl ControllerRegisters {
         }
     }
 
+    // Raw word <-> PAC value type. Field meanings live in the PAC; the
+    // Tock cells only decide who may read and who may write.
+
+    fn msr(&self) -> Msr {
+        Msr(self.regs.msr.get())
+    }
+
+    fn mfsr(&self) -> Mfsr {
+        Mfsr(self.regs.mfsr.get())
+    }
+
+    fn write_msr(&self, v: Msr) {
+        self.regs.msr.set(v.0);
+    }
+
+    fn write_mier(&self, f: impl FnOnce(&mut Mier)) {
+        let mut v = Mier(0);
+        f(&mut v);
+        self.regs.mier.set(v.0);
+    }
+
+    fn modify_mcr(&self, f: impl FnOnce(&mut Mcr)) {
+        let mut v = Mcr(self.regs.mcr.get());
+        f(&mut v);
+        self.regs.mcr.set(v.0);
+    }
+
+    fn modify_mder(&self, f: impl FnOnce(&mut Mder)) {
+        let mut v = Mder(self.regs.mder.get());
+        f(&mut v);
+        self.regs.mder.set(v.0);
+    }
+
     /// Disable the controller interrupt mask if any source is enabled.
     ///
     /// Returns whether the driver should wake its waiter.
@@ -134,41 +160,55 @@ impl ControllerRegisters {
         // detection; EPF from repeated STARTs), so arming them storms
         // the waker. Silent early termination is handled by bounded
         // waits in the driver instead.
-        self.regs
-            .mier
-            .write(MIER::NDIE::SET + MIER::ALIE::SET + MIER::FEIE::SET + MIER::PLTIE::SET);
+        self.write_mier(|w| {
+            w.set_ndie(true);
+            w.set_alie(true);
+            w.set_feie(true);
+            w.set_pltie(true);
+        });
     }
 
     pub(super) fn enable_receive_interrupts(&self) {
         // No EPIE/SDIE — see `enable_error_interrupts`.
-        self.regs
-            .mier
-            .write(MIER::RDIE::SET + MIER::NDIE::SET + MIER::ALIE::SET + MIER::FEIE::SET + MIER::PLTIE::SET);
+        self.write_mier(|w| {
+            w.set_rdie(true);
+            w.set_ndie(true);
+            w.set_alie(true);
+            w.set_feie(true);
+            w.set_pltie(true);
+        });
     }
 
     pub(super) fn enable_transmit_interrupts(&self) {
-        self.regs
-            .mier
-            .write(MIER::TDIE::SET + MIER::NDIE::SET + MIER::ALIE::SET + MIER::FEIE::SET + MIER::PLTIE::SET);
+        self.write_mier(|w| {
+            w.set_tdie(true);
+            w.set_ndie(true);
+            w.set_alie(true);
+            w.set_feie(true);
+            w.set_pltie(true);
+        });
     }
 
     pub(super) fn reset_fifos(&self) {
         critical_section::with(|_| {
-            self.regs.mcr.modify(MCR::RTF::SET + MCR::RRF::SET);
+            self.modify_mcr(|w| {
+                w.set_rtf(McrRtf::Reset);
+                w.set_rrf(McrRrf::Reset);
+            });
         });
     }
 
     pub(super) fn clear_all_status(&self) {
-        self.regs.msr.write(
-            MSR::EPF::SET
-                + MSR::SDF::SET
-                + MSR::NDF::SET
-                + MSR::ALF::SET
-                + MSR::FEF::SET
-                + MSR::PLTF::SET
-                + MSR::DMF::SET
-                + MSR::STF::SET,
-        );
+        let mut v = Msr(0);
+        v.set_epf(Epf::IntYes);
+        v.set_sdf(MsrSdf::IntYes);
+        v.set_ndf(Ndf::IntYes);
+        v.set_alf(Alf::IntYes);
+        v.set_fef(MsrFef::IntYes);
+        v.set_pltf(Pltf::IntYes);
+        v.set_dmf(Dmf::IntYes);
+        v.set_stf(Stf::IntYes);
+        self.write_msr(v);
     }
 
     /// Read and clear one coherent status snapshot.
@@ -177,34 +217,34 @@ impl ControllerRegisters {
     /// back clears only flags observed by this read, avoiding a
     /// read/clear race with a flag that arrives after the snapshot.
     pub(super) fn take_status(&self) -> ControllerStatus {
-        let msr = self.regs.msr.extract();
-        self.regs.msr.set(msr.get());
+        let msr = self.msr();
+        self.write_msr(msr);
         ControllerStatus::from_snapshot(&msr)
     }
 
     pub(super) fn read_status(&self) -> ControllerStatus {
-        ControllerStatus::from_snapshot(&self.regs.msr.extract())
+        ControllerStatus::from_snapshot(&self.msr())
     }
 
     pub(super) fn clear_current_status(&self) {
-        let msr = self.regs.msr.extract();
-        self.regs.msr.set(msr.get());
+        let msr = self.msr();
+        self.write_msr(msr);
     }
 
     /// Reference Manual 40.7.1.5: after an address NACK, a STOP must be
     /// sent by software when automatic STOP generation is disabled and
     /// nothing else is queued that would terminate the transfer.
     pub(super) fn needs_manual_stop_after_nack(&self) -> bool {
-        self.regs.mcfgr1.read(MCFGR1::AUTOSTOP) == 0 && self.regs.mfsr.read(MFSR::TXCOUNT) == 0
+        !Mcfgr1(self.regs.mcfgr1.get()).autostop() && self.mfsr().txcount() == 0
     }
 
     /// One step of receive progress: a received byte (popped from the RX
-    /// FIFO), a fault that means no more data will arrive, or `None` to
-    /// keep waiting. There is deliberately no data-only variant of this
-    /// wait — see the module docs.
+    /// FIFO), a fault that means no more data will arrive, an early
+    /// termination, or `None` to keep waiting. There is deliberately no
+    /// data-only variant of this wait — see the module docs.
     pub(super) fn rx_step(&self) -> Option<RxStep> {
-        if self.regs.mfsr.read(MFSR::RXCOUNT) != 0 {
-            return Some(RxStep::Byte(self.regs.mrdr.read(MRDR::DATA) as u8));
+        if self.mfsr().rxcount() != 0 {
+            return Some(RxStep::Byte(Mrdr(self.regs.mrdr.get()).data()));
         }
         if let Some(e) = self.read_status().error() {
             return Some(RxStep::Fault(e));
@@ -219,7 +259,7 @@ impl ControllerRegisters {
     /// wake conditions. True when a byte, a fault, or an early transfer
     /// termination is pending.
     pub(super) fn rx_ready(&self) -> bool {
-        self.regs.mfsr.read(MFSR::RXCOUNT) != 0 || self.read_status().error().is_some() || self.transfer_ended()
+        self.mfsr().rxcount() != 0 || self.read_status().error().is_some() || self.transfer_ended()
     }
 
     /// True when this controller has ended the packet (EPF) and gone
@@ -234,8 +274,20 @@ impl ControllerRegisters {
     /// transaction are cleared by the `take_status` inside the START's
     /// own status check.
     pub(super) fn transfer_ended(&self) -> bool {
-        let msr = self.regs.msr.extract();
-        msr.is_set(MSR::EPF) && !msr.is_set(MSR::MBF)
+        let msr = self.msr();
+        msr.epf() == Epf::IntYes && msr.mbf() == Mbf::Idle
+    }
+
+    /// Capacity of the shared command/transmit FIFO, in entries.
+    pub(super) fn tx_fifo_capacity(&self) -> usize {
+        1usize << Param(self.regs.param.get()).mtxfifo()
+    }
+
+    /// True when the command FIFO has fully drained *or* a fault is
+    /// pending — i.e. the wait for a queued command is over, one way or
+    /// the other. Callers classify with `take_status`/`read_status`.
+    pub(super) fn tx_settled(&self) -> bool {
+        self.mfsr().txcount() == 0 || self.read_status().error().is_some()
     }
 
     /// One step of transmit-space progress: room in the command FIFO, a
@@ -244,49 +296,38 @@ impl ControllerRegisters {
         if let Some(e) = self.read_status().error() {
             return Some(TxStep::Fault(e));
         }
-        let size = 1u32 << self.regs.param.read(PARAM::MTXFIFO);
-        if self.regs.mfsr.read(MFSR::TXCOUNT) < size {
+        if (self.mfsr().txcount() as usize) < self.tx_fifo_capacity() {
             return Some(TxStep::Room);
         }
         None
-    }
-
-    /// Capacity of the shared command/transmit FIFO, in entries.
-    pub(super) fn tx_fifo_capacity(&self) -> usize {
-        1usize << self.regs.param.read(PARAM::MTXFIFO)
-    }
-
-    /// True when the command FIFO has fully drained *or* a fault is
-    /// pending — i.e. the wait for a queued command is over, one way or
-    /// the other. Callers classify with `take_status`/`read_status`.
-    pub(super) fn tx_settled(&self) -> bool {
-        self.regs.mfsr.read(MFSR::TXCOUNT) == 0 || self.read_status().error().is_some()
     }
 
     /// Push a typed controller command into the transmit FIFO.
     pub(super) fn write_command(&self, command: ControllerCommand, data: u8) {
         #[cfg(feature = "defmt")]
         defmt::trace!(
-            "Sending cmd {} with data '{:02x}' MSR: {:08x}",
+            "Sending cmd '{}' ({}) with data '{:02x}' MSR: {:08x}",
             command,
+            command as u8,
             data,
             self.regs.msr.get()
         );
 
-        self.regs
-            .mtdr
-            .write(MTDR::DATA.val(data as u32) + MTDR::CMD.val(command as u32));
+        let mut v = Mtdr(0);
+        v.set_data(data);
+        v.set_cmd(command);
+        self.regs.mtdr.set(v.0);
     }
 
     // DMA plumbing: request enables and the FIFO data addresses the DMA
     // engine reads/writes directly.
 
     pub(super) fn set_rx_dma(&self, enable: bool) {
-        self.regs.mder.modify(MDER::RDDE.val(enable as u32));
+        self.modify_mder(|w| w.set_rdde(enable));
     }
 
     pub(super) fn set_tx_dma(&self, enable: bool) {
-        self.regs.mder.modify(MDER::TDDE.val(enable as u32));
+        self.modify_mder(|w| w.set_tdde(enable));
     }
 
     pub(super) fn rx_data_ptr(&self) -> *const u8 {
