@@ -56,6 +56,13 @@ async fn main(spawner: Spawner) {
     let mut p = hal::init(config);
     defmt::info!("i2c-twoboard-controller: driving 0x2a on LPI2C3 (P3_21 SCL / P3_20 SDA)");
 
+    // Quiet window: this binary's own flash/reset can glitch a listening
+    // target into a half-addressed ADRSTALL stretch that wedges the bus.
+    // Idle long enough for the test flow to reset the target board after
+    // the controller is up, so the suite always starts on a clean bus.
+    defmt::info!("2s quiet window for target reset");
+    embassy_time::Timer::after_secs(2).await;
+
     // Interrupt-latency interference for t_isr_latency: ~0.5 ms with all
     // interrupts blocked, every ~1.5 ms, while the test has it enabled.
     spawner.spawn(i2c_twoboard::interference::task(160_000, 1_500).unwrap());

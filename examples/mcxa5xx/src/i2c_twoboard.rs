@@ -12,12 +12,14 @@
 //! against real written payloads instead of a constant fill.
 //!
 //! Long-transfer coverage: reads of 255/256/257/260/300/512 bytes cross
-//! the driver's 256-byte RECEIVE-command chunk boundary, where the LPI2C
-//! controller would otherwise depend on back-to-back receive-command
-//! chaining (the documented silent-data-loss hazard for >256-byte reads).
-//! This driver instead issues each chunk as its own repeated-START
-//! transfer; these tests verify no byte is lost or duplicated across the
-//! seams, in the interrupt-async, DMA, and blocking paths separately.
+//! the LPI2C's 256-byte RECEIVE-command boundary. The driver chains
+//! adjacent RECEIVE commands under a single address phase (the
+//! controller ACKs across a command boundary only when the next command
+//! is already queued), which is exactly the mechanism with a documented
+//! silent-data-loss hazard for >256-byte reads — so these tests verify
+//! byte-for-byte, against the shadow model, that nothing is lost or
+//! duplicated across the command seams, in the interrupt-async, DMA,
+//! and blocking paths separately.
 //!
 //! Interrupt-latency stress: `interference::task` periodically blocks all
 //! interrupts for ~0.5 ms. The controller binary gates it around
@@ -172,11 +174,12 @@ impl Model {
         }
     }
 
-    /// Expected read data: the target serves its buffer cyclically and
-    /// restarts from the front on every (repeated) START. The driver's
-    /// 256-byte read chunks are a multiple of the 32-byte buffer, so
-    /// position `i` of any read must equal `buf[i % BUF_LEN]` regardless
-    /// of where the chunk seams fall.
+    /// Expected read data: the target serves its buffer cyclically for
+    /// the whole of one read transaction (and restarts from the front on
+    /// a new address phase), so position `i` of any read must equal
+    /// `buf[i % BUF_LEN]` — for chained multi-command reads because
+    /// there is no re-address at all, and for any re-addressed fallback
+    /// because 256 is a multiple of the 32-byte buffer.
     fn check(&self, read: &[u8]) -> bool {
         read.iter().enumerate().all(|(i, b)| *b == self.buf[i % BUF_LEN])
     }
@@ -233,10 +236,11 @@ pub mod harness {
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
 
         defmt::info!(
-            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF retries) ==",
+            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
             mode,
             stats.alf_retries,
-            stats.fef_retries
+            stats.fef_retries,
+            stats.end_retries
         );
     }
 
@@ -264,10 +268,11 @@ pub mod harness {
         }
 
         defmt::info!(
-            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF retries) ==",
+            "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
             mode,
             stats.alf_retries,
-            stats.fef_retries
+            stats.fef_retries,
+            stats.end_retries
         );
     }
 }
@@ -294,6 +299,10 @@ pub mod tests {
         /// consumed RECEIVE can trip the next transfer's START check; the
         /// reporting status read also clears it, so a retry runs clean).
         pub fef_retries: u32,
+        /// Total operations retried after an `UnexpectedStop` (a chained
+        /// read terminated early with SDF/EPF latched and no fault —
+        /// same spurious-flag silicon family as the ALF quirk).
+        pub end_retries: u32,
     }
 
     /// Retries per operation before giving up on `ArbitrationLoss`.
@@ -315,6 +324,7 @@ pub mod tests {
             match ctrl.read(TARGET_ADDR, buf).await {
                 Ok(()) => return Ok(()),
                 Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) => stats.end_retries += 1,
                 Err(_) => return Err("read failed"),
             }
         }
@@ -326,6 +336,7 @@ pub mod tests {
             match ctrl.write_read(TARGET_ADDR, w, r).await {
                 Ok(()) => return Ok(()),
                 Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) => stats.end_retries += 1,
                 Err(_) => return Err("write_read failed"),
             }
         }
@@ -697,6 +708,7 @@ pub mod tests {
                 Ok(()) => return Ok(()),
                 Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
                 Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) => stats.end_retries += 1,
                 Err(e) => {
                     defmt::error!("blocking read err: {} (len {})", e, buf.len());
                     return Err("read failed");
@@ -717,6 +729,7 @@ pub mod tests {
                 Ok(()) => return Ok(()),
                 Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
                 Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) => stats.end_retries += 1,
                 Err(_) => return Err("write_read failed"),
             }
         }
