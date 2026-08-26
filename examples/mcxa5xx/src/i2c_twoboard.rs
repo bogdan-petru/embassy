@@ -171,6 +171,13 @@ pub async fn target_task(
                     ReadStatus::Complete(n) | ReadStatus::EarlyStop(n) => (n, false),
                     _ => (0, false),
                 };
+                // NOTE: `ReadStatus` documents this count as bytes
+                // *queued*, and explicitly warns against using it to
+                // advance a device-side position — at a terminated
+                // transfer it overshoots by the discarded FIFO residue.
+                // This emulated device does it anyway because there is
+                // no better source, and `Model::check_chunked` accounts
+                // for the resulting one-byte skip per seam.
                 cursor = (cursor + n) % BUF_LEN;
                 if !more {
                     break;

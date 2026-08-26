@@ -131,8 +131,28 @@ impl From<TargetFault> for IOError {
 
 /// Outcome of a `respond_to_read` call.
 ///
-/// The `usize` in every variant counts bytes consumed from the supplied
-/// buffer, i.e. bytes the controller actually clocked out and ACKed.
+/// The `usize` in every variant counts bytes **queued** for transmission
+/// — consumed from the supplied buffer and written into the transmit
+/// register — which is what the caller needs to resume from the right
+/// offset on a follow-up call.
+///
+/// # It is not a count of bytes that reached the bus
+///
+/// At the end of a transfer the peripheral may hold bytes that were
+/// queued but never clocked out, and they are discarded by the FIFO
+/// reset that ends the transfer. The count therefore *overshoots* the
+/// bytes the controller actually ACKed, by up to the transmit FIFO
+/// depth. This driver cannot correct for it: the difference is the FIFO
+/// residue at termination, and this PAC exposes no target FIFO status
+/// register (`SFSR`) to read it back. All three implementations behave
+/// this way — the blocking and interrupt paths count each write to
+/// `STDR`, the DMA path counts bytes the engine moved into it.
+///
+/// So: safe to use for "how much of my buffer was taken, where do I
+/// resume". **Not** safe to use to advance a device-side position, a
+/// cursor, or any other model of what the peer received — doing that
+/// skips a byte per terminated transfer. If you need exact transmission
+/// progress, it is not available through this API today.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -145,6 +165,9 @@ pub enum ReadStatus {
     /// `respond_to_read` again with additional bytes, or accept that the
     /// bus will clock-stretch (with TXDSTALL enabled) until something
     /// else terminates the transfer.
+    ///
+    /// This is the one variant whose count is exact: the transfer has
+    /// not terminated, so nothing has been discarded.
     NeedMore(usize),
     /// Controller issued an early STOP or repeated START before the
     /// buffer was exhausted.
@@ -585,7 +608,8 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// # Returns
     ///
     /// - `Ok(ReadStatus)` describing how the transfer ended and how many
-    ///   bytes the controller ACKed.
+    ///   bytes were queued for transmission — see [`ReadStatus`] for why
+    ///   that is not the same as bytes the controller ACKed.
     /// - `Err(IOError)` if an error occurs.
     pub fn blocking_respond_to_read(&mut self, buf: &[u8]) -> Result<ReadStatus, IOError> {
         let mut count = 0;
@@ -1123,7 +1147,8 @@ where
     /// # Returns
     ///
     /// - `Ok(ReadStatus)` describing how the transfer ended and how many
-    ///   bytes the controller ACKed.
+    ///   bytes were queued for transmission — see [`ReadStatus`] for why
+    ///   that is not the same as bytes the controller ACKed.
     /// - `Err(IOError)` if an error occurs.
     pub fn async_respond_to_read<'a>(
         &'a mut self,
