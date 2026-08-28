@@ -138,21 +138,33 @@ impl From<TargetFault> for IOError {
 ///
 /// # It is not a count of bytes that reached the bus
 ///
-/// At the end of a transfer the peripheral may hold bytes that were
-/// queued but never clocked out, and they are discarded by the FIFO
-/// reset that ends the transfer. The count therefore *overshoots* the
-/// bytes the controller actually ACKed, by up to the transmit FIFO
-/// depth. This driver cannot correct for it: the difference is the FIFO
-/// residue at termination, and this PAC exposes no target FIFO status
-/// register (`SFSR`) to read it back. All three implementations behave
-/// this way — the blocking and interrupt paths count each write to
-/// `STDR`, the DMA path counts bytes the engine moved into it.
+/// When a transfer terminates, `STDR` may hold one byte that was queued
+/// but never clocked out (the target has no transmit FIFO beyond that
+/// single register), and it is discarded — measured on FRDM-MCXA577:
+/// the next transaction never transmits it stale. The count therefore
+/// overshoots the bytes the controller actually took by up to one per
+/// terminated transfer. All three implementations behave this way — the
+/// blocking and interrupt paths count each write to `STDR`, the DMA
+/// path counts bytes the engine moved into it.
+///
+/// A correction was prototyped and measured rather than assumed: TDF
+/// sampled in the same status snapshot that detects the termination
+/// identifies the stranded byte (SSR reads `SDF` with `TDF` clear,
+/// 48 of 49 sampled terminations). But it is raceable, not reliable:
+/// if servicing the termination is delayed past the *next*
+/// transaction's address phase — back-to-back transfers plus interrupt
+/// latency are enough — the first observable snapshot already reads
+/// `SDF|AVF|TDF|BBF`, where TDF belongs to the new transfer and the
+/// stranded byte's fate is unrecoverable from any register (1 of 49:
+/// a silent off-by-one). The ambiguous case is *detectable* (AVF/BBF
+/// alongside SDF) but not *resolvable*, and this PAC has no target
+/// FIFO status register to resolve it with.
 ///
 /// So: safe to use for "how much of my buffer was taken, where do I
 /// resume". **Not** safe to use to advance a device-side position, a
 /// cursor, or any other model of what the peer received — doing that
-/// skips a byte per terminated transfer. If you need exact transmission
-/// progress, it is not available through this API today.
+/// risks skipping a byte per terminated transfer. Exact transmission
+/// progress is not available through this API on this IP.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
