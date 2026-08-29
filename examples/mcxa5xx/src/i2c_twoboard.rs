@@ -9,9 +9,10 @@
 //! sensor block) rather than a stateless one: each byte served advances
 //! the cursor, the cursor survives STOP and re-addressing, and a write
 //! stores to the front of the buffer and rewinds it. The controller
-//! keeps an exact shadow of both buffer and cursor and checks every byte
-//! it reads back, so data integrity is verified end to end against real
-//! written payloads instead of a constant fill.
+//! keeps an exact shadow of the buffer — not of the cursor, which it
+//! cannot track (see below); reads are anchored instead — and checks
+//! every byte it reads back, so data integrity is verified end to end
+//! against real written payloads instead of a constant fill.
 //!
 //! The cursor is what makes non-atomic reads detectable. A read that is
 //! silently retried after a partial transfer resumes from an advanced
@@ -241,9 +242,12 @@ pub async fn target_task(
                 // Control message: toggle stateless-read mode; not
                 // data, so no commit and no cursor rewind. (A control
                 // write that terminated early misses the length/magic
-                // match and is committed as data — harmless: the
-                // harness retries the toggle and rewrites the buffer
-                // before anything is verified.)
+                // match and is committed as data — harmless: on the
+                // controller side that attempt errored, which retries
+                // only on arbitration loss and otherwise fails the
+                // test loudly, and the partial bytes are overwritten
+                // by the next anchored write before anything is
+                // verified.)
                 if n == CTRL_LEN && scratch[..4] == CTRL_MAGIC {
                     stateless = scratch[4] != 0;
                     defmt::info!("[T] stateless-read mode: {}", stateless);
@@ -976,17 +980,18 @@ pub mod tests {
     /// silently split into re-addressed chunks, which is what the DMA
     /// path did before chunking became opt-in.
     ///
-    /// `caps` carries the phase's expectation: only an engine with a
-    /// chaining ceiling may refuse, and the test length must actually
-    /// exceed that ceiling — otherwise the expectation silently
-    /// inverts.
+    /// `caps` carries the phase's expectation, and the two outcomes are
+    /// mutually exclusive: an engine with a chaining ceiling MUST
+    /// refuse (the length is asserted to exceed it, and completing
+    /// would mean it chained past its own declared limit); an engine
+    /// without one MUST complete atomically, byte-correct.
     pub async fn t_over_capacity<C: Controller>(
         ctrl: &mut C,
         model: &mut Model,
         stats: &mut RetryStats,
         caps: PhaseCaps,
     ) -> TestResult {
-        let may_refuse = match caps.dma_chain_ceiling {
+        let must_refuse = match caps.dma_chain_ceiling {
             Some(ceiling) => {
                 defmt::assert!(
                     OVER_CAPACITY > ceiling,
@@ -1008,6 +1013,10 @@ pub mod tests {
             resync(ctrl, model).await?;
             match ctrl.read(TARGET_ADDR, &mut big[..OVER_CAPACITY]).await {
                 Ok(()) => {
+                    if must_refuse {
+                        defmt::error!("over-capacity: completed, but this engine's ceiling requires a refusal");
+                        return Err("over_capacity: missing refusal");
+                    }
                     if !model.check_read(&big[..OVER_CAPACITY]) {
                         defmt::error!("over-capacity: mismatch head={:02x}", big[..8]);
                         return Err("over_capacity: mismatch");
@@ -1016,7 +1025,7 @@ pub mod tests {
                     break;
                 }
                 Err(ControllerIOError::ChunkingRequired) => {
-                    if !may_refuse {
+                    if !must_refuse {
                         defmt::error!("over-capacity: refused, but this engine chains without a capacity limit");
                         return Err("over_capacity: unexpected refusal");
                     }
