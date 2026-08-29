@@ -691,7 +691,16 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
 
         // Wait until we have space in the TxFIFO
-        self.wait_tx_room()?;
+        if let Err(e) = self.wait_tx_room() {
+            // The fault classes were already remediated inside
+            // `wait_tx_room`; a timeout means whatever clogged the
+            // FIFO is still queued and must be dropped, or the next
+            // transaction trips over it.
+            if matches!(e, IOError::Timeout) {
+                self.remediation();
+            }
+            return Err(e);
+        }
 
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
@@ -703,8 +712,12 @@ impl<'d, M: Mode> I2c<'d, M> {
             addr_rw,
         );
 
-        // Wait for TxFIFO to be drained
-        self.wait_tx_settled()?;
+        // Wait for TxFIFO to be drained. Timeout is its only failure:
+        // the START is still queued behind a stretched clock — drop it.
+        if let Err(e) = self.wait_tx_settled() {
+            self.remediation();
+            return Err(e);
+        }
 
         // Check controller status
         let res = self.status_and_act();
@@ -732,15 +745,39 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// waiting for the FIFO to become empty ensuring the command was
     /// sent.
     fn stop(&self) -> Result<(), IOError> {
-        // Wait until we have space in the TxFIFO
-        self.wait_tx_room()?;
+        // Wait until we have space in the TxFIFO. Timeout recovery
+        // mirrors `start`: fault classes were remediated inside
+        // `wait_tx_room`, a timeout leaves the clog queued.
+        if let Err(e) = self.wait_tx_room() {
+            if matches!(e, IOError::Timeout) {
+                self.remediation();
+            }
+            return Err(e);
+        }
 
         self.send_cmd(ControllerCommand::STOP, 0);
 
-        // Wait for TxFIFO to be drained
-        self.wait_tx_settled()?;
+        // Wait for TxFIFO to be drained; on timeout the STOP is still
+        // queued behind a stretched clock — drop it.
+        if let Err(e) = self.wait_tx_settled() {
+            self.remediation();
+            return Err(e);
+        }
 
-        self.status_and_act()
+        let res = self.status_and_act();
+
+        // Mirror `start` (and `async_stop`): the fault classes can
+        // leave the aborted STOP queued, and callers run this after
+        // defusing their guards on the strength of "stop recovers its
+        // own failures".
+        if matches!(
+            res,
+            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
+        ) {
+            self.remediation();
+        }
+
+        res
     }
 
     fn blocking_read_internal(&self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
@@ -872,17 +909,20 @@ impl<'d, M: Mode> I2c<'d, M> {
                     };
                 }
 
-                // End every non-final chunk with a STOP; a repeated START
-                // right after the auto-NACK of a consumed RECEIVE command
-                // is not reliably accepted on this silicon.
-                if idx + 1 < nchunks {
-                    self.stop()?;
-                }
                 Ok(())
             };
             if let Err(e) = drain() {
                 self.remediation();
                 return Err(e);
+            }
+
+            // End every non-final chunk with a STOP; a repeated START
+            // right after the auto-NACK of a consumed RECEIVE command
+            // is not reliably accepted on this silicon. Outside the
+            // drain guard: `stop` recovers its own failures, and the
+            // guard must not stack a second remediation on top.
+            if idx + 1 < nchunks {
+                self.stop()?;
             }
         }
         Ok(())
@@ -910,11 +950,24 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Ok(());
         }
 
-        for byte in write {
-            // Wait until we have space in the TxFIFO
-            self.wait_tx_room()?;
+        // Mirror the read paths' recovery guard: an error mid-write
+        // aborts the transaction with TRANSMIT commands still queued
+        // and the bus held. `wait_tx_room` remediates the fault
+        // classes itself; its Timeout arm does not.
+        let push = || -> Result<(), IOError> {
+            for byte in write {
+                // Wait until we have space in the TxFIFO
+                self.wait_tx_room()?;
 
-            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+                self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+            }
+            Ok(())
+        };
+        if let Err(e) = push() {
+            if matches!(e, IOError::Timeout) {
+                self.remediation();
+            }
+            return Err(e);
         }
 
         if send_stop == SendStop::Yes {
@@ -1003,6 +1056,11 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
     pub fn blocking_write_read(&mut self, address: u8, write: &[u8], read: &mut [u8]) -> Result<(), IOError> {
+        // Reject a doomed read before the no-STOP write half touches
+        // the bus — see `async_write_read`.
+        if read.is_empty() {
+            return Err(IOError::InvalidReadBufferLength);
+        }
         self.blocking_write_internal(address, write, SendStop::No)?;
         self.blocking_read_internal(address, read, SendStop::Yes)
     }
@@ -1024,6 +1082,13 @@ where
     /// Schedule sending a START command and await it being pulled from the FIFO.
     ///
     /// Does not indicate that the command was responded to.
+    ///
+    /// The wait is bounded by [`Config::transfer_timeout`] like its
+    /// blocking counterpart: a target stretching SCL indefinitely
+    /// satisfies neither the drain condition nor any error flag. A
+    /// start that fails is returned with the controller recovered —
+    /// callers arm their cancellation guards only *after* the start
+    /// (see the seamed branch), so nobody else would clean up.
     async fn async_start(&self, address: u8, read: bool) -> Result<(), IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
@@ -1040,38 +1105,90 @@ where
             addr_rw,
         );
 
-        self.info
-            .wait_cell()
-            .wait_for(|| {
+        match embassy_time::with_timeout(
+            self.timeout,
+            self.info.wait_cell().wait_for(|| {
                 // enable interrupts
                 self.enable_tx_ints();
                 // if the command FIFO is empty, we're done sending start
                 self.registers().tx_settled()
-            })
-            .await
-            .map_err(|_| IOError::Other)?;
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(IOError::Other),
+            Err(_) => {
+                // The START never drained: drop it, or the next
+                // transaction trips over the stale queued command.
+                self.remediation();
+                return Err(IOError::Timeout);
+            }
+        }
 
         // Note: the START + ACK/NACK have not necessarily been finished here.
         // thus this might return Ok(()), but might at a later state result in NAK or FifoError.
-        self.status_and_act()
+        let res = self.status_and_act();
+
+        // Mirror the blocking `start`: `status_and_act` recovers a
+        // NACKed start itself, but a start that failed with arbitration
+        // loss or a FIFO error leaves the controller halted with the
+        // aborted commands still queued.
+        if matches!(
+            res,
+            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
+        ) {
+            self.remediation();
+        }
+
+        res
     }
 
+    /// Schedule a STOP command and await it being pulled from the FIFO.
+    ///
+    /// Bounded like [`Self::async_start`], and like it fully
+    /// self-recovering: a timeout means the STOP is stuck behind a
+    /// stretched clock and remediation drops it, and the fault classes
+    /// (arbitration loss, FIFO error, pin-low timeout) can leave the
+    /// aborted STOP queued — `tx_settled` also exits on an error flag
+    /// — so they remediate too. Callers rely on this: every seam and
+    /// trailing stop runs AFTER its cancellation guard was defused
+    /// (letting a still-armed guard also fire would run remediation
+    /// twice, the double-recovery hazard the OnDrop placement notes
+    /// warn about), so nobody else would clean up a failed stop.
     async fn async_stop(&self) -> Result<(), IOError> {
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
-        self.info
-            .wait_cell()
-            .wait_for(|| {
+        match embassy_time::with_timeout(
+            self.timeout,
+            self.info.wait_cell().wait_for(|| {
                 // enable interrupts
                 self.enable_tx_ints();
                 // if the command FIFO is empty, we're done sending stop
                 self.registers().tx_settled()
-            })
-            .await
-            .map_err(|_| IOError::Other)?;
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(IOError::Other),
+            Err(_) => {
+                self.remediation();
+                return Err(IOError::Timeout);
+            }
+        }
 
-        self.status_and_act()
+        let res = self.status_and_act();
+
+        if matches!(
+            res,
+            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
+        ) {
+            self.remediation();
+        }
+
+        res
     }
 
     // Public API: Async
@@ -1160,12 +1277,24 @@ where
         write: &'a [u8],
         read: &'a mut [u8],
     ) -> Result<(), IOError> {
+        // Reject a doomed read BEFORE the no-STOP write half touches
+        // the bus. The read-side preflight checks (empty buffer, DMA
+        // command-FIFO capacity) run before any guard is armed, so a
+        // rejection after the write would return with the transaction
+        // still open and the bus held — nothing would ever send the
+        // STOP.
+        <Self as AsyncEngine>::read_preflight(self, read)?;
         <Self as AsyncEngine>::async_write_internal(self, address, write, SendStop::No).await?;
         <Self as AsyncEngine>::async_read_internal(self, address, read, SendStop::Yes).await
     }
 }
 
 trait AsyncEngine {
+    /// Validate a read request before ANY bus activity. Combined
+    /// transactions run this before their write half; the read paths
+    /// run it at entry. Must stay side-effect free.
+    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError>;
+
     fn async_read_internal<'a>(
         &'a mut self,
         address: u8,
@@ -1352,24 +1481,31 @@ impl<'d> I2c<'d, Async> {
                 }
             }
 
+            // The chunk's data is drained; defuse before the seam STOP,
+            // which recovers its own failures (see `async_stop`).
+            on_drop.defuse();
+
             // End every non-final chunk with a STOP; a repeated START
             // right after the auto-NACK of a consumed RECEIVE command is
             // not reliably accepted on this silicon.
             if idx + 1 < nchunks {
                 self.async_stop().await?;
             }
-
-            on_drop.defuse();
         }
         Ok(())
     }
 }
 
 impl<'d> AsyncEngine for I2c<'d, Async> {
-    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
+        Ok(())
+    }
+
+    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+        self.read_preflight(read)?;
 
         // A chained read that died mid-transfer leaves the device in an
         // unknown state: its pointer has advanced by however many bytes
@@ -1398,9 +1534,6 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
     async fn async_write_internal(&mut self, address: u8, write: &[u8], send_stop: SendStop) -> Result<(), IOError> {
         self.async_start(address, false).await?;
 
-        // perform corrective action if the future is dropped
-        let on_drop = OnDrop::new(|| self.remediation());
-
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -1420,30 +1553,56 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             return Ok(());
         }
 
+        // Corrective action if the future is dropped or a write step
+        // fails. Armed only AFTER the empty-write return above: this
+        // guard exists to close an *aborted* transaction, and the
+        // empty-write path returns with its transaction either cleanly
+        // stopped or deliberately left open for a combined
+        // transaction's read half — a guard firing on that success
+        // would inject a STOP into it.
+        let on_drop = OnDrop::new(|| self.remediation());
+
         for byte in write {
             // initiate transmit
             self.send_cmd(ControllerCommand::TRANSMIT, *byte);
 
-            self.info
-                .wait_cell()
-                .wait_for(|| {
+            match embassy_time::with_timeout(
+                self.timeout,
+                self.info.wait_cell().wait_for(|| {
                     // enable interrupts
                     self.enable_tx_ints();
                     // if the tx FIFO is empty, we're done transmiting
                     self.registers().tx_settled()
-                })
-                .await
-                .map_err(|_| IOError::WriteFail)?;
+                }),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(IOError::WriteFail),
+                // No progress within the transfer timeout (a target
+                // holding SCL low): the guard above closes the
+                // transaction on this return.
+                Err(_) => return Err(IOError::Timeout),
+            }
 
-            self.status_and_act()?;
+            // NOT `status_and_act`: its NACK arm can run remediation
+            // itself (manual STOP when the FIFO drained before the
+            // NACK was observed), and the still-armed guard would then
+            // remediate a second time on the error return. The guard
+            // is the single remediator for every error class here —
+            // remediation subsumes the manual-STOP special case.
+            self.parse_status(self.registers().take_status())?;
         }
+
+        // Defused before the trailing stop: `async_stop` recovers its
+        // own timeout, and the guard must not stack a second
+        // remediation on top of that (nothing after the data loop
+        // needs the guard).
+        on_drop.defuse();
 
         if send_stop == SendStop::Yes {
             self.async_stop().await?;
         }
-
-        // defuse it if the future is not dropped
-        on_drop.defuse();
 
         Ok(())
     }
@@ -1635,10 +1794,21 @@ impl<'d> I2c<'d, Dma<'d>> {
 }
 
 impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
-    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
+        // Longer reads than the command FIFO can chain cannot be
+        // served atomically here — see `async_read_internal`.
+        let ncmds = read.len().div_ceil(256);
+        if ncmds > self.registers().tx_fifo_capacity() && !self.allow_chunked_reads {
+            return Err(IOError::ChunkingRequired);
+        }
+        Ok(())
+    }
+
+    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+        self.read_preflight(read)?;
 
         // Chain all RECEIVE commands under a single address phase when
         // they fit the command FIFO: the controller ACKs across a
@@ -1649,9 +1819,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // sleeps on the DMA completion.
         let ncmds = read.len().div_ceil(256);
         let mut seamed = ncmds > self.registers().tx_fifo_capacity();
-        if seamed && !self.allow_chunked_reads {
-            return Err(IOError::ChunkingRequired);
-        }
         if !seamed {
             match self.dma_read_chained(address, read).await {
                 Ok(()) => {}
@@ -1697,15 +1864,18 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
                 self.dma_read_into(chunk).await?;
 
+                // The chunk is drained and its channel quiesced by
+                // `dma_read_into`; defuse before the seam STOP, which
+                // recovers its own failures (see `async_stop`). We
+                // re-arm on the next chunk if any.
+                on_drop.defuse();
+
                 // End every non-final chunk with a STOP: a repeated START
                 // right after the auto-NACK of a consumed RECEIVE command
                 // is not reliably accepted on this silicon.
                 if idx + 1 < nchunks {
                     self.async_stop().await?;
                 }
-
-                // defuse it; we'll re-arm on the next chunk if any.
-                on_drop.defuse();
             }
         }
 
@@ -1779,8 +1949,10 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // Wait for completion asynchronously — or for a bus error
             // (NACK, arbitration loss, FIFO error) that stops the
             // transfer, in which case the DMA would never complete and
-            // waiting on it alone would hang forever.
-            core::future::poll_fn(|cx| {
+            // waiting on it alone would hang forever. Bounded like the
+            // read path: the silicon can terminate a transfer silently
+            // (no flag, no interrupt), which only a timeout can catch.
+            let wait = core::future::poll_fn(|cx| {
                 let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
                 if self.mode.tx_dma.is_done() {
                     return core::task::Poll::Ready(Ok(()));
@@ -1793,8 +1965,15 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                     return core::task::Poll::Ready(Err(e));
                 }
                 core::task::Poll::Pending
-            })
-            .await?;
+            });
+            // ~1 ms/byte of margin on top of a generous floor.
+            let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
+            match embassy_time::with_timeout(bound, wait).await {
+                Ok(r) => r?,
+                // The guard above is still armed: it quiesces the
+                // channel and closes the transaction on this return.
+                Err(_) => return Err(IOError::Timeout),
+            }
 
             // Ensure DMA writes are visible to CPU
             cortex_m::asm::dsb();
@@ -1805,12 +1984,14 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             self.mode.tx_dma.quiesce();
         }
 
+        // Every chunk is drained and the channel quiesced; defuse
+        // before the trailing stop, which recovers its own failures
+        // (see `async_stop`).
+        on_drop.defuse();
+
         if send_stop == SendStop::Yes {
             self.async_stop().await?;
         }
-
-        // defuse it if the future is not dropped
-        on_drop.defuse();
 
         Ok(())
     }
@@ -1855,6 +2036,18 @@ impl<'d, M: Mode> embedded_hal_02::blocking::i2c::Transactional for I2c<'d, M> {
         address: u8,
         operations: &mut [embedded_hal_02::blocking::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
+        // Reject a doomed read before ANY op touches the bus: the
+        // read entry checks run before a guard is armed, so a
+        // rejection after a no-STOP op would leave the transaction
+        // open with the bus held — see `blocking_write_read`.
+        for op in operations.iter() {
+            if let embedded_hal_02::blocking::i2c::Operation::Read(buf) = op {
+                if buf.is_empty() {
+                    return Err(IOError::InvalidReadBufferLength);
+                }
+            }
+        }
+
         if let Some((last, rest)) = operations.split_last_mut() {
             for op in rest {
                 match op {
@@ -1903,6 +2096,17 @@ impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
         address: u8,
         operations: &mut [embedded_hal_1::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
+        // Reject a doomed read before ANY op touches the bus — see
+        // `exec` above; `recover_from_error` below clears flags but
+        // does not close an open transaction.
+        for op in operations.iter() {
+            if let embedded_hal_1::i2c::Operation::Read(buf) = op {
+                if buf.is_empty() {
+                    return Err(IOError::InvalidReadBufferLength);
+                }
+            }
+        }
+
         let result = (|| {
             if let Some((last, rest)) = operations.split_last_mut() {
                 for op in rest {
@@ -1945,6 +2149,19 @@ where
         address: u8,
         operations: &mut [embedded_hal_async::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
+        // Reject a doomed read before ANY op touches the bus. This is
+        // the entry point device-driver crates actually use (the
+        // trait's `write_read` is a provided method that delegates
+        // here), and `read_preflight` errors — empty buffer,
+        // `ChunkingRequired` on the DMA engine — fire before a
+        // recovery guard is armed, so a mid-list rejection would
+        // otherwise leave the transaction open with the bus held.
+        for op in operations.iter() {
+            if let embedded_hal_async::i2c::Operation::Read(buf) = op {
+                <Self as AsyncEngine>::read_preflight(self, buf)?;
+            }
+        }
+
         let result = async {
             if let Some((last, rest)) = operations.split_last_mut() {
                 for op in rest {

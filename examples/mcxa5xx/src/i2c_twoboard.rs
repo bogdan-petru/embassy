@@ -21,11 +21,13 @@
 //! passed a driver that could corrupt data on real devices.
 //!
 //! The controller does not try to track the cursor across transactions:
-//! it cannot. The target driver's `ReadStatus` count is documented as
-//! bytes the controller ACKed, but it counts bytes *pushed*, and the
-//! difference (transmit-FIFO residue at the end of a read) is not
-//! recoverable — this PAC exposes no target FIFO status register. So
-//! every verified read is instead **anchored**: `op_read` rewrites the
+//! it cannot. The target driver's `ReadStatus` count is (per its own
+//! docs) bytes *queued* into the transmit register, not bytes the
+//! controller took, and the difference — up to one stranded byte per
+//! terminated transfer — is not recoverable: this IP exposes no target
+//! FIFO status register, and the measured same-snapshot TDF correction
+//! is raceable past the next address phase. So every verified read is
+//! instead **anchored**: `op_read` rewrites the
 //! buffer first, which rewinds the target's cursor to a known zero.
 //! Detection is unaffected, because a silent retry happens *inside* the
 //! read being verified, after the anchor.
@@ -906,10 +908,19 @@ pub mod tests {
                         return Err("over_capacity: ALF retries exhausted");
                     }
                 }
+                // Early termination is a clean, reported failure of one
+                // attempt (the always-on target interference makes the
+                // occasional one legitimate) — but it must not be
+                // accepted as the test's outcome: a chained path that
+                // *always* dies early would otherwise be
+                // indistinguishable from one that works. Retry like the
+                // ALF arm; a persistent failure exhausts the budget and
+                // fails the test.
                 Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
                     stats.end_retries += 1;
-                    defmt::info!("  over-capacity {}: terminated early (reported)", OVER_CAPACITY);
-                    break;
+                    if attempt == MAX_RETRIES {
+                        return Err("over_capacity: early-termination retries exhausted");
+                    }
                 }
                 Err(e) => {
                     defmt::error!("over-capacity: unexpected error {}", e);
@@ -923,10 +934,17 @@ pub mod tests {
 
     /// Exercise the opt-in non-atomic path: with
     /// `Config::allow_chunked_reads` enabled, a long read may be split
-    /// into re-addressed, STOP-separated chunks. The target's cursor
-    /// carries across those seams, so the concatenated payload must
-    /// still match the model byte for byte — a chunked read is allowed
-    /// to be non-atomic, never incorrect.
+    /// into re-addressed, STOP-separated chunks. Verified with
+    /// `check_chunked`, which asserts contiguity within each 256-byte
+    /// window of the returned buffer — equal to per-transaction
+    /// contiguity whenever the read was actually chunked (the fallbacks
+    /// split at 256), and strictly weaker when it completed atomically
+    /// (a defect at a 256-aligned chained-command seam re-anchors
+    /// invisibly; that case is covered byte-exactly by `check_read` in
+    /// the atomic tests). Continuity *across* seams is not asserted —
+    /// the emulated peer's cursor skips the queued-but-unclocked
+    /// residue byte at each seam (see `check_chunked`), so byte-exact
+    /// concatenation is not a property this target can witness.
     ///
     /// Restores the default (disabled) before returning.
     pub async fn t_chunked_optin<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {

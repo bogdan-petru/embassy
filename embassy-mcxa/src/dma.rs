@@ -875,7 +875,10 @@ impl DmaChannel<'_> {
     /// 1. Enabling the peripheral's DMA request
     /// 2. Calling `enable_request()` to start the transfer
     /// 3. Polling `is_done()` or using interrupts to detect completion
-    /// 4. Calling `disable_request()`, `clear_done()`, `clear_interrupt()` for cleanup
+    /// 4. Calling [`DmaChannel::quiesce`] for cleanup — mandatory before
+    ///    releasing a borrowed buffer or reading the transferred count
+    ///    (`disable_request()` alone leaves an in-flight minor loop
+    ///    running; see `quiesce`)
     ///
     /// Use this when you need manual control over the DMA lifecycle (e.g., in
     /// peripheral drivers that have their own completion polling).
@@ -941,7 +944,10 @@ impl DmaChannel<'_> {
     /// 1. Enabling the peripheral's DMA request
     /// 2. Calling `enable_request()` to start the transfer
     /// 3. Polling `is_done()` or using interrupts to detect completion
-    /// 4. Calling `disable_request()`, `clear_done()`, `clear_interrupt()` for cleanup
+    /// 4. Calling [`DmaChannel::quiesce`] for cleanup — mandatory before
+    ///    releasing a borrowed buffer or reading the transferred count
+    ///    (`disable_request()` alone leaves an in-flight minor loop
+    ///    running; see `quiesce`)
     ///
     /// Use this when you need manual control over the DMA lifecycle (e.g., in
     /// peripheral drivers that have their own completion polling).
@@ -992,7 +998,10 @@ impl DmaChannel<'_> {
     /// 1. Enabling the peripheral's DMA request
     /// 2. Calling `enable_request()` to start the transfer
     /// 3. Polling `is_done()` or using interrupts to detect completion
-    /// 4. Calling `disable_request()`, `clear_done()`, `clear_interrupt()` for cleanup
+    /// 4. Calling [`DmaChannel::quiesce`] for cleanup — mandatory before
+    ///    releasing a borrowed buffer or reading the transferred count
+    ///    (`disable_request()` alone leaves an in-flight minor loop
+    ///    running; see `quiesce`)
     ///
     /// Use this when you need manual control over the DMA lifecycle (e.g., in
     /// peripheral drivers that have their own completion polling).
@@ -1111,37 +1120,72 @@ impl DmaChannel<'_> {
     /// transfer, an error path) must use this instead, or the DMA can
     /// write into memory the borrow checker believes is free again.
     ///
-    /// Mirrors the shutdown sequence of `Transfer::drop`, which owns the
-    /// same problem for the RAII path: clear ERQ/EARQ and the major/half
-    /// interrupt enables under a critical section, drop any NVIC
-    /// dispatch queued while masked, then spin on `CH_CSR.ACTIVE` (a
-    /// single minor loop — microseconds at most), and finally clear the
-    /// W1C DONE/INT bookkeeping so the next user of this channel starts
-    /// clean and the IRQ handler cannot leave a stale wake behind.
+    /// The ENTIRE sequence runs under one critical section: if any part
+    /// of it executes with interrupts live — in particular clearing the
+    /// W1C DONE/INT bookkeeping — a completion that raced the
+    /// cancellation leaves `CH_INT.INT` latched, the line re-pends
+    /// after the unpend, and the IRQ handler runs mid-shutdown, calling
+    /// `wake()` on a `WaitCell` nobody is registered with. That stores
+    /// a stale WOKEN token; the next transfer's first `poll_wait`
+    /// consumes it and returns `Ready` *without registering its waker*,
+    /// and the real completion then has nothing to wake — a deadlock.
+    /// With the whole sequence masked and DONE/INT cleared before the
+    /// unpend, a post-shutdown dispatch sees `DONE=0` and skips the
+    /// wake, so no token can be left behind. The `ACTIVE` spin is a
+    /// single in-flight minor loop — microseconds — which is why
+    /// holding the critical section across it is acceptable.
+    /// [`Transfer::abort`] delegates here: the RAII path owns the same
+    /// problem.
+    ///
+    /// Returns whether the channel's major loop had completed (`DONE`
+    /// observed set). Callers that report a byte count need this:
+    /// `transferred_bytes()` reads `BITER - CITER`, and CITER auto-
+    /// reloads to BITER on major completion, so a completed transfer
+    /// reads back as zero bytes.
+    ///
+    /// DONE is sampled BEFORE the first `CH_CSR` write and re-sampled
+    /// after the `ACTIVE` drain. The order matters: DONE is W1C in the
+    /// same register as ERQ/EARQ, and the PAC's `modify` is a plain
+    /// read/write-back, so an RMW that only touches ERQ/EARQ would
+    /// write the latched DONE back as 1 and clear it before the sample
+    /// (NXP's fsl_edma masks DONE out of every CH_CSR RMW for exactly
+    /// this reason). The ERQ-clearing write below forces the DONE bit
+    /// low in its write-back so the flag survives until the deliberate
+    /// clear.
+    ///
     /// Takes `&self` like its sibling channel helpers: a live
     /// `Transfer` borrows the channel, so this cannot run concurrently
     /// with one, and it only ever makes the channel more quiescent.
-    pub(crate) fn quiesce(&self) {
+    pub(crate) fn quiesce(&self) -> bool {
         let t = self.tcd();
         let irq = self.channel.interrupt();
 
-        critical_section::with(|_| {
+        let was_done = critical_section::with(|_| {
+            let done_at_entry = t.ch_csr().read().done();
             t.ch_csr().modify(|w| {
                 w.set_erq(false);
                 w.set_earq(false);
+                // W1C: writing 0 preserves a DONE latched between the
+                // sample above and this RMW's internal read.
+                w.set_done(false);
             });
             t.tcd_csr().modify(|w| {
                 w.set_intmajor(false);
                 w.set_inthalf(false);
             });
+
+            while t.ch_csr().read().active() {}
+
+            // The final minor loop may have completed during the drain.
+            let was_done = done_at_entry || t.ch_csr().read().done();
+            t.ch_csr().modify(|w| w.set_done(true));
+            t.ch_int().write(|w| w.set_int(true));
             cortex_m::peripheral::NVIC::unpend(irq);
+
+            was_done
         });
-
-        while t.ch_csr().read().active() {}
-
-        t.ch_csr().modify(|w| w.set_done(true));
-        t.ch_int().write(|w| w.set_int(true));
         fence(Ordering::SeqCst);
+        was_done
     }
 
     /// Clear the DONE flag for this channel.
@@ -1463,64 +1507,22 @@ impl<'a> Transfer<'a> {
 
     /// Abort the transfer.
     ///
-    /// Runs the entire shutdown sequence under `critical_section` so that
-    /// the cancelled transfer's completion IRQ can never fire. This is
-    /// crucial because the IRQ handler unconditionally calls `wake()` on
-    /// this channel's `WaitCell` when `CH_CSR.DONE` is set, which would
-    /// leave the cell in the `WOKEN` state. The next `Transfer` future on
-    /// this channel would then have its first `poll_wait` consume that
-    /// stale wake and return `Ready` *without registering its waker*; the
-    /// next IRQ would have nothing to wake -- a deadlock.
-    ///
-    /// With IRQs masked we:
-    /// 1. Clear `ERQ`/`EARQ` so no further service requests are issued.
-    /// 2. Spin until `CH_CSR.ACTIVE` clears, so any in-flight minor loop
-    ///    or software-triggered transfer drains.
-    /// 3. Clear `CH_CSR.DONE` and `CH_INT.INT` (both W1C). After this,
-    ///    even if the IRQ does dispatch when masking is lifted, the
-    ///    handler will see `DONE=0` and skip the `wake()`.
-    /// 4. Unpend the channel's IRQ in the NVIC so a queued dispatch is
-    ///    dropped on the floor instead of running redundantly after CS
-    ///    exit.
-    ///
-    /// Because `wake()` is never called for the cancelled transfer, the
-    /// `WaitCell` is guaranteed to never enter the `WOKEN` state on
-    /// account of this cancellation, and there is nothing to "drain".
+    /// Delegates to [`DmaChannel::quiesce`], which runs the whole
+    /// shutdown — request disable, `ACTIVE` drain, DONE/INT clear,
+    /// NVIC unpend — under one critical section. The critical part is
+    /// that the cancelled transfer's completion IRQ can never `wake()`
+    /// the channel's `WaitCell` mid-shutdown: the handler gates its
+    /// wake on `CH_CSR.DONE`, and a stale WOKEN token stored with no
+    /// waiter registered would make the next transfer's first
+    /// `poll_wait` return `Ready` without registering — the next IRQ
+    /// then has nothing to wake, a deadlock. (The previous open-coded
+    /// version cleared INT and drained `ACTIVE` *outside* its critical
+    /// section and never cleared DONE, leaving exactly that window: a
+    /// completion racing the abort re-pended the line after the
+    /// too-early unpend and the handler ran mid-shutdown with DONE
+    /// still set.)
     fn abort(&mut self) {
-        let t = self.channel.tcd();
-        let irq = self.channel.channel.interrupt();
-
-        critical_section::with(|_| {
-            // 1. Stop accepting new requests.
-            t.ch_csr().modify(|w| {
-                w.set_erq(false);
-                w.set_earq(false);
-            });
-
-            // 2. Mask interrupts so we don't have to worry about the
-            // IRQ firing while we're in the middle of the shutdown
-            // sequence.
-            t.tcd_csr().modify(|w| {
-                w.set_intmajor(false);
-                w.set_inthalf(false)
-            });
-
-            // 3. Drop any IRQ the hardware queued in the NVIC while we
-            //    were masked.
-            cortex_m::peripheral::NVIC::unpend(irq);
-        });
-
-        // 4. Wait for any in-flight minor loop / SW-triggered transfer
-        //    to drain. Bounded by the size of one minor loop / SW
-        //    transfer this driver issues (microseconds at most).
-        while t.ch_csr().read().active() {
-            core::hint::spin_loop();
-        }
-
-        // 5. Clear completion bookkeeping (W1C).
-        t.ch_int().write(|w| w.set_int(true));
-
-        fence(Ordering::SeqCst);
+        self.channel.quiesce();
     }
 }
 
@@ -1701,10 +1703,12 @@ impl<'a> Future for Transfer<'a> {
 
 impl<'a> Drop for Transfer<'a> {
     fn drop(&mut self) {
-        // `abort` leaves the channel quiescent and clears all completion
-        // bookkeeping (DONE/INT/NVIC/WaitCell) so the next user of this
-        // channel starts from a clean slate. Safe to call unconditionally;
-        // it's cheap when the transfer is already complete.
+        // `abort` (via `quiesce`) leaves the channel quiescent and
+        // clears the completion bookkeeping (DONE/INT/NVIC) so the next
+        // user of this channel starts from a clean slate — and so the
+        // WaitCell can never be handed a stale wake. Safe to call
+        // unconditionally; it's cheap when the transfer is already
+        // complete.
         self.abort();
 
         fence(Ordering::Release);

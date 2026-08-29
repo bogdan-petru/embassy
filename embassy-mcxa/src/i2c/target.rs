@@ -133,8 +133,7 @@ impl From<TargetFault> for IOError {
 ///
 /// The `usize` in every variant counts bytes **queued** for transmission
 /// — consumed from the supplied buffer and written into the transmit
-/// register — which is what the caller needs to resume from the right
-/// offset on a follow-up call.
+/// register.
 ///
 /// # It is not a count of bytes that reached the bus
 ///
@@ -160,11 +159,16 @@ impl From<TargetFault> for IOError {
 /// alongside SDF) but not *resolvable*, and this PAC has no target
 /// FIFO status register to resolve it with.
 ///
-/// So: safe to use for "how much of my buffer was taken, where do I
-/// resume". **Not** safe to use to advance a device-side position, a
-/// cursor, or any other model of what the peer received — doing that
-/// risks skipping a byte per terminated transfer. Exact transmission
-/// progress is not available through this API on this IP.
+/// So the count is buffer bookkeeping only: it says how much of the
+/// supplied buffer the driver consumed, nothing more. Resuming a
+/// follow-up transmission at this offset silently omits up to one
+/// stranded byte per terminated transfer from the stream the
+/// controller receives — whether that is tolerable is a protocol
+/// decision, not a default. And the count must **not** be used to
+/// advance a device-side position, a cursor, or any other model of
+/// what the peer received — doing that skips a byte per terminated
+/// transfer. Exact transmission progress is not available through
+/// this API on this IP.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -522,6 +526,11 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().reset_fifos();
     }
 
+    /// Unconditionally clear the W1C event flags. Only for the entry to
+    /// `listen`, where everything still latched is by definition stale
+    /// (the previous transaction's lifecycle is complete). Anywhere a
+    /// snapshot is being classified, clear through the snapshot instead
+    /// — see `status`.
     fn clear_status(&self) {
         self.info.regs().ssr().write(|w| {
             w.set_rsf(true);
@@ -533,9 +542,20 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     /// Reads and parses the target status producing an
     /// appropriate `Result<(), Error>` variant.
+    ///
+    /// Clears ONLY the W1C flags this snapshot observed — the same
+    /// same-snapshot pattern as the controller's `take_status`. A
+    /// constant-mask clear here would erase a flag that latched between
+    /// the read and the write (a STOP landing in that window, say)
+    /// without anyone ever having seen it.
     fn status(&self) -> Result<Event, IOError> {
         let ssr = self.info.regs().ssr().read();
-        self.clear_status();
+        self.info.regs().ssr().write(|w| {
+            w.set_rsf(ssr.rsf());
+            w.set_sdf(ssr.sdf());
+            w.set_bef(ssr.bef());
+            w.set_fef(ssr.fef());
+        });
 
         if ssr.bef() {
             Err(IOError::BitError)
@@ -950,16 +970,25 @@ impl<'d> I2c<'d, Dma<'d>> {
         })
         .await;
 
-        // Cleanup
+        // Cleanup: request path off, then quiesce. `disable_request`
+        // alone only stops NEW service requests — a minor loop already
+        // in flight keeps writing into `data`, which is about to be
+        // released to the caller, and keeps moving the count under the
+        // read below. Quiesce waits for the channel to go provably
+        // idle first, and reports whether the major loop had completed
+        // (after which CITER has auto-reloaded and `transferred_bytes`
+        // would read zero).
         self.info.regs().sder().modify(|w| w.set_rdde(false));
-        unsafe {
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-        }
+        let filled = self.mode.rx_dma.quiesce();
 
         // Ensure all writes by DMA are visible to the CPU
         fence(Ordering::Acquire);
 
+        let bytes = if filled {
+            chunk_len
+        } else {
+            self.mode.rx_dma.transferred_bytes()
+        };
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
@@ -967,9 +996,9 @@ impl<'d> I2c<'d, Dma<'d>> {
         } else if ssr.bef() {
             Err(IOError::BitError)
         } else if ssr.sdf() {
-            Ok(RxChunkOutcome::Stopped(self.mode.rx_dma.transferred_bytes()))
+            Ok(RxChunkOutcome::Stopped(bytes))
         } else if ssr.rsf() {
-            Ok(RxChunkOutcome::Restarted(self.mode.rx_dma.transferred_bytes()))
+            Ok(RxChunkOutcome::Restarted(bytes))
         } else {
             // DMA done with no end-of-transfer flag: chunk filled, controller
             // may want to write more bytes.
@@ -1042,13 +1071,19 @@ impl<'d> I2c<'d, Dma<'d>> {
         })
         .await;
 
-        // Cleanup
+        // Cleanup: request path off, then quiesce — same rationale as
+        // `read_dma_chunk`. The hazard here is the count, not the
+        // buffer contents: an in-flight minor loop is still consuming
+        // `data` and advancing CITER while the caller's borrow ends
+        // and the count is read.
         self.info.regs().sder().modify(|w| w.set_tdde(false));
-        unsafe {
-            self.mode.tx_dma.disable_request();
-            self.mode.tx_dma.clear_done();
-        }
+        let exhausted = self.mode.tx_dma.quiesce();
 
+        let bytes = if exhausted {
+            chunk_len
+        } else {
+            self.mode.tx_dma.transferred_bytes()
+        };
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
@@ -1056,9 +1091,9 @@ impl<'d> I2c<'d, Dma<'d>> {
         } else if ssr.bef() {
             Err(IOError::BitError)
         } else if ssr.sdf() {
-            Ok(TxChunkOutcome::Stopped(self.mode.tx_dma.transferred_bytes()))
+            Ok(TxChunkOutcome::Stopped(bytes))
         } else if ssr.rsf() {
-            Ok(TxChunkOutcome::Restarted(self.mode.tx_dma.transferred_bytes()))
+            Ok(TxChunkOutcome::Restarted(bytes))
         } else {
             // DMA done with no end-of-transfer flag: chunk exhausted,
             // controller still expects more bytes.
@@ -1073,6 +1108,15 @@ where
     Self: AsyncEngine,
 {
     /// Enable only the interrupts relevant to listening for a new address match.
+    ///
+    /// Deliberately no RSIE: the armed set must equal `listen_ready`'s
+    /// wake set, or a source that fires without satisfying the
+    /// predicate re-arms and interrupts forever. A repeated START is
+    /// not itself a listen event — the address phase that follows it
+    /// raises AVF (armed), which is what classification keys on; an
+    /// RSF-only wake would classify against a stale SASR. RSF latching
+    /// quietly during the listen is fine: `status` observes and clears
+    /// it alongside the address event it belongs to.
     fn enable_listen_ints(&self) {
         self.info.regs().sier().write(|w| {
             w.set_sarie(self.smbus_alert.clone().into());
@@ -1082,7 +1126,6 @@ where
             w.set_feie(true);
             w.set_beie(true);
             w.set_sdie(true);
-            w.set_rsie(true);
             w.set_avie(true);
         });
     }
