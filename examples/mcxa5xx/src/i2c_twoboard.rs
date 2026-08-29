@@ -252,50 +252,69 @@ impl Model {
         }
     }
 
-    /// Verify a read walks the buffer contiguously, without needing to
-    /// know where it started.
+    /// Verify a chunked read: an anchored walk of the whole payload
+    /// that carries the expected cursor position **across** the seams,
+    /// accepting exactly 0 or 1 bytes of cursor slip at each 256-byte
+    /// boundary.
     ///
-    /// Requires `buf` to hold `BUF_LEN` distinct values: each returned
-    /// byte is mapped back to its buffer index, and every step must be
-    /// exactly +1 (mod `BUF_LEN`). That detects any byte lost,
-    /// duplicated or reordered — including across a chunk seam — while
-    /// being immune to *where* the target's cursor happened to be.
+    /// The slip is the emulated peer's irreducible ambiguity, not a
+    /// licence for the driver to lose data: at the end of a read
+    /// transaction the target driver may have pushed one more byte into
+    /// the transmit register than the controller clocked out.
+    /// `ReadStatus` counts pushes, the FIFO reset discards the residue
+    /// (measured: 0 or 1 bytes, never more — a single `STDR` register,
+    /// and this IP has no FIFO status register to recover which), so
+    /// the emulated cursor skips that byte at a seam. Real devices
+    /// advance their pointer on clocked bytes only and would be
+    /// continuous.
     ///
-    /// Applied per transaction, not across the whole read — see
-    /// `check_chunked`.
-    fn check_contiguous(&self, read: &[u8]) -> bool {
-        let Some(start) = self.buf.iter().position(|b| *b == read[0]) else {
-            defmt::error!("contiguity: first byte {:02x} not in buffer", read[0]);
+    /// So this proves: byte-exact contiguity within every transaction,
+    /// correct chunk ordering and placement across the STOP seams, and
+    /// no shift anywhere beyond the single physically-possible residue
+    /// byte per seam. Requires `buf` to hold distinct values (so the
+    /// two slip candidates are distinguishable).
+    ///
+    /// The *absolute* start position is deliberately NOT asserted: the
+    /// opt-in fallback may legitimately resume from a cursor the
+    /// failed chained attempt already advanced — returning shifted
+    /// data is the documented trade of chunked mode, and precisely why
+    /// it is opt-in. Absolute placement (and the seam-aligned defect
+    /// an atomic read could hide behind a zero-slip walk) is covered
+    /// byte-exactly by `check_read` in the atomic tests.
+    fn check_chunked(&self, read: &[u8]) -> bool {
+        // Anchor the first chunk by value — see above on why not at 0.
+        let Some(mut pos) = self.buf.iter().position(|b| *b == read[0]) else {
+            defmt::error!("chunked: first byte {:02x} not in buffer", read[0]);
             return false;
         };
-        for (i, b) in read.iter().enumerate() {
-            let expect = self.buf[(start + i) % BUF_LEN];
-            if *b != expect {
-                defmt::error!("contiguity: break at {} (got {:02x}, want {:02x})", i, *b, expect);
+        for (ci, chunk) in read.chunks(256).enumerate() {
+            let max_slip = if ci == 0 { 0 } else { 1 };
+            let Some(slip) = (0..=max_slip).find(|s| chunk[0] == self.buf[(pos + s) % BUF_LEN]) else {
+                defmt::error!(
+                    "chunked: seam {} misplaced (got {:02x}, want {:02x}(+0) or {:02x}(+1))",
+                    ci,
+                    chunk[0],
+                    self.buf[pos % BUF_LEN],
+                    self.buf[(pos + 1) % BUF_LEN]
+                );
                 return false;
+            };
+            pos += slip;
+            for (i, b) in chunk.iter().enumerate() {
+                let expect = self.buf[(pos + i) % BUF_LEN];
+                if *b != expect {
+                    defmt::error!(
+                        "chunked: break at {} (got {:02x}, want {:02x})",
+                        ci * 256 + i,
+                        *b,
+                        expect
+                    );
+                    return false;
+                }
             }
+            pos += chunk.len();
         }
         true
-    }
-
-    /// Verify a chunked read: contiguous *within* each bus transaction.
-    ///
-    /// Continuity **across** a seam is deliberately not asserted, and
-    /// this is a limitation of the emulated peer rather than a licence
-    /// for the driver to lose data. At the end of a read transaction the
-    /// target driver has pushed one more byte into the transmit register
-    /// than the controller clocked out; `ReadStatus` counts pushes, the
-    /// FIFO reset discards the residue, and this PAC exposes no target
-    /// FIFO status register to recover the difference. The emulated
-    /// cursor therefore skips exactly that byte at every seam — observed
-    /// as "break at 256, got 0x91 want 0x90". Real devices advance their
-    /// pointer on clocked bytes only and would be continuous.
-    ///
-    /// What this does prove is that no byte is lost, duplicated or
-    /// reordered *within* a transaction, which is where chunked reads
-    /// could actually corrupt data.
-    fn check_chunked(&self, read: &[u8]) -> bool {
-        read.chunks(256).all(|c| self.check_contiguous(c))
     }
 
     /// Current buffer contents, for re-establishing a known state after
@@ -364,7 +383,11 @@ pub mod harness {
         run_test!("speed_sweep", tests::t_speed_sweep(ctrl, &mut model, &mut stats));
         run_test!("long_transfers", tests::t_long_transfers(ctrl, &mut model, &mut stats));
         run_test!("isr_latency", tests::t_isr_latency(ctrl, &mut model, &mut stats));
-        run_test!("over_capacity", tests::t_over_capacity(ctrl, &mut model, &mut stats));
+        run_test!(
+            "over_capacity",
+            // Only the DMA engine has a chaining ceiling to refuse at.
+            tests::t_over_capacity(ctrl, &mut model, &mut stats, mode == "dma")
+        );
         run_test!("chunked_optin", tests::t_chunked_optin(ctrl, &mut model, &mut stats));
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
 
@@ -877,7 +900,16 @@ pub mod tests {
     /// be refused with `ChunkingRequired`. What it must never do is
     /// silently split into re-addressed chunks, which is what the DMA
     /// path did before chunking became opt-in.
-    pub async fn t_over_capacity<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+    ///
+    /// `may_refuse` carries the phase's expectation: only the DMA
+    /// engine has a chaining ceiling, so a refusal from an engine that
+    /// chains without one is a failure, not an accepted outcome.
+    pub async fn t_over_capacity<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+        may_refuse: bool,
+    ) -> TestResult {
         let mut pat = [0u8; BUF_LEN];
         for (i, b) in pat.iter_mut().enumerate() {
             *b = 0x80 | (i as u8).wrapping_mul(7);
@@ -898,6 +930,10 @@ pub mod tests {
                     break;
                 }
                 Err(ControllerIOError::ChunkingRequired) => {
+                    if !may_refuse {
+                        defmt::error!("over-capacity: refused, but this engine chains without a capacity limit");
+                        return Err("over_capacity: unexpected refusal");
+                    }
                     defmt::info!("  over-capacity {}: refused (ChunkingRequired)", OVER_CAPACITY);
                     break;
                 }
@@ -935,16 +971,14 @@ pub mod tests {
     /// Exercise the opt-in non-atomic path: with
     /// `Config::allow_chunked_reads` enabled, a long read may be split
     /// into re-addressed, STOP-separated chunks. Verified with
-    /// `check_chunked`, which asserts contiguity within each 256-byte
-    /// window of the returned buffer — equal to per-transaction
-    /// contiguity whenever the read was actually chunked (the fallbacks
-    /// split at 256), and strictly weaker when it completed atomically
-    /// (a defect at a 256-aligned chained-command seam re-anchors
-    /// invisibly; that case is covered byte-exactly by `check_read` in
-    /// the atomic tests). Continuity *across* seams is not asserted —
-    /// the emulated peer's cursor skips the queued-but-unclocked
-    /// residue byte at each seam (see `check_chunked`), so byte-exact
-    /// concatenation is not a property this target can witness.
+    /// `check_chunked`, a cross-seam walk: byte-exact contiguity
+    /// within every transaction, correct chunk placement across the
+    /// STOP seams relative to each other, and no shift anywhere beyond
+    /// the single physically-possible residue-byte slip per seam — the
+    /// emulated peer's one irreducible ambiguity. Absolute start
+    /// position is not asserted: the fallback may legitimately resume
+    /// from an advanced cursor, the documented trade of opting in (see
+    /// `check_chunked`).
     ///
     /// Restores the default (disabled) before returning.
     pub async fn t_chunked_optin<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {

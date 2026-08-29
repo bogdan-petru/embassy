@@ -1474,8 +1474,10 @@ impl<'a> Transfer<'a> {
         poll_fn(|cx| {
             let state = &STATES[self.channel.index()];
 
-            // Register the half-transfer waker
-            let _ = state.half_waker.poll_wait(cx);
+            // Register the half-transfer waker. Drain any stale WOKEN
+            // token first: `poll_wait` registers only when it returns
+            // Pending (see `Transfer::poll`).
+            while state.half_waker.poll_wait(cx).is_ready() {}
 
             // Check if there's an error
             let t = self.channel.tcd();
@@ -1876,10 +1878,12 @@ impl<'channel, 'buf, W: Word> RingBuffer<'channel, 'buf, W> {
                 return Poll::Ready(Ok(n));
             }
 
-            // Register wakers for both half and complete interrupts
+            // Register wakers for both half and complete interrupts,
+            // draining any stale WOKEN tokens: `poll_wait` registers
+            // only when it returns Pending (see `Transfer::poll`).
             let state = &STATES[self.channel.index()];
-            let _ = state.waker.poll_wait(cx);
-            let _ = state.half_waker.poll_wait(cx);
+            while state.waker.poll_wait(cx).is_ready() {}
+            while state.half_waker.poll_wait(cx).is_ready() {}
 
             // Check again after registering waker (avoid race)
             let n = self.read_immediate(dst);

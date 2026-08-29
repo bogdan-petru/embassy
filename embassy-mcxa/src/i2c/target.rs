@@ -951,8 +951,14 @@ impl<'d> I2c<'d, Dma<'d>> {
         // The DMA done interrupt wakes the DMA's wait_cell; I2C status
         // changes wake the I2C wait_cell. Register on both.
         poll_fn(|cx| {
-            let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
-            let _ = self.info.wait_cell().poll_wait(cx);
+            // Drain any stale WOKEN token and finish REGISTERED:
+            // `poll_wait` registers the waker only when it returns
+            // Pending — discarding a `Ready` (a token left by a
+            // cancellation racing a completion, which `quiesce` cannot
+            // remove) would park this task with no waker on the cell.
+            // Same pattern as `Transfer::poll` in dma.rs.
+            while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
+            while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
             self.info.regs().sier().write(|w| {
                 w.set_feie(true);
@@ -1052,8 +1058,10 @@ impl<'d> I2c<'d, Dma<'d>> {
         //  - DMA channel completion -> chunk exhausted; if controller still
         //    clocking, caller may want to call again (NeedMore)
         poll_fn(|cx| {
-            let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
-            let _ = self.info.wait_cell().poll_wait(cx);
+            // Drain stale tokens and finish registered — see
+            // `read_dma_chunk`.
+            while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
+            while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
             self.info.regs().sier().write(|w| {
                 w.set_feie(true);

@@ -887,8 +887,17 @@ impl<'d, M: Mode> I2c<'d, M> {
         for (idx, chunk) in read.chunks_mut(256).enumerate() {
             self.start(address, true)?;
 
+            // Outside the drain guard: `wait_tx_room` remediates the
+            // fault classes itself, and routing it through the guard
+            // would remediate those twice. Its Timeout arm does not.
+            if let Err(e) = self.wait_tx_room() {
+                if matches!(e, IOError::Timeout) {
+                    self.remediation();
+                }
+                return Err(e);
+            }
+
             let mut drain = || -> Result<(), IOError> {
-                self.wait_tx_room()?;
                 self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
                 let mut deadline = embassy_time::Instant::now() + self.timeout;
@@ -901,8 +910,12 @@ impl<'d, M: Mode> I2c<'d, M> {
                             }
                             Some(RxStep::Fault(e)) => return Err(e.into()),
                             Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                            // No progress for a full timeout window:
+                            // Timeout, like the chained and async
+                            // paths — UnexpectedStop is reserved for
+                            // an observed termination.
                             None if embassy_time::Instant::now() > deadline => {
-                                return Err(IOError::UnexpectedStop);
+                                return Err(IOError::Timeout);
                             }
                             None => {}
                         }
@@ -1086,9 +1099,11 @@ where
     /// The wait is bounded by [`Config::transfer_timeout`] like its
     /// blocking counterpart: a target stretching SCL indefinitely
     /// satisfies neither the drain condition nor any error flag. A
-    /// start that fails is returned with the controller recovered —
-    /// callers arm their cancellation guards only *after* the start
-    /// (see the seamed branch), so nobody else would clean up.
+    /// start that fails is returned with the controller recovered, and
+    /// the awaited wait is guarded against drop-cancellation — callers
+    /// arm their cancellation guards only *after* the start (see the
+    /// seamed branch), so nobody else would clean up either kind of
+    /// abort.
     async fn async_start(&self, address: u8, read: bool) -> Result<(), IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
@@ -1105,7 +1120,15 @@ where
             addr_rw,
         );
 
-        match embassy_time::with_timeout(
+        // Cancellation guard for THIS await: if the caller's future is
+        // dropped here (an outer select/timeout), the queued START
+        // still executes autonomously on the wire and opens a
+        // transaction nothing would ever close. Defused the moment the
+        // wait resolves — the arms below own their remediation, so
+        // recovery stays exactly-once.
+        let on_drop = OnDrop::new(|| self.remediation());
+
+        let waited = embassy_time::with_timeout(
             self.timeout,
             self.info.wait_cell().wait_for(|| {
                 // enable interrupts
@@ -1114,8 +1137,10 @@ where
                 self.registers().tx_settled()
             }),
         )
-        .await
-        {
+        .await;
+        on_drop.defuse();
+
+        match waited {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(IOError::Other),
             Err(_) => {
@@ -1155,12 +1180,20 @@ where
     /// trailing stop runs AFTER its cancellation guard was defused
     /// (letting a still-armed guard also fire would run remediation
     /// twice, the double-recovery hazard the OnDrop placement notes
-    /// warn about), so nobody else would clean up a failed stop.
+    /// warn about), so nobody else would clean up a failed stop. The
+    /// awaited wait is guarded against drop-cancellation for the same
+    /// reason — see `async_start`.
     async fn async_stop(&self) -> Result<(), IOError> {
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
-        match embassy_time::with_timeout(
+        // Cancellation guard for THIS await — see `async_start`. A
+        // dropped stop mostly self-heals (the queued STOP executes
+        // autonomously), but one stuck behind a stretched clock would
+        // otherwise stay queued for the next transaction to trip over.
+        let on_drop = OnDrop::new(|| self.remediation());
+
+        let waited = embassy_time::with_timeout(
             self.timeout,
             self.info.wait_cell().wait_for(|| {
                 // enable interrupts
@@ -1169,8 +1202,10 @@ where
                 self.registers().tx_settled()
             }),
         )
-        .await
-        {
+        .await;
+        on_drop.defuse();
+
+        match waited {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(IOError::Other),
             Err(_) => {
@@ -1714,11 +1749,18 @@ impl<'d> I2c<'d, Dma<'d>> {
         // bounded: the silicon can terminate a transfer silently (no
         // flag, no interrupt), which only a timeout can catch.
         let wait = core::future::poll_fn(|cx| {
-            let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
+            // Drain any stale WOKEN token and finish REGISTERED:
+            // `poll_wait` registers the waker only when it returns
+            // Pending — discarding a `Ready` (a token left by a
+            // cancellation racing a completion, which `quiesce` cannot
+            // remove) would park this task with no waker on the cell,
+            // and the real completion would then wake nobody. Same
+            // pattern as `Transfer::poll`.
+            while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
             if self.mode.rx_dma.is_done() {
                 return core::task::Poll::Ready(Ok(()));
             }
-            let _ = self.info.wait_cell().poll_wait(cx);
+            while self.info.wait_cell().poll_wait(cx).is_ready() {}
             // The interrupt handler disables MIER on wake; re-arm the
             // error sources for the next wait.
             self.registers().enable_error_interrupts();
@@ -1953,11 +1995,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // read path: the silicon can terminate a transfer silently
             // (no flag, no interrupt), which only a timeout can catch.
             let wait = core::future::poll_fn(|cx| {
-                let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
+                // Drain stale tokens and finish registered — see
+                // `dma_read_into`.
+                while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
                 if self.mode.tx_dma.is_done() {
                     return core::task::Poll::Ready(Ok(()));
                 }
-                let _ = self.info.wait_cell().poll_wait(cx);
+                while self.info.wait_cell().poll_wait(cx).is_ready() {}
                 // The interrupt handler disables MIER on wake; re-arm the
                 // error sources for the next wait.
                 self.registers().enable_error_interrupts();
