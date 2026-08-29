@@ -4,7 +4,7 @@
 //! Wiring (board A ↔ board B): P3_20 ↔ P3_20 (SDA), P3_21 ↔ P3_21 (SCL),
 //! GND ↔ GND. The bus needs pull-ups to 3V3 on both lines.
 //!
-//! The target exposes a 32-byte RAM buffer at address 0x2A behind a
+//! The target exposes a 40-byte RAM buffer at address 0x2A behind a
 //! **persistent read cursor**, modelling a real device (EEPROM, FIFO,
 //! sensor block) rather than a stateless one: each byte served advances
 //! the cursor, the cursor survives STOP and re-addressing, and a write
@@ -59,7 +59,7 @@
 //! ceiling (which must be refused, not split) and `t_chunked_optin`
 //! covers the opt-in path, including one such read.
 //!
-//! Retry policy: `ArbitrationLoss` is retried up to 3 times per operation
+//! Retry policy: `ArbitrationLoss` is retried up to 15 times per operation
 //! and counted — the FRDM-MCXA577 LPI2C flags a spurious arbitration loss
 //! on roughly every other read whose first data byte has the MSB set (the
 //! target releasing SDA for a 1-bit reads as a foreign STOP). The suite
@@ -154,14 +154,14 @@ pub mod interference {
     }
 }
 
-/// Target task: a 32-byte RAM buffer behind a persistent read cursor,
+/// Target task: a [`BUF_LEN`]-byte RAM buffer behind a persistent read cursor,
 /// served over I2C at [`TARGET_ADDR`].
 ///
-/// Reads serve `buf[cursor..]` wrapping, advancing the cursor by every
-/// byte the controller ACKs, and the cursor **survives STOP and
+/// Reads serve `buf[cursor..]` wrapping, advancing the cursor by the
+/// driver-reported queued count, and the cursor **survives STOP and
 /// re-addressing** — so a re-addressed read continues where the previous
 /// one stopped, exactly like a device with an auto-incrementing pointer.
-/// Writes commit in 32-byte chunks to the front of the buffer and rewind
+/// Writes commit in `BUF_LEN`-byte chunks to the front of the buffer and rewind
 /// the cursor to 0.
 ///
 /// A [`CTRL_MAGIC`] control write switches the target into
@@ -199,7 +199,7 @@ pub async fn target_task(
                 }
                 loop {
                     // Serve the buffer rotated to the cursor, then advance by
-                    // however many bytes the controller actually ACKed.
+                    // however many bytes the driver reports as queued.
                     let mut view = [0u8; BUF_LEN];
                     for (i, b) in view.iter_mut().enumerate() {
                         *b = buf[(cursor + i) % BUF_LEN];
@@ -249,7 +249,7 @@ pub async fn target_task(
                     defmt::info!("[T] stateless-read mode: {}", stateless);
                     continue;
                 }
-                // Commit in 32-byte chunks, mirroring `Model::write`,
+                // Commit in `BUF_LEN`-byte chunks, mirroring `Model::write`,
                 // and rewind the read cursor like a device whose address
                 // pointer is set by the write.
                 for chunk in scratch[..n].chunks(BUF_LEN) {
@@ -294,7 +294,7 @@ impl Model {
     }
 
     /// Mirror of the target's write handling: data is committed in
-    /// 32-byte chunks, each overwriting the front of the buffer, so a
+    /// `BUF_LEN`-byte chunks, each overwriting the front of the buffer, so a
     /// long write leaves the last chunk (plus any surviving tail of the
     /// chunk before it) in place. The write rewinds the read cursor.
     fn write(&mut self, data: &[u8]) {
@@ -332,7 +332,12 @@ impl Model {
     /// equals a legal all-restart read — is indistinguishable by any
     /// payload check on a stateless device and is covered by the
     /// cursor-mode atomic tests instead.)
-    fn check_chunked_stateless(&self, read: &[u8]) -> bool {
+    ///
+    /// `require_restart` narrows the accepted shapes to all-restart
+    /// alone: a read past the engine's chaining ceiling can only have
+    /// been served by the split path, so a continuation-shaped payload
+    /// there means the driver chained past its declared limit.
+    fn check_chunked_stateless(&self, read: &[u8], require_restart: bool) -> bool {
         // Shape, decided by window 1: true = continuation (atomic
         // chained), false = restart-per-window (seamed chunks).
         let mut continuation = true;
@@ -344,6 +349,10 @@ impl Model {
             } else if ci == 1 {
                 // `buf[16]` vs `buf[0]` — distinct values, unambiguous.
                 continuation = chunk[0] == self.buf[pos % BUF_LEN];
+                if continuation && require_restart {
+                    defmt::error!("chunked: payload is one chained transaction, but this length must be split");
+                    return false;
+                }
                 if continuation {
                     pos
                 } else if chunk[0] == self.buf[0] {
@@ -451,7 +460,10 @@ pub mod harness {
             "over_capacity",
             tests::t_over_capacity(ctrl, &mut model, &mut stats, caps)
         );
-        run_test!("chunked_optin", tests::t_chunked_optin(ctrl, &mut model, &mut stats));
+        run_test!(
+            "chunked_optin",
+            tests::t_chunked_optin(ctrl, &mut model, &mut stats, caps)
+        );
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
 
         defmt::info!(
@@ -841,7 +853,7 @@ pub mod tests {
         }
 
         // Long write: 512 bytes streamed in one transaction; the target
-        // commits 32-byte chunks, so the buffer ends as the final chunk.
+        // commits `BUF_LEN`-byte chunks, so the buffer ends as the final chunk.
         let mut w512 = [0u8; 512];
         for (i, b) in w512.iter_mut().enumerate() {
             *b = (i as u8) ^ 0x5A;
@@ -1069,58 +1081,84 @@ pub mod tests {
     /// placement asserted unconditionally — no slip tolerance, no
     /// variable origin.
     ///
-    /// Restores the default config and cursor mode before returning.
-    pub async fn t_chunked_optin<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+    /// For a length past the phase's chaining ceiling (`caps`), the
+    /// payload must additionally be the **all-restart** shape: over
+    /// the ceiling only the split path exists, so a continuation-
+    /// shaped payload would mean the driver chained past its own
+    /// declared limit — the test proves the split actually happened,
+    /// not merely that some correct-looking bytes came back.
+    ///
+    /// Restores the default config and cursor mode before returning,
+    /// unconditionally: every fallible step after the opt-in config is
+    /// enabled routes through the result merge, so a failed run cannot
+    /// leak chunked mode or stateless mode into later tests or reruns.
+    pub async fn t_chunked_optin<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+        caps: PhaseCaps,
+    ) -> TestResult {
         let mut cfg = CtrlConfig::default();
         cfg.speed = Speed::Standard;
         cfg.allow_chunked_reads = true;
+        // Nothing is enabled if this fails, so the early return is safe.
         ctrl.set_config(&cfg).map_err(|_| "set_config failed")?;
-        set_stateless(ctrl, model, stats, true).await?;
 
-        // Distinct values (BUF_LEN < 0x80, so `0x80 | i` is unique per
-        // index) with the high bit set, which both enables the
-        // contiguity check below and keeps the MSB-related ALF quirk
-        // exercised.
-        let mut pat = [0u8; BUF_LEN];
-        for (i, b) in pat.iter_mut().enumerate() {
-            *b = 0x80 | i as u8;
-        }
-        op_write(ctrl, &pat, model, stats).await?;
-        model.write(&pat);
+        let mut result = set_stateless(ctrl, model, stats, true).await;
 
-        let mut big = [0u8; MAX_READ];
-        let mut result = Ok(());
-        // Includes a length past the DMA chaining ceiling: with the
-        // opt-in enabled that read *is* split, and must still come back
-        // byte-correct (non-atomic is permitted; incorrect is not).
-        for &l in &[257usize, 512, OVER_CAPACITY] {
-            // Scrub with a value outside the pattern (all pattern
-            // bytes have the MSB set): a lost chunk must read as
-            // garbage, not as plausible data left over from the
-            // previous length's read.
-            big[..l].fill(0x00);
-            if let Err(e) = op_read(ctrl, &mut big[..l], model, stats).await {
-                result = Err(e);
-                break;
+        if result.is_ok() {
+            // Distinct values (BUF_LEN < 0x80, so `0x80 | i` is unique
+            // per index) with the high bit set, which both enables the
+            // contiguity check below and keeps the MSB-related ALF
+            // quirk exercised.
+            let mut pat = [0u8; BUF_LEN];
+            for (i, b) in pat.iter_mut().enumerate() {
+                *b = 0x80 | i as u8;
             }
-            // Deterministic in stateless mode: exact continuation or
-            // exact restart-at-zero per window, nothing else.
-            if !model.check_chunked_stateless(&big[..l]) {
-                defmt::error!("chunked L={}: seam break, head={:02x}", l, big[..8]);
-                result = Err("chunked read mismatch");
-                break;
+            result = op_write(ctrl, &pat, model, stats).await;
+            if result.is_ok() {
+                model.write(&pat);
             }
         }
 
-        // Restore cursor mode and the default config regardless of
-        // outcome; a restore failure outranks a pass but must not mask
-        // a test failure.
+        if result.is_ok() {
+            let mut big = [0u8; MAX_READ];
+            // Includes a length past the DMA chaining ceiling: with the
+            // opt-in enabled that read *is* split, and must still come
+            // back byte-correct (non-atomic is permitted; incorrect is
+            // not).
+            for &l in &[257usize, 512, OVER_CAPACITY] {
+                // Scrub with a value outside the pattern (all pattern
+                // bytes have the MSB set): a lost chunk must read as
+                // garbage, not as plausible data left over from the
+                // previous length's read.
+                big[..l].fill(0x00);
+                if let Err(e) = op_read(ctrl, &mut big[..l], model, stats).await {
+                    result = Err(e);
+                    break;
+                }
+                // Deterministic in stateless mode: exact continuation
+                // or exact restart-at-zero, uniform shape — and past
+                // the ceiling, restart shape only (see above).
+                let must_split = caps.dma_chain_ceiling.is_some_and(|c| l > c);
+                if !model.check_chunked_stateless(&big[..l], must_split) {
+                    defmt::error!("chunked L={}: seam break, head={:02x}", l, big[..8]);
+                    result = Err("chunked read mismatch");
+                    break;
+                }
+            }
+        }
+
+        // Unconditional restores; a restore failure outranks a pass
+        // but must not mask a test failure.
         if set_stateless(ctrl, model, stats, false).await.is_err() && result.is_ok() {
             result = Err("stateless-mode restore failed");
         }
         let mut cfg = CtrlConfig::default();
         cfg.speed = Speed::Standard;
-        ctrl.set_config(&cfg).map_err(|_| "set_config restore failed")?;
+        if ctrl.set_config(&cfg).is_err() && result.is_ok() {
+            result = Err("set_config restore failed");
+        }
         result
     }
 

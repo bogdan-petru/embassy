@@ -1,7 +1,7 @@
 //! i2c-twoboard-target — the target (slave) half of the two-board I2C test.
 //!
 //! Flash this to board B and reset it; it runs standalone with no debugger
-//! attached. It serves a 32-byte RAM buffer at address 0x2A on LPI2C3:
+//! attached. It serves a 40-byte RAM buffer at address 0x2A on LPI2C3:
 //! controller writes store into the buffer, controller reads return it.
 //! Board A runs `i2c-twoboard-controller` against it.
 //!
