@@ -1474,10 +1474,22 @@ impl<'a> Transfer<'a> {
         poll_fn(|cx| {
             let state = &STATES[self.channel.index()];
 
-            // Register the half-transfer waker. Drain any stale WOKEN
-            // token first: `poll_wait` registers only when it returns
-            // Pending (see `Transfer::poll`).
+            // Register on BOTH cells, draining stale WOKEN tokens
+            // (`poll_wait` registers only when it returns Pending —
+            // see `Transfer::poll`). The full-transfer cell is
+            // load-bearing here, not defensive: the ISR's half-wake is
+            // gated on `citer <= half_point && citer > 0`, and CITER
+            // auto-reloads to BITER at major completion — so a half
+            // IRQ serviced after the transfer completed (coalesced
+            // with the DONE interrupt, or plain latency) drops the
+            // half wake and delivers ONLY the full-transfer wake.
+            // Registered on `half_waker` alone, this future would
+            // never be polled again despite its own `is_done()` branch
+            // being ready. Consuming a full-transfer token here is
+            // safe: every consumer of that cell re-checks the
+            // level-latched `CH_CSR.DONE`, which the ISR never clears.
             while state.half_waker.poll_wait(cx).is_ready() {}
+            while state.waker.poll_wait(cx).is_ready() {}
 
             // Check if there's an error
             let t = self.channel.tcd();

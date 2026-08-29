@@ -107,6 +107,28 @@ const OVER_CAPACITY: usize = 1100;
 /// Longest read the tests perform.
 const MAX_READ: usize = OVER_CAPACITY;
 
+/// Control message: a write of exactly [`CTRL_LEN`] bytes whose first
+/// four match this magic toggles the target's stateless-read mode
+/// (last byte: 0 = persistent cursor, nonzero = stateless) instead of
+/// committing data. The magic is unreachable by every generated test
+/// pattern: those are all arithmetic sequences xor a constant, and
+/// these bytes xor any constant are not consecutive.
+const CTRL_MAGIC: [u8; 4] = [0x5C, 0xC5, 0x3A, 0xA3];
+const CTRL_LEN: usize = 5;
+
+/// Per-phase driver capabilities the tests key their expectations on.
+/// Typed and passed from the binary, where the engine type is concrete
+/// — never derived from a display string.
+#[derive(Clone, Copy)]
+pub struct PhaseCaps {
+    /// The engine's atomic-read ceiling in bytes, if it has one. The
+    /// DMA engine cannot refill the command FIFO while the CPU sleeps
+    /// on the DMA completion, so reads past `tx_fifo_capacity * 256`
+    /// are refused (`ChunkingRequired`) rather than chained. `None`:
+    /// the engine chains without a length limit and must never refuse.
+    pub dma_chain_ceiling: Option<usize>,
+}
+
 /// Interrupt-latency interference: a task that periodically blocks all
 /// interrupts, delaying ISR entry to model a busy system.
 pub mod interference {
@@ -141,6 +163,12 @@ pub mod interference {
 /// one stopped, exactly like a device with an auto-incrementing pointer.
 /// Writes commit in 32-byte chunks to the front of the buffer and rewind
 /// the cursor to 0.
+///
+/// A [`CTRL_MAGIC`] control write switches the target into
+/// **stateless-read mode**: every read transaction serves from the
+/// buffer start, modelling the stateless-read device class that chunked
+/// reads are actually intended for. `t_chunked_optin` uses this to make
+/// its expectations fully deterministic and byte-exact.
 pub async fn target_task(
     peri: Peri<'static, LPI2C3>,
     scl: Peri<'static, P3_21>,
@@ -154,37 +182,49 @@ pub async fn target_task(
     let mut buf = [FILL; BUF_LEN];
     // Persistent read cursor: survives STOP and re-addressing.
     let mut cursor = 0usize;
+    // Stateless-read mode (see the task docs): toggled by the control
+    // write, off by default.
+    let mut stateless = false;
 
     loop {
         let request = tgt.async_listen().await.unwrap();
         defmt::trace!("[T] event {}", request);
         match request {
-            Request::Read(_) => loop {
-                // Serve the buffer rotated to the cursor, then advance by
-                // however many bytes the controller actually ACKed.
-                let mut view = [0u8; BUF_LEN];
-                for (i, b) in view.iter_mut().enumerate() {
-                    *b = buf[(cursor + i) % BUF_LEN];
+            Request::Read(_) => {
+                if stateless {
+                    // Every read transaction starts at the front; the
+                    // cursor still advances *within* the transaction
+                    // (a NeedMore continuation is the same transfer).
+                    cursor = 0;
                 }
-                defmt::trace!("[T] R serve @{} {:02x}", cursor, view[..2]);
-                let status = tgt.async_respond_to_read(&view).await.unwrap();
-                let (n, more) = match status {
-                    ReadStatus::NeedMore(n) => (n, true),
-                    ReadStatus::Complete(n) | ReadStatus::EarlyStop(n) => (n, false),
-                    _ => (0, false),
-                };
-                // NOTE: `ReadStatus` documents this count as bytes
-                // *queued*, and explicitly warns against using it to
-                // advance a device-side position — at a terminated
-                // transfer it overshoots by the discarded FIFO residue.
-                // This emulated device does it anyway because there is
-                // no better source, and `Model::check_chunked` accounts
-                // for the resulting one-byte skip per seam.
-                cursor = (cursor + n) % BUF_LEN;
-                if !more {
-                    break;
+                loop {
+                    // Serve the buffer rotated to the cursor, then advance by
+                    // however many bytes the controller actually ACKed.
+                    let mut view = [0u8; BUF_LEN];
+                    for (i, b) in view.iter_mut().enumerate() {
+                        *b = buf[(cursor + i) % BUF_LEN];
+                    }
+                    defmt::trace!("[T] R serve @{} {:02x}", cursor, view[..2]);
+                    let status = tgt.async_respond_to_read(&view).await.unwrap();
+                    let (n, more) = match status {
+                        ReadStatus::NeedMore(n) => (n, true),
+                        ReadStatus::Complete(n) | ReadStatus::EarlyStop(n) => (n, false),
+                        _ => (0, false),
+                    };
+                    // NOTE: `ReadStatus` documents this count as bytes
+                    // *queued*, and explicitly warns against using it to
+                    // advance a device-side position — at a terminated
+                    // transfer it overshoots by the discarded FIFO residue.
+                    // This emulated device does it anyway because there is
+                    // no better source; verified reads are anchored, and
+                    // the chunked test runs in stateless-read mode, where
+                    // the per-transaction rewind makes the residue moot.
+                    cursor = (cursor + n) % BUF_LEN;
+                    if !more {
+                        break;
+                    }
                 }
-            },
+            }
             Request::Write(_) => {
                 // One respond call per Write event, with headroom above
                 // the longest transfer the tests perform. `BufferFull` on
@@ -198,6 +238,17 @@ pub async fn target_task(
                     _ => 0,
                 };
                 let n = n.min(scratch.len());
+                // Control message: toggle stateless-read mode; not
+                // data, so no commit and no cursor rewind. (A control
+                // write that terminated early misses the length/magic
+                // match and is committed as data — harmless: the
+                // harness retries the toggle and rewrites the buffer
+                // before anything is verified.)
+                if n == CTRL_LEN && scratch[..4] == CTRL_MAGIC {
+                    stateless = scratch[4] != 0;
+                    defmt::info!("[T] stateless-read mode: {}", stateless);
+                    continue;
+                }
                 // Commit in 32-byte chunks, mirroring `Model::write`,
                 // and rewind the read cursor like a device whose address
                 // pointer is set by the write.
@@ -252,56 +303,67 @@ impl Model {
         }
     }
 
-    /// Verify a chunked read: an anchored walk of the whole payload
-    /// that carries the expected cursor position **across** the seams,
-    /// accepting exactly 0 or 1 bytes of cursor slip at each 256-byte
-    /// boundary.
+    /// Verify a chunked read served by the target in **stateless-read
+    /// mode**: fully deterministic and byte-exact, no tolerance.
     ///
-    /// The slip is the emulated peer's irreducible ambiguity, not a
-    /// licence for the driver to lose data: at the end of a read
-    /// transaction the target driver may have pushed one more byte into
-    /// the transmit register than the controller clocked out.
-    /// `ReadStatus` counts pushes, the FIFO reset discards the residue
-    /// (measured: 0 or 1 bytes, never more — a single `STDR` register,
-    /// and this IP has no FIFO status register to recover which), so
-    /// the emulated cursor skips that byte at a seam. Real devices
-    /// advance their pointer on clocked bytes only and would be
-    /// continuous.
+    /// The stateless target serves every bus transaction from the
+    /// buffer start, so each 256-byte window of the payload has exactly
+    /// two legal shapes, distinguished by its first byte (buffer values
+    /// are distinct): it either **continues** the previous position
+    /// exactly — the same transaction, a chained atomic read — or
+    /// **restarts** at position zero exactly — a new re-addressed
+    /// chunk. The transmit-register residue that forces a slip
+    /// tolerance against the cursor target is moot here (the restart
+    /// discards it deterministically), and a fallback engaged after a
+    /// partially-consumed chained attempt also restarts at zero — so
+    /// first-window placement is verified exactly too. The first window
+    /// must sit at position zero unconditionally.
     ///
-    /// So this proves: byte-exact contiguity within every transaction,
-    /// correct chunk ordering and placement across the STOP seams, and
-    /// no shift anywhere beyond the single physically-possible residue
-    /// byte per seam. Requires `buf` to hold distinct values (so the
-    /// two slip candidates are distinguishable).
-    ///
-    /// The *absolute* start position is deliberately NOT asserted: the
-    /// opt-in fallback may legitimately resume from a cursor the
-    /// failed chained attempt already advanced — returning shifted
-    /// data is the documented trade of chunked mode, and precisely why
-    /// it is opt-in. Absolute placement (and the seam-aligned defect
-    /// an atomic read could hide behind a zero-slip walk) is covered
-    /// byte-exactly by `check_read` in the atomic tests.
-    fn check_chunked(&self, read: &[u8]) -> bool {
-        // Anchor the first chunk by value — see above on why not at 0.
-        let Some(mut pos) = self.buf.iter().position(|b| *b == read[0]) else {
-            defmt::error!("chunked: first byte {:02x} not in buffer", read[0]);
-            return false;
-        };
+    /// The payload's **shape is uniform**: a correct driver either
+    /// served the whole read as one chained transaction (every window
+    /// continues) or as re-addressed chunks (every window restarts —
+    /// the seamed path and its fallback always re-read the entire
+    /// buffer from chunk zero). Window 1 decides which; the rest must
+    /// match. Accepting a per-window mix would reopen mod-`BUF_LEN`
+    /// aliasing: dropping one whole 256-byte chunk at the final
+    /// chained seam of an 1100-byte read shifts the next continuation
+    /// position to 1280 ≡ 0 (mod 40), byte-identical to a restart.
+    /// (The 512-byte analogue — a seam defect whose payload exactly
+    /// equals a legal all-restart read — is indistinguishable by any
+    /// payload check on a stateless device and is covered by the
+    /// cursor-mode atomic tests instead.)
+    fn check_chunked_stateless(&self, read: &[u8]) -> bool {
+        // Shape, decided by window 1: true = continuation (atomic
+        // chained), false = restart-per-window (seamed chunks).
+        let mut continuation = true;
+        let mut pos = 0usize;
         for (ci, chunk) in read.chunks(256).enumerate() {
-            let max_slip = if ci == 0 { 0 } else { 1 };
-            let Some(slip) = (0..=max_slip).find(|s| chunk[0] == self.buf[(pos + s) % BUF_LEN]) else {
-                defmt::error!(
-                    "chunked: seam {} misplaced (got {:02x}, want {:02x}(+0) or {:02x}(+1))",
-                    ci,
-                    chunk[0],
-                    self.buf[pos % BUF_LEN],
-                    self.buf[(pos + 1) % BUF_LEN]
-                );
-                return false;
+            let start = if ci == 0 {
+                // First window: exactly at the front, unconditionally.
+                0
+            } else if ci == 1 {
+                // `buf[16]` vs `buf[0]` — distinct values, unambiguous.
+                continuation = chunk[0] == self.buf[pos % BUF_LEN];
+                if continuation {
+                    pos
+                } else if chunk[0] == self.buf[0] {
+                    0
+                } else {
+                    defmt::error!(
+                        "chunked: window 1 misplaced (got {:02x}, want {:02x} cont or {:02x} restart)",
+                        chunk[0],
+                        self.buf[pos % BUF_LEN],
+                        self.buf[0]
+                    );
+                    return false;
+                }
+            } else if continuation {
+                pos
+            } else {
+                0
             };
-            pos += slip;
             for (i, b) in chunk.iter().enumerate() {
-                let expect = self.buf[(pos + i) % BUF_LEN];
+                let expect = self.buf[(start + i) % BUF_LEN];
                 if *b != expect {
                     defmt::error!(
                         "chunked: break at {} (got {:02x}, want {:02x})",
@@ -312,7 +374,7 @@ impl Model {
                     return false;
                 }
             }
-            pos += chunk.len();
+            pos = start + chunk.len();
         }
         true
     }
@@ -340,10 +402,12 @@ pub mod harness {
 
     /// Run the full suite through `ctrl` against the remote target board.
     ///
-    /// `mode` labels the log lines (e.g. "async", "dma"). Logs
+    /// `mode` labels the log lines (e.g. "async", "dma") — display
+    /// only; test expectations come from the typed `caps`, which the
+    /// binary fills in where the engine type is concrete. Logs
     /// `[mode] <test> PASS (<ms>)` per test and panics on the first
     /// failure, so a failing run exits through the panic handler.
-    pub async fn run<C: Controller>(mode: &str, ctrl: &mut C) {
+    pub async fn run<C: Controller>(mode: &str, ctrl: &mut C, caps: PhaseCaps) {
         defmt::info!("== two-board i2c suite [{=str}] start ==", mode);
 
         // Reset the target buffer to a known state so the model is exact
@@ -385,8 +449,7 @@ pub mod harness {
         run_test!("isr_latency", tests::t_isr_latency(ctrl, &mut model, &mut stats));
         run_test!(
             "over_capacity",
-            // Only the DMA engine has a chaining ceiling to refuse at.
-            tests::t_over_capacity(ctrl, &mut model, &mut stats, mode == "dma")
+            tests::t_over_capacity(ctrl, &mut model, &mut stats, caps)
         );
         run_test!("chunked_optin", tests::t_chunked_optin(ctrl, &mut model, &mut stats));
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
@@ -901,15 +964,26 @@ pub mod tests {
     /// silently split into re-addressed chunks, which is what the DMA
     /// path did before chunking became opt-in.
     ///
-    /// `may_refuse` carries the phase's expectation: only the DMA
-    /// engine has a chaining ceiling, so a refusal from an engine that
-    /// chains without one is a failure, not an accepted outcome.
+    /// `caps` carries the phase's expectation: only an engine with a
+    /// chaining ceiling may refuse, and the test length must actually
+    /// exceed that ceiling — otherwise the expectation silently
+    /// inverts.
     pub async fn t_over_capacity<C: Controller>(
         ctrl: &mut C,
         model: &mut Model,
         stats: &mut RetryStats,
-        may_refuse: bool,
+        caps: PhaseCaps,
     ) -> TestResult {
+        let may_refuse = match caps.dma_chain_ceiling {
+            Some(ceiling) => {
+                defmt::assert!(
+                    OVER_CAPACITY > ceiling,
+                    "over-capacity length must exceed the engine's chaining ceiling"
+                );
+                true
+            }
+            None => false,
+        };
         let mut pat = [0u8; BUF_LEN];
         for (i, b) in pat.iter_mut().enumerate() {
             *b = 0x80 | (i as u8).wrapping_mul(7);
@@ -968,24 +1042,40 @@ pub mod tests {
         Ok(())
     }
 
+    /// Toggle the target's stateless-read mode via the control write.
+    /// Not committed to the model — the target intercepts it as a
+    /// command, not data.
+    async fn set_stateless<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+        on: bool,
+    ) -> TestResult {
+        let msg = [CTRL_MAGIC[0], CTRL_MAGIC[1], CTRL_MAGIC[2], CTRL_MAGIC[3], on as u8];
+        op_write(ctrl, &msg, model, stats).await
+    }
+
     /// Exercise the opt-in non-atomic path: with
     /// `Config::allow_chunked_reads` enabled, a long read may be split
-    /// into re-addressed, STOP-separated chunks. Verified with
-    /// `check_chunked`, a cross-seam walk: byte-exact contiguity
-    /// within every transaction, correct chunk placement across the
-    /// STOP seams relative to each other, and no shift anywhere beyond
-    /// the single physically-possible residue-byte slip per seam — the
-    /// emulated peer's one irreducible ambiguity. Absolute start
-    /// position is not asserted: the fallback may legitimately resume
-    /// from an advanced cursor, the documented trade of opting in (see
-    /// `check_chunked`).
+    /// into re-addressed, STOP-separated chunks.
     ///
-    /// Restores the default (disabled) before returning.
+    /// Runs against the target in **stateless-read mode** — the device
+    /// class chunked reads are actually intended for (each transaction
+    /// re-serves from the front, so re-addressing loses nothing).
+    /// That makes every expectation deterministic and byte-exact:
+    /// `check_chunked_stateless` verifies each 256-byte window as
+    /// either an exact continuation (chained atomic transaction) or an
+    /// exact restart at zero (a re-addressed chunk), with first-window
+    /// placement asserted unconditionally — no slip tolerance, no
+    /// variable origin.
+    ///
+    /// Restores the default config and cursor mode before returning.
     pub async fn t_chunked_optin<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
         let mut cfg = CtrlConfig::default();
         cfg.speed = Speed::Standard;
         cfg.allow_chunked_reads = true;
         ctrl.set_config(&cfg).map_err(|_| "set_config failed")?;
+        set_stateless(ctrl, model, stats, true).await?;
 
         // Distinct values (BUF_LEN < 0x80, so `0x80 | i` is unique per
         // index) with the high bit set, which both enables the
@@ -1004,22 +1094,30 @@ pub mod tests {
         // opt-in enabled that read *is* split, and must still come back
         // byte-correct (non-atomic is permitted; incorrect is not).
         for &l in &[257usize, 512, OVER_CAPACITY] {
+            // Scrub with a value outside the pattern (all pattern
+            // bytes have the MSB set): a lost chunk must read as
+            // garbage, not as plausible data left over from the
+            // previous length's read.
+            big[..l].fill(0x00);
             if let Err(e) = op_read(ctrl, &mut big[..l], model, stats).await {
                 result = Err(e);
                 break;
             }
-            // A chunked read may span several transactions, so verify
-            // per-transaction integrity rather than absolute position —
-            // see `Model::check_chunked` for what the emulated peer can
-            // and cannot attest to.
-            if !model.check_chunked(&big[..l]) {
+            // Deterministic in stateless mode: exact continuation or
+            // exact restart-at-zero per window, nothing else.
+            if !model.check_chunked_stateless(&big[..l]) {
                 defmt::error!("chunked L={}: seam break, head={:02x}", l, big[..8]);
                 result = Err("chunked read mismatch");
                 break;
             }
         }
 
-        // Restore the default regardless of outcome.
+        // Restore cursor mode and the default config regardless of
+        // outcome; a restore failure outranks a pass but must not mask
+        // a test failure.
+        if set_stateless(ctrl, model, stats, false).await.is_err() && result.is_ok() {
+            result = Err("stateless-mode restore failed");
+        }
         let mut cfg = CtrlConfig::default();
         cfg.speed = Speed::Standard;
         ctrl.set_config(&cfg).map_err(|_| "set_config restore failed")?;

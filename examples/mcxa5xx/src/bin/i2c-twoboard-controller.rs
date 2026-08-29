@@ -72,7 +72,12 @@ async fn main(spawner: Spawner) {
         let mut ccfg = controller::Config::default();
         ccfg.speed = Speed::Standard;
         let mut ctrl = I2c::new_async(p.LPI2C3.reborrow(), p.P3_21.reborrow(), p.P3_20.reborrow(), Irqs, ccfg).unwrap();
-        i2c_twoboard::harness::run("async", &mut ctrl).await;
+        // The interrupt engine refills the command FIFO as it drains:
+        // no chaining ceiling, refusing a long read is a failure.
+        let caps = i2c_twoboard::PhaseCaps {
+            dma_chain_ceiling: None,
+        };
+        i2c_twoboard::harness::run("async", &mut ctrl, caps).await;
     }
 
     // Phase 2: DMA controller over the same bus.
@@ -89,7 +94,14 @@ async fn main(spawner: Spawner) {
             ccfg,
         )
         .unwrap();
-        i2c_twoboard::harness::run("dma", &mut ctrl).await;
+        // The DMA engine queues every RECEIVE up front in the 4-entry
+        // command FIFO (PARAM[MTXFIFO]=2 on this part) and cannot
+        // refill it while the CPU sleeps: reads past 4 * 256 bytes are
+        // refused with `ChunkingRequired` unless chunking is opted in.
+        let caps = i2c_twoboard::PhaseCaps {
+            dma_chain_ceiling: Some(4 * 256),
+        };
+        i2c_twoboard::harness::run("dma", &mut ctrl, caps).await;
     }
 
     // Phase 3: blocking (polled) controller.
