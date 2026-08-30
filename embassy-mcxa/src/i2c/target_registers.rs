@@ -241,10 +241,20 @@ impl TargetRegisters {
     // marooned-residue and FEF-before-BEF defects both lived in a DMA
     // path that re-made these decisions at the call site.
 
-    /// Interrupts for a DMA-driven transfer: fault and termination
-    /// sources only (RDF/TDF service the DMA engine, not firmware).
-    /// The armed set equals [`Self::dma_transfer_event`]'s wake set.
-    pub(super) fn enable_dma_transfer_interrupts(&self) {
+    /// Arm the DMA-transfer interrupt set (fault and termination
+    /// sources only — RDF/TDF service the DMA engine, not firmware)
+    /// and evaluate its wake condition, as ONE operation, like the
+    /// other `*_wake` pairs. The DMA-completion disjunct is the
+    /// channel's own wait cell and is OR'd in by the caller — it is
+    /// not an SIER source and cannot drift from this set.
+    pub(super) fn dma_transfer_wake(&self) -> bool {
+        self.enable_dma_transfer_interrupts();
+        self.dma_transfer_event()
+    }
+
+    /// Interrupts for a DMA-driven transfer — see
+    /// [`Self::dma_transfer_wake`], the only intended caller.
+    fn enable_dma_transfer_interrupts(&self) {
         self.write_sier(|w| {
             w.set_feie(true);
             w.set_beie(true);
@@ -253,11 +263,9 @@ impl TargetRegisters {
         });
     }
 
-    /// Wake condition paired with
-    /// [`Self::enable_dma_transfer_interrupts`]: any latched fault or
-    /// termination. (DMA completion wakes through the channel's own
-    /// cell and is checked separately.)
-    pub(super) fn dma_transfer_event(&self) -> bool {
+    /// Wake condition paired with the arm set above — see
+    /// [`Self::dma_transfer_wake`], the only intended caller.
+    fn dma_transfer_event(&self) -> bool {
         let ssr = self.ssr();
         ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf()
     }
@@ -282,13 +290,29 @@ impl TargetRegisters {
         from
     }
 
-    /// Whether RX data is still pending — the full-chunk residue
-    /// decision after a drain hit buffer capacity.
-    pub(super) fn rx_pending(&self) -> bool {
-        self.ssr().rdf()
+    /// Terminal classification of an RX DMA chunk from ONE status
+    /// snapshot, in the vocabulary's single flag-priority order: data
+    /// residue with no room left outranks termination (the caller must
+    /// defer, or the residue is marooned into the next transaction),
+    /// after faults, before STOP/repeated-START. Consumes nothing.
+    pub(super) fn rx_chunk_end(&self, chunk_full: bool) -> RxChunkEnd {
+        let ssr = self.ssr();
+        if ssr.bef() {
+            RxChunkEnd::Fault(TargetFault::Bit)
+        } else if ssr.fef() {
+            RxChunkEnd::Fault(TargetFault::Fifo)
+        } else if ssr.rdf() && chunk_full {
+            RxChunkEnd::ResiduePending
+        } else if ssr.sdf() {
+            RxChunkEnd::Stopped
+        } else if ssr.rsf() {
+            RxChunkEnd::Restarted
+        } else {
+            RxChunkEnd::Continue
+        }
     }
 
-    /// Terminal classification of a DMA chunk, in the vocabulary's
+    /// Terminal classification of a TX DMA chunk, in the vocabulary's
     /// single flag-priority order: bit error before FIFO error
     /// (matching [`Self::rx_event`]/[`Self::tx_step`]), faults before
     /// termination. Consumes nothing.
@@ -308,7 +332,26 @@ impl TargetRegisters {
     }
 }
 
-/// Terminal classification of a DMA chunk transfer — see
+/// Terminal classification of an RX DMA chunk — see
+/// [`TargetRegisters::rx_chunk_end`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum RxChunkEnd {
+    /// A fault; the transfer is compromised.
+    Fault(TargetFault),
+    /// Data is still pending with no room left in the chunk — defer
+    /// (report the chunk full); a latched termination stays latched
+    /// for the follow-up.
+    ResiduePending,
+    /// The controller issued a STOP.
+    Stopped,
+    /// The controller issued a repeated START.
+    Restarted,
+    /// No fault or termination latched.
+    Continue,
+}
+
+/// Terminal classification of a TX DMA chunk transfer — see
 /// [`TargetRegisters::chunk_end`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]

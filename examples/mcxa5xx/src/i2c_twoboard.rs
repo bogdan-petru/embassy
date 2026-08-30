@@ -33,7 +33,8 @@
 //! Detection is unaffected, because a silent retry happens *inside* the
 //! read being verified, after the anchor.
 //!
-//! Long-transfer coverage: reads of 255/256/257/260/300/512 bytes cross
+//! Long-transfer coverage: reads of 40/80 (exact view multiples) and
+//! 255/256/257/260/300/512 bytes cross
 //! the LPI2C's 256-byte RECEIVE-command boundary. The driver chains
 //! adjacent RECEIVE commands under a single address phase (the
 //! controller ACKs across a command boundary only when the next command
@@ -306,11 +307,12 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 .min(OVERFLOW_PROBE_LEN);
                 let first_full = matches!(status, WriteStatus::BufferFull(_));
                 // Service to a clean termination NO MATTER how much
-                // arrives: an armed probe can be consumed by a retry's
-                // 40-byte resync instead of the 9-byte probe write,
-                // and abandoning a still-open transaction here would
-                // wedge the bus under RXSTALL. Collect what fits,
-                // discard the rest.
+                // arrives. With raw whole-sequence retries the data
+                // write is always 9 bytes, so anything longer reaching
+                // an armed probe would be a harness bug — but
+                // abandoning a still-open transaction would wedge the
+                // bus under RXSTALL, so this stays robust to any
+                // length: collect what fits, discard the rest.
                 while matches!(status, WriteStatus::BufferFull(_)) {
                     if total < small.len() {
                         status = tgt.respond_write(&mut small[total..]).await.unwrap();
@@ -333,6 +335,25 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 } else {
                     defmt::info!("[T] overflow probe: no overflow ({})", total);
                 }
+                // Commands are commands on EVERY path: a retried
+                // control write can land on the armed probe (e.g. the
+                // arm reported a bus error to the controller but
+                // completed on the wire, and the retry arrives here).
+                // Handling it — instead of committing magic bytes as
+                // data — keeps the arm idempotent.
+                if total == CTRL_LEN && small[..4] == CTRL_MAGIC {
+                    match small[4] {
+                        CTRL_ARM_OVERFLOW_PROBE => {
+                            overflow_probe = true;
+                            defmt::info!("[T] overflow probe re-armed");
+                        }
+                        m => {
+                            stateless = m != CTRL_STATELESS_OFF;
+                            defmt::info!("[T] stateless-read mode: {}", stateless);
+                        }
+                    }
+                    continue;
+                }
                 for chunk in small[..total].chunks(BUF_LEN) {
                     buf[..chunk.len()].copy_from_slice(chunk);
                 }
@@ -345,6 +366,7 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                     // (a NeedMore continuation is the same transfer).
                     cursor = 0;
                 }
+                let mut after_needmore = false;
                 loop {
                     // Serve the buffer rotated to the cursor, then advance by
                     // however many bytes the driver reports as queued.
@@ -359,6 +381,19 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                         ReadStatus::Complete(n) | ReadStatus::EarlyStop(n) => (n, false),
                         _ => (0, false),
                     };
+                    // Discriminator for the TX-settle contract: NeedMore
+                    // claims the controller wants more, so a follow-up
+                    // that immediately reports termination with ZERO
+                    // bytes means the NeedMore was premature (the
+                    // pre-settle DMA defect fired this on every read
+                    // ending exactly at a view boundary — the suite's
+                    // exact-multiple lengths force that case). The one
+                    // legitimate producer is the razor TDF-then-NACK
+                    // race, so a correct driver logs ~zero of these.
+                    if after_needmore && n == 0 && !more {
+                        defmt::info!("[T] premature NeedMore (0-byte follow-up)");
+                    }
+                    after_needmore = more;
                     // NOTE: `ReadStatus` documents this count as bytes
                     // *queued*, and explicitly warns against using it to
                     // advance a device-side position — at a terminated
@@ -678,7 +713,11 @@ pub mod tests {
     /// Read lengths that straddle the driver's 256-byte RECEIVE-command
     /// chunk boundary, where >256-byte reads are documented to risk
     /// silent data loss if the controller chains receive commands.
-    const LONG_LENGTHS: &[usize] = &[255, 256, 257, 260, 300, 512];
+    // 40 and 80 are exact multiples of the target's BUF_LEN: the read
+    // terminates exactly at a served-view boundary, which is the case
+    // that discriminates a settled NeedMore/Complete decision from a
+    // premature one (see the serve loop's premature-NeedMore log).
+    const LONG_LENGTHS: &[usize] = &[40, 80, 255, 256, 257, 260, 300, 512];
 
     /// Spurious-error retry accounting for one suite run.
     #[derive(Default)]
@@ -954,7 +993,7 @@ pub mod tests {
 
     /// Long transfers across the 256-byte RECEIVE chunk boundary, with
     /// every byte checked against the cyclic model:
-    /// - reads of 255/256/257/260/300/512 bytes;
+    /// - reads of 40/80/255/256/257/260/300/512 bytes;
     /// - consecutive long reads separated by STOP;
     /// - repeated-START (write_read) into a 300-byte read;
     /// - wrong-address NACK immediately followed by a 257-byte read;
@@ -1273,26 +1312,58 @@ pub mod tests {
             CTRL_ARM_OVERFLOW_PROBE,
         ];
         let mut w = [0u8; OVERFLOW_PROBE_LEN + 1];
+        // Monotone across every attempt of every rep: CONSECUTIVE
+        // payloads always differ at every index, so a dropped ninth
+        // byte can never be masked by the previously committed value.
+        // (Deriving the base from rep and attempt separately collides
+        // — e.g. rep*0x21 ^ attempt*0x0B repeats 0x81 — which is
+        // exactly the masking this exists to prevent.)
+        let mut seq: u8 = 0;
 
-        'reps: for rep in 0..OVERFLOW_PROBE_REPS {
+        'reps: for _rep in 0..OVERFLOW_PROBE_REPS {
             for attempt in 0..=MAX_RETRIES {
-                // One byte more than the probe buffer holds. The
-                // payload VARIES per rep AND per attempt: the previous
-                // rep (or this rep's previous attempt) already
-                // committed its values, so a dropped ninth byte would
-                // otherwise be masked by an identical stale value
-                // underneath.
-                let base = 0xA0u8 ^ (rep as u8).wrapping_mul(0x21) ^ (attempt as u8).wrapping_mul(0x0B);
+                seq = seq.wrapping_add(1);
+                let base = 0xA0 ^ seq;
                 for (i, b) in w.iter_mut().enumerate() {
                     *b = base ^ i as u8;
                 }
-                // Arm (one-shot; a command, not data). An arm consumed
-                // by a retry's resync routes the data write through the
-                // normal oversized path — correctness identical, branch
-                // chance lost for this rep; the target log tells.
-                op_write(ctrl, &arm, model, stats).await?;
+
+                // RAW writes throughout: `op_write` retries internally
+                // (with a resync write), which can consume the one-shot
+                // arm and route the data write through the ordinary
+                // oversized handler without the test noticing. Here any
+                // failure restarts the WHOLE arm/write/read sequence,
+                // and a retried arm landing on an already-armed probe
+                // re-arms it (the probe path intercepts the magic).
+                if let Err(e) = ctrl.write(TARGET_ADDR, &arm).await {
+                    match e {
+                        ControllerIOError::ArbitrationLoss => stats.alf_retries += 1,
+                        ControllerIOError::UnexpectedStop | ControllerIOError::Timeout => stats.end_retries += 1,
+                        _ => {
+                            defmt::error!("overflow write: arm failed {}", e);
+                            return Err("overflow_write: arm failed");
+                        }
+                    }
+                    if attempt == MAX_RETRIES {
+                        return Err("overflow_write: retries exhausted");
+                    }
+                    continue;
+                }
                 // The overflowing write; commits and rewinds cursor.
-                op_write(ctrl, &w, model, stats).await?;
+                if let Err(e) = ctrl.write(TARGET_ADDR, &w).await {
+                    match e {
+                        ControllerIOError::ArbitrationLoss => stats.alf_retries += 1,
+                        ControllerIOError::UnexpectedStop | ControllerIOError::Timeout => stats.end_retries += 1,
+                        _ => {
+                            defmt::error!("overflow write: write failed {}", e);
+                            return Err("overflow_write: write failed");
+                        }
+                    }
+                    if attempt == MAX_RETRIES {
+                        return Err("overflow_write: retries exhausted");
+                    }
+                    continue;
+                }
                 model.write(&w);
 
                 // UNANCHORED read-back: the write above rewound the

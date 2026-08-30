@@ -73,7 +73,7 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::target_registers::{ChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
+use super::target_registers::{ChunkEnd, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -960,10 +960,8 @@ impl<'d> I2c<'d, Dma<'d>> {
             while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
-            // Arm-and-check through the vocabulary: the armed set and
-            // the wake set are defined together in one place.
-            self.registers().enable_dma_transfer_interrupts();
-            if self.registers().dma_transfer_event() || self.mode.rx_dma.is_done() {
+            // Arm-and-check through the vocabulary, as one operation.
+            if self.registers().dma_transfer_wake() || self.mode.rx_dma.is_done() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -1013,8 +1011,8 @@ impl<'d> I2c<'d, Dma<'d>> {
             );
         }
 
-        match self.registers().chunk_end() {
-            ChunkEnd::Fault(f) => {
+        match self.registers().rx_chunk_end(bytes == chunk_len) {
+            RxChunkEnd::Fault(f) => {
                 // Parity with the interrupt paths' fault arms: the
                 // error discards this transfer's accounting, so
                 // whatever the FIFOs still hold must not survive into
@@ -1022,33 +1020,27 @@ impl<'d> I2c<'d, Dma<'d>> {
                 self.reset_fifos();
                 Err(f.into())
             }
-            end => {
-                if self.registers().rx_pending() && bytes == chunk_len {
-                    // Data is still pending with no room left in this
-                    // chunk — even if a termination flag is also
-                    // latched. Mirror the interrupt engine's
-                    // data-before-termination contract: report the
-                    // chunk full so the caller collects the residue
-                    // (next chunk, or `BufferFull` and a follow-up
-                    // respond — SDF/RSF stay latched for it, so the
-                    // follow-up's entry wait completes immediately,
-                    // drains the residue, and only then reports the
-                    // termination). Affirming `Stopped` here would
-                    // maroon the residue in the FIFO to be DMA'd into
-                    // the NEXT transaction's first bytes.
-                    #[cfg(feature = "defmt")]
-                    defmt::debug!("i2c target rx: residue beyond chunk; deferring to follow-up");
-                    return Ok(RxChunkOutcome::Filled(chunk_len));
-                }
-                match end {
-                    ChunkEnd::Stopped => Ok(RxChunkOutcome::Stopped(bytes)),
-                    ChunkEnd::Restarted => Ok(RxChunkOutcome::Restarted(bytes)),
-                    // DMA done with no end-of-transfer flag: chunk
-                    // filled, controller may want to write more bytes.
-                    // (Fault is unreachable in this arm.)
-                    ChunkEnd::Continue | ChunkEnd::Fault(_) => Ok(RxChunkOutcome::Filled(chunk_len)),
-                }
+            RxChunkEnd::ResiduePending => {
+                // Data is still pending with no room left in this
+                // chunk — even if a termination flag is also latched.
+                // Mirror the interrupt engine's data-before-
+                // termination contract: report the chunk full so the
+                // caller collects the residue (next chunk, or
+                // `BufferFull` and a follow-up respond — SDF/RSF stay
+                // latched for it, so the follow-up's entry wait
+                // completes immediately, drains the residue, and only
+                // then reports the termination). Affirming `Stopped`
+                // here would maroon the residue in the FIFO to be
+                // DMA'd into the NEXT transaction's first bytes.
+                #[cfg(feature = "defmt")]
+                defmt::debug!("i2c target rx: residue beyond chunk; deferring to follow-up");
+                Ok(RxChunkOutcome::Filled(chunk_len))
             }
+            RxChunkEnd::Stopped => Ok(RxChunkOutcome::Stopped(bytes)),
+            RxChunkEnd::Restarted => Ok(RxChunkOutcome::Restarted(bytes)),
+            // DMA done with no end-of-transfer flag: chunk filled,
+            // controller may want to write more bytes.
+            RxChunkEnd::Continue => Ok(RxChunkOutcome::Filled(chunk_len)),
         }
     }
 
@@ -1103,10 +1095,8 @@ impl<'d> I2c<'d, Dma<'d>> {
             while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
-            // Arm-and-check through the vocabulary — see
-            // `read_dma_chunk`.
-            self.registers().enable_dma_transfer_interrupts();
-            if self.registers().dma_transfer_event() || self.mode.tx_dma.is_done() {
+            // Arm-and-check through the vocabulary, as one operation.
+            if self.registers().dma_transfer_wake() || self.mode.tx_dma.is_done() {
                 Poll::Ready(())
             } else {
                 Poll::Pending

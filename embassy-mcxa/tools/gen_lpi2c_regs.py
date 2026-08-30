@@ -29,10 +29,11 @@ one command away.
 """
 
 import argparse
-import glob
 import io
+import json
 import os
 import re
+import subprocess
 import sys
 
 # (pac_accessor, tock_access, [doc lines])
@@ -92,16 +93,32 @@ STRUCT_BEGIN = "// BEGIN GENERATED (gen_lpi2c_regs.py): register_structs"
 STRUCT_END = "// END GENERATED: register_structs"
 ASSERT_BEGIN = "// BEGIN GENERATED (gen_lpi2c_regs.py): offset assertions"
 ASSERT_END = "// END GENERATED: offset assertions"
+CHECK_BEGIN = "// BEGIN GENERATED (gen_lpi2c_regs.py): layout checks"
+CHECK_END = "// END GENERATED: layout checks"
 
 
 def find_pac() -> str:
-    home = os.path.expanduser("~")
-    hits = glob.glob(
-        os.path.join(home, ".cargo", "git", "checkouts", "nxp-pac-*", "*", "nxp-pac", "src", "meta_peripherals", "mcxa", "LPI2C.rs")
-    )
-    if not hits:
-        sys.exit("PAC LPI2C.rs not found under ~/.cargo/git/checkouts; pass --pac")
-    return sorted(hits)[-1]
+    """Resolve the SAME nxp-pac checkout the build uses, via cargo
+    metadata (which honors Cargo.lock and CARGO_HOME) — never by
+    globbing caches, which can silently pick another cached revision.
+    `--pac` remains the manual override."""
+    manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml")
+    try:
+        out = subprocess.check_output(
+            ["cargo", "metadata", "--format-version", "1", "--manifest-path", manifest],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        sys.exit(f"cargo metadata failed ({e}); pass --pac explicitly")
+    meta = json.loads(out)
+    for pkg in meta["packages"]:
+        if pkg["name"] == "nxp-pac":
+            root = os.path.dirname(pkg["manifest_path"])
+            path = os.path.join(root, "src", "meta_peripherals", "mcxa", "LPI2C.rs")
+            if not os.path.exists(path):
+                sys.exit(f"resolved nxp-pac at {root} but LPI2C.rs is missing (layout changed?)")
+            return path
+    sys.exit("nxp-pac not found in cargo metadata; pass --pac")
 
 
 def parse_offsets(pac_path: str) -> dict:
@@ -146,7 +163,7 @@ def gen_struct(offsets: dict) -> str:
     return "\n".join(lines)
 
 
-def gen_asserts(offsets: dict, pac_path: str) -> str:
+def gen_asserts(offsets: dict) -> str:
     lines = [
         ASSERT_BEGIN,
         "// Offsets generated from the PAC's own accessors",
@@ -159,6 +176,14 @@ def gen_asserts(offsets: dict, pac_path: str) -> str:
         lines.append(f"    assert!(offset_of!(LpI2cRegisters, {name}) == 0x{off:03x});")
     lines.append("};")
     lines.append(ASSERT_END)
+    return "\n".join(lines)
+
+
+def gen_checks(offsets: dict) -> str:
+    lines = [CHECK_BEGIN.strip()]
+    for name, _, _ in MANIFEST:
+        lines.append(f"    check!({name}, {name});")
+    lines.append("    " + CHECK_END)
     return "\n".join(lines)
 
 
@@ -181,12 +206,18 @@ def main() -> None:
     target = os.path.join(here, "..", "src", "i2c", "lpi2c_regs.rs")
     text = io.open(target, encoding="utf-8", newline="").read()
 
-    for marker in (STRUCT_BEGIN, STRUCT_END, ASSERT_BEGIN, ASSERT_END):
+    # Preserve the file's own line-ending convention, so --check never
+    # reports false staleness on a CRLF checkout and regeneration never
+    # produces mixed endings.
+    eol = "\r\n" if "\r\n" in text else "\n"
+
+    for marker in (STRUCT_BEGIN, STRUCT_END, ASSERT_BEGIN, ASSERT_END, CHECK_BEGIN, CHECK_END):
         if marker not in text:
             sys.exit(f"marker missing in lpi2c_regs.rs: {marker!r}")
 
-    updated = splice(text, STRUCT_BEGIN, STRUCT_END, gen_struct(offsets))
-    updated = splice(updated, ASSERT_BEGIN, ASSERT_END, gen_asserts(offsets, pac_path))
+    updated = splice(text, STRUCT_BEGIN, STRUCT_END, gen_struct(offsets).replace("\n", eol))
+    updated = splice(updated, ASSERT_BEGIN, ASSERT_END, gen_asserts(offsets).replace("\n", eol))
+    updated = splice(updated, CHECK_BEGIN, CHECK_END, gen_checks(offsets).replace("\n", eol))
 
     if args.check:
         if updated != text:
