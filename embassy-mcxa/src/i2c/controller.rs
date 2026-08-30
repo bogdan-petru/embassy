@@ -730,14 +730,20 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// sends the command and blocks waiting for the FIFO to become
     /// empty ensuring the command was sent.
     fn start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
+        // Preflight BEFORE the continuation is surrendered: a
+        // rejection must not silently abandon a live transaction, so
+        // it is closed (best-effort) and the error wins.
+        if address >= 0x80 {
+            if let Some(open) = continues {
+                let _ = self.stop(open);
+            }
+            return Err(IOError::AddressOutOfRange(address));
+        }
         // A repeated START surrenders the prior transaction's token
         // and mints the successor atomically (verified to belong to
         // this controller); a fresh START passes `None`.
         if let Some(open) = continues {
             self.consume_token(open);
-        }
-        if address >= 0x80 {
-            return Err(IOError::AddressOutOfRange(address));
         }
 
         // Wait until we have space in the TxFIFO
@@ -837,6 +843,11 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// token back to the caller, which must thread it onward.
     fn blocking_read_txn(&self, address: u8, read: &mut [u8], continues: Option<Started>) -> Result<Started, IOError> {
         if read.is_empty() {
+            // A preflight rejection must not silently abandon a live
+            // continuation — close it so the bus is released.
+            if let Some(open) = continues {
+                let _ = self.stop(open);
+            }
             return Err(IOError::InvalidReadBufferLength);
         }
 
@@ -1172,14 +1183,19 @@ where
     /// seamed branch), so nobody else would clean up either kind of
     /// abort.
     async fn async_start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
+        // Preflight BEFORE the continuation is surrendered — see
+        // `start`.
+        if address >= 0x80 {
+            if let Some(open) = continues {
+                let _ = self.async_stop(open).await;
+            }
+            return Err(IOError::AddressOutOfRange(address));
+        }
         // A repeated START surrenders the prior transaction's token
         // and mints the successor atomically (verified to belong to
         // this controller); a fresh START passes `None`.
         if let Some(open) = continues {
             self.consume_token(open);
-        }
-        if address >= 0x80 {
-            return Err(IOError::AddressOutOfRange(address));
         }
 
         // send the start command
@@ -1636,7 +1652,14 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         read: &mut [u8],
         continues: Option<Started>,
     ) -> Result<Started, IOError> {
-        self.read_preflight(read)?;
+        if let Err(e) = self.read_preflight(read) {
+            // A preflight rejection must not silently abandon a live
+            // continuation — close it so the bus is released.
+            if let Some(open) = continues {
+                let _ = self.async_stop(open).await;
+            }
+            return Err(e);
+        }
 
         // A chained read that died mid-transfer leaves the device in an
         // unknown state: its pointer has advanced by however many bytes
@@ -1945,7 +1968,14 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         read: &mut [u8],
         continues: Option<Started>,
     ) -> Result<Started, IOError> {
-        self.read_preflight(read)?;
+        if let Err(e) = self.read_preflight(read) {
+            // A preflight rejection must not silently abandon a live
+            // continuation — close it so the bus is released.
+            if let Some(open) = continues {
+                let _ = self.async_stop(open).await;
+            }
+            return Err(e);
+        }
 
         // Chain all RECEIVE commands under a single address phase when
         // they fit the command FIFO: the controller ACKs across a

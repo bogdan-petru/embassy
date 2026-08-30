@@ -125,7 +125,8 @@ const CTRL_ARM_OVERFLOW_PROBE: u8 = 2;
 /// Serve the audit counters on the next Read request (WITHOUT
 /// resetting them — see [`CTRL_RESET_STATS`]).
 const CTRL_SERVE_STATS: u8 = 3;
-/// Acknowledge a served audit: reset the counters. Separate from the
+/// Reset the audit counters, the stats latch, and every test mode
+/// (stateless read, overflow probe). Separate from the
 /// serve so a stats read that fails controller-side (the audit read is
 /// retried) cannot destroy the evidence it was fetching.
 const CTRL_RESET_STATS: u8 = 4;
@@ -375,7 +376,17 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             stats_pending = true;
                         }
                         CTRL_RESET_STATS => {
+                            // Clears ALL audit and test-mode state:
+                            // an interrupted run must not leave a
+                            // stale counter, a pending stats latch (it
+                            // would serve a stats payload to the next
+                            // data read), a stateless-read mode, or an
+                            // armed overflow probe behind for the next
+                            // run's phases.
                             premature_needmore = 0;
+                            stats_pending = false;
+                            stateless = false;
+                            overflow_probe = false;
                         }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
@@ -486,7 +497,17 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             stats_pending = true;
                         }
                         CTRL_RESET_STATS => {
+                            // Clears ALL audit and test-mode state:
+                            // an interrupted run must not leave a
+                            // stale counter, a pending stats latch (it
+                            // would serve a stats payload to the next
+                            // data read), a stateless-read mode, or an
+                            // armed overflow probe behind for the next
+                            // run's phases.
                             premature_needmore = 0;
+                            stats_pending = false;
+                            stateless = false;
+                            overflow_probe = false;
                         }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
@@ -665,15 +686,25 @@ pub mod harness {
     pub async fn run<C: Controller>(mode: &str, ctrl: &mut C, caps: PhaseCaps) {
         defmt::info!("== two-board i2c suite [{=str}] start ==", mode);
 
+        let mut model = Model::new();
+        let mut stats = tests::RetryStats::default();
+
+        // Scrub audit and test-mode state possibly left by an
+        // interrupted previous run BEFORE the sync write: a stale
+        // armed probe would otherwise partially swallow the sync
+        // payload (the probe path handles control writes as commands,
+        // so this scrub gets through regardless of stale state).
+        if let Err(e) = tests::t_audit_reset(ctrl, &mut model, &mut stats).await {
+            defmt::error!("[{=str}] audit reset failed: {=str}", mode, e);
+            panic!("audit reset failed");
+        }
+
         // Reset the target buffer to a known state so the model is exact
         // even if the target kept state from a previous run or phase.
-        let mut model = Model::new();
         if ctrl.write(TARGET_ADDR, &model.buf).await.is_err() {
             defmt::error!("[{=str}] sync write failed — is the target board up?", mode);
             panic!("target sync failed");
         }
-
-        let mut stats = tests::RetryStats::default();
 
         macro_rules! run_test {
             ($name:literal, $fut:expr) => {{
@@ -731,12 +762,19 @@ pub mod harness {
         defmt::info!("== two-board i2c suite [{=str}] start ==", mode);
 
         let mut model = Model::new();
+        let mut stats = tests::RetryStats::default();
+
+        // Scrub before the sync write — see `run`.
+        if let Err(e) = tests::b_audit_reset(ctrl, &mut stats) {
+            defmt::error!("[{=str}] audit reset failed: {=str}", mode, e);
+            panic!("audit reset failed");
+        }
+
         if ctrl.blocking_write(TARGET_ADDR, &model.buf).is_err() {
             defmt::error!("[{=str}] sync write failed — is the target board up?", mode);
             panic!("target sync failed");
         }
 
-        let mut stats = tests::RetryStats::default();
         let t0 = Instant::now();
         match tests::t_blocking_battery(ctrl, &mut model, &mut stats) {
             Ok(()) => defmt::info!("[{=str}] battery PASS ({=u64} ms)", mode, t0.elapsed().as_millis()),
@@ -1659,6 +1697,43 @@ pub mod tests {
             }
         }
         Err("settle_audit: retries exhausted")
+    }
+
+    /// Scrub the target's audit state (counter AND pending stats
+    /// latch). Run at every phase start: the target task persists
+    /// across controller reruns, so an interrupted run must not
+    /// contaminate the next one's audit or serve a stale stats
+    /// payload to its first read.
+    pub async fn t_audit_reset<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        let msg = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_RESET_STATS,
+        ];
+        op_write(ctrl, &msg, model, stats).await
+    }
+
+    /// Blocking-phase variant of [`t_audit_reset`].
+    pub fn b_audit_reset(ctrl: &mut ControllerI2c<'_, Blocking>, stats: &mut RetryStats) -> TestResult {
+        let msg = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_RESET_STATS,
+        ];
+        for attempt in 0..=MAX_RETRIES {
+            if ctrl.blocking_write(TARGET_ADDR, &msg).is_ok() {
+                return Ok(());
+            }
+            stats.alf_retries += 1;
+            if attempt == MAX_RETRIES {
+                break;
+            }
+        }
+        Err("audit_reset(b): retries exhausted")
     }
 
     /// Blocking-phase settle audit — same protocol as

@@ -7,8 +7,8 @@ is either single-sourced in the PAC or owned here. This script removes
 the transcription risk from that one duplication: it reads the offsets
 from the PAC's own generated accessors (nxp-pac
 `meta_peripherals/mcxa/LPI2C.rs`) and emits the `register_structs!`
-block and the `offset_of!` assertion block between the GENERATED
-markers in lpi2c_regs.rs.
+block, the `offset_of!` assertion block, and the runtime
+`check_layout` list between the GENERATED markers in lpi2c_regs.rs.
 
 The MANIFEST below is the policy input and stays hand-written: which
 registers the hot paths map, which Tock access type each gets (the

@@ -35,10 +35,13 @@ cargo embassy-devtool check --force-incremental
 # Store stub while real Python is `python` — accept either.)
 if command -v python3 &> /dev/null && python3 -c '' &> /dev/null; then
     python3 embassy-mcxa/tools/gen_lpi2c_regs.py --check
-elif command -v python &> /dev/null; then
+elif command -v python &> /dev/null && python -c '' &> /dev/null; then
     python embassy-mcxa/tools/gen_lpi2c_regs.py --check
 else
-    echo "python not found; skipping the generated-map drift check (tools/gen_lpi2c_regs.py --check)"
+    echo "python not found: the generated-map drift check (embassy-mcxa/tools/"
+    echo "gen_lpi2c_regs.py --check) cannot run. Install python3 — a guard that"
+    echo "can be silently skipped is no guard."
+    exit 1
 fi
 
 if [[ -z "${TELEPROBE_TOKEN-}" ]]; then
