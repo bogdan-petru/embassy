@@ -127,6 +127,23 @@ impl TargetRegisters {
         });
     }
 
+    /// Arm the receive interrupt set and evaluate its wake condition,
+    /// as ONE operation: the armed set and the predicate are defined
+    /// together so they cannot drift apart (an armed source outside
+    /// the wake set re-arms and interrupts forever — the listen-side
+    /// RSIE mismatch was exactly this class).
+    pub(super) fn rx_wake(&self) -> bool {
+        self.enable_receive_interrupts();
+        self.rx_ready()
+    }
+
+    /// Arm the transmit interrupt set and evaluate its wake condition,
+    /// as one operation — see [`Self::rx_wake`].
+    pub(super) fn tx_wake(&self) -> bool {
+        self.enable_transmit_interrupts();
+        self.tx_ready()
+    }
+
     pub(super) fn reset_fifos(&self) {
         critical_section::with(|_| {
             self.modify_scr(|w| {

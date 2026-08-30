@@ -16,16 +16,20 @@
 //! `pub struct X(pub u32)` newtypes over exactly this word. The PAC
 //! remains the single source of truth for what the bits mean.
 //!
-//! Layout drift is guarded twice: `offset_of!` assertions at the bottom
-//! pin this map against transcribed offsets at compile time, and
-//! [`check_layout`] compares every mapped register's address against the
-//! PAC's *generated* accessors at driver init — so a regenerated PAC
-//! with a changed layout (which the transcribed literals cannot see)
-//! panics at first construction instead of corrupting MMIO.
+//! Layout drift is guarded three ways: the `register_structs!` block
+//! and the `offset_of!` assertions below are **generated from the
+//! PAC's own accessors** by `tools/gen_lpi2c_regs.py` (offsets are
+//! never written by hand; rerun the script after a PAC bump, or run it
+//! with `--check` to verify), the assertions pin the generated map at
+//! compile time, and [`check_layout`] compares every mapped register's
+//! address against the PAC's generated accessors at driver init — so
+//! drift at any layer panics at first construction instead of
+//! corrupting MMIO.
 
 use tock_registers::register_structs;
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
 
+// BEGIN GENERATED (gen_lpi2c_regs.py): register_structs
 register_structs! {
     /// LPI2C register block (hot-path subset; gaps are configuration
     /// registers still accessed through the PAC).
@@ -72,6 +76,7 @@ register_structs! {
         (0x174 => @END),
     }
 }
+// END GENERATED: register_structs
 
 /// View the LPI2C block behind a PAC handle through the Tock map.
 pub(super) fn from_pac(regs: crate::pac::lpi2c::Lpi2c) -> &'static LpI2cRegisters {
@@ -123,7 +128,9 @@ pub(super) fn check_layout(regs: crate::pac::lpi2c::Lpi2c) {
     check!(srdr, srdr);
 }
 
-// Offsets transcribed from nxp-pac (nxp-pac/src/meta_peripherals/mcxa/LPI2C.rs).
+// BEGIN GENERATED (gen_lpi2c_regs.py): offset assertions
+// Offsets generated from the PAC's own accessors
+// (nxp-pac/src/meta_peripherals/mcxa/LPI2C.rs).
 const _: () = {
     use core::mem::offset_of;
     assert!(offset_of!(LpI2cRegisters, param) == 0x004);
@@ -141,3 +148,4 @@ const _: () = {
     assert!(offset_of!(LpI2cRegisters, stdr) == 0x160);
     assert!(offset_of!(LpI2cRegisters, srdr) == 0x170);
 };
+// END GENERATED: offset assertions

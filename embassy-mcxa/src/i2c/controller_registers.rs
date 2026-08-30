@@ -168,6 +168,31 @@ impl ControllerRegisters {
         });
     }
 
+    /// Arm the transmit-path interrupt set and evaluate its wake
+    /// condition, as ONE operation: the armed set and the predicate
+    /// are defined together so they cannot drift apart (an armed
+    /// source outside the wake set re-arms and interrupts forever —
+    /// the listen-side RSIE mismatch was exactly this class).
+    pub(super) fn tx_settle_wake(&self) -> bool {
+        self.enable_transmit_interrupts();
+        self.tx_settled()
+    }
+
+    /// Arm the receive-path interrupt set and evaluate its wake
+    /// condition, as one operation — see [`Self::tx_settle_wake`].
+    pub(super) fn rx_wake(&self) -> bool {
+        self.enable_receive_interrupts();
+        self.rx_ready()
+    }
+
+    /// Arm the error interrupt set (for DMA-driven transfers, where
+    /// TDF/RDF service the engine) and report any latched error, as
+    /// one operation — see [`Self::tx_settle_wake`].
+    pub(super) fn error_wake(&self) -> Option<ControllerStatusError> {
+        self.enable_error_interrupts();
+        self.read_status().error()
+    }
+
     pub(super) fn enable_receive_interrupts(&self) {
         // No EPIE/SDIE — see `enable_error_interrupts`.
         self.write_mier(|w| {

@@ -1151,10 +1151,7 @@ impl<'d> I2c<'d, Dma<'d>> {
                 // interrupt engine returns Complete.
                 self.info
                     .wait_cell()
-                    .wait_for(|| {
-                        self.registers().enable_transmit_interrupts();
-                        self.registers().tx_ready()
-                    })
+                    .wait_for(|| self.registers().tx_wake())
                     .await
                     .map_err(|_| IOError::Other)?;
 
@@ -1202,14 +1199,14 @@ where
         });
     }
 
-    /// Enable only the interrupts relevant to receiving data (respond_to_write).
-    fn enable_rx_ints(&self) {
-        self.registers().enable_receive_interrupts();
-    }
-
-    /// Enable only the interrupts relevant to transmitting data (respond_to_read).
-    fn enable_tx_ints(&self) {
-        self.registers().enable_transmit_interrupts();
+    /// Arm the listen interrupt set and evaluate its wake condition as
+    /// one operation (the armed set depends on driver config —
+    /// general call, SMBus alert — so the pairing lives here rather
+    /// than in the register wrapper). Includes BEF/FEF — see
+    /// `listen_ready`.
+    fn listen_wake(&self) -> bool {
+        self.enable_listen_ints();
+        self.registers().listen_ready()
     }
 
     // Public API: Async
@@ -1228,11 +1225,7 @@ where
 
         self.info
             .wait_cell()
-            .wait_for(|| {
-                self.enable_listen_ints();
-                // Includes BEF/FEF — see `listen_ready`.
-                self.registers().listen_ready()
-            })
+            .wait_for(|| self.listen_wake())
             .await
             .map_err(|_| IOError::Other)?;
 
@@ -1337,10 +1330,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             loop {
                 self.info
                     .wait_cell()
-                    .wait_for(|| {
-                        self.enable_tx_ints();
-                        self.registers().tx_ready()
-                    })
+                    .wait_for(|| self.registers().tx_wake())
                     .await
                     .map_err(|_| IOError::Other)?;
 
@@ -1374,10 +1364,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         let ended = loop {
             self.info
                 .wait_cell()
-                .wait_for(|| {
-                    self.enable_tx_ints();
-                    self.registers().tx_ready()
-                })
+                .wait_for(|| self.registers().tx_wake())
                 .await
                 .map_err(|_| IOError::Other)?;
 
@@ -1423,10 +1410,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             loop {
                 self.info
                     .wait_cell()
-                    .wait_for(|| {
-                        self.enable_rx_ints();
-                        self.registers().rx_ready()
-                    })
+                    .wait_for(|| self.registers().rx_wake())
                     .await
                     .map_err(|_| IOError::Other)?;
 

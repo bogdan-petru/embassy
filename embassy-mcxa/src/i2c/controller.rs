@@ -284,6 +284,19 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
     (best_prescale, clklo, clkhi, sethold, datavd)
 }
 
+/// Proof that a START was issued and its transaction is open on the
+/// wire. Produced by `start`/`async_start`, consumed by `stop`/
+/// `async_stop`; the internal engines thread it, so the compiler now
+/// enforces the transaction protocol — a stop cannot be issued without
+/// an open transaction, and a path that leaves one open must visibly
+/// hand the token onward (`#[must_use]`). Deliberately zero-sized and
+/// non-owning: cleanup on abandonment (drop-cancellation, error
+/// unwind) stays with the hardware-validated OnDrop guards and the
+/// self-recovering start/stop arms — the token encodes ORDER, not
+/// cleanup, which is why it has no `Drop` of its own.
+#[must_use]
+struct Started;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum SendStop {
@@ -665,12 +678,6 @@ impl<'d, M: Mode> I2c<'d, M> {
         status
     }
 
-    /// Reads and parses the controller status producing an
-    /// appropriate `Result<(), Error>` variant.
-    fn status(&self) -> Result<(), IOError> {
-        self.parse_status(self.registers().read_status())
-    }
-
     /// Inserts the given command into the outgoing FIFO.
     ///
     /// Caller must ensure there is space in the FIFO for the new
@@ -685,7 +692,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Blocks waiting for space in the FIFO to become available, then
     /// sends the command and blocks waiting for the FIFO to become
     /// empty ensuring the command was sent.
-    fn start(&self, address: u8, read: bool) -> Result<(), IOError> {
+    fn start(&self, address: u8, read: bool) -> Result<Started, IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
@@ -735,7 +742,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.remediation();
         }
 
-        res
+        res.map(|()| Started)
     }
 
     /// Prepares a Stop condition on the bus.
@@ -744,7 +751,8 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// FIFO to become available, then sends the command and blocks
     /// waiting for the FIFO to become empty ensuring the command was
     /// sent.
-    fn stop(&self) -> Result<(), IOError> {
+    fn stop(&self, open: Started) -> Result<(), IOError> {
+        let Started = open;
         // Wait until we have space in the TxFIFO. Timeout recovery
         // mirrors `start`: fault classes were remediated inside
         // `wait_tx_room`, a timeout leaves the clog queued.
@@ -780,7 +788,12 @@ impl<'d, M: Mode> I2c<'d, M> {
         res
     }
 
-    fn blocking_read_internal(&self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+    fn blocking_read_internal(
+        &self,
+        address: u8,
+        read: &mut [u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
@@ -791,32 +804,32 @@ impl<'d, M: Mode> I2c<'d, M> {
         // them. Re-reading from the caller's buffer start would return
         // shifted data as success, so it happens only when the caller
         // has explicitly accepted that trade.
-        match self.blocking_read_chained(address, read) {
-            Ok(()) => {}
+        let open = match self.blocking_read_chained(address, read) {
+            Ok(open) => open,
             Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
                 let _ = e;
-                self.blocking_read_seamed(address, read)?;
+                self.blocking_read_seamed(address, read)?
             }
             Err(e) => return Err(e),
-        }
+        };
 
         if send_stop == SendStop::Yes {
-            self.stop()?;
+            self.stop(open)?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 
     /// One read as a single addressed transaction with chained RECEIVE
     /// commands. Does not send the trailing STOP.
-    fn blocking_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+    fn blocking_read_chained(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
         // NOTE: start() is outside the recovery guard below —
         // `status_and_act` inside it already remediates a NACK, and
         // remediating twice corrupts the controller state for the
         // next transaction (see the async path's OnDrop note).
-        self.start(address, true)?;
+        let open = self.start(address, true)?;
 
         let total = read.len();
         // Mirror the async path's OnDrop: an error past this point
@@ -876,16 +889,19 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(e);
         }
 
-        Ok(())
+        Ok(open)
     }
 
     /// Fallback: one read as re-addressed 256-byte chunks, each ended
     /// with a STOP. Not atomic, but immune to the chained-boundary
     /// early-termination quirk. Does not send the trailing STOP.
-    fn blocking_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+    fn blocking_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
         let nchunks = read.len().div_ceil(256);
+        // Carries the final chunk's transaction out of the loop; every
+        // non-final chunk's is consumed by its seam STOP.
+        let mut last_open = None;
         for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            self.start(address, true)?;
+            let open = self.start(address, true)?;
 
             // Outside the drain guard: `wait_tx_room` remediates the
             // fault classes itself, and routing it through the guard
@@ -935,14 +951,22 @@ impl<'d, M: Mode> I2c<'d, M> {
             // drain guard: `stop` recovers its own failures, and the
             // guard must not stack a second remediation on top.
             if idx + 1 < nchunks {
-                self.stop()?;
+                self.stop(open)?;
+            } else {
+                last_open = Some(open);
             }
         }
-        Ok(())
+        // Non-empty reads are guaranteed by the caller, so the loop ran.
+        Ok(last_open.expect("blocking_read_seamed called with an empty buffer"))
     }
 
-    fn blocking_write_internal(&self, address: u8, write: &[u8], send_stop: SendStop) -> Result<(), IOError> {
-        self.start(address, false)?;
+    fn blocking_write_internal(
+        &self,
+        address: u8,
+        write: &[u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
+        let open = self.start(address, false)?;
 
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
@@ -958,9 +982,10 @@ impl<'d, M: Mode> I2c<'d, M> {
             #[cfg(feature = "defmt")]
             defmt::trace!("Empty write, write probing?");
             if send_stop == SendStop::Yes {
-                self.stop()?;
+                self.stop(open)?;
+                return Ok(None);
             }
-            return Ok(());
+            return Ok(Some(open));
         }
 
         // Mirror the read paths' recovery guard: an error mid-write
@@ -984,10 +1009,10 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
 
         if send_stop == SendStop::Yes {
-            self.stop()?;
+            self.stop(open)?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 
     // Public API: Blocking
@@ -1019,7 +1044,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// controller, the read operation will be performed in multiple
     /// chunks. This will be transparent to the caller.
     pub fn blocking_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
-        self.blocking_read_internal(address, read, SendStop::Yes)
+        self.blocking_read_internal(address, read, SendStop::Yes).map(|_| ())
     }
 
     /// Writes data to the specified I2C address from the provided buffer.
@@ -1042,7 +1067,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
     pub fn blocking_write(&mut self, address: u8, write: &[u8]) -> Result<(), IOError> {
-        self.blocking_write_internal(address, write, SendStop::Yes)
+        self.blocking_write_internal(address, write, SendStop::Yes).map(|_| ())
     }
 
     /// Performs a combined write and read operation on the specified I2C
@@ -1074,8 +1099,11 @@ impl<'d, M: Mode> I2c<'d, M> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
-        self.blocking_write_internal(address, write, SendStop::No)?;
-        self.blocking_read_internal(address, read, SendStop::Yes)
+        let open = self.blocking_write_internal(address, write, SendStop::No)?;
+        // The read half's repeated START continues this open
+        // transaction; its trailing STOP closes it.
+        drop(open);
+        self.blocking_read_internal(address, read, SendStop::Yes).map(|_| ())
     }
 }
 
@@ -1084,14 +1112,6 @@ impl<'d, M: AsyncMode> I2c<'d, M>
 where
     Self: AsyncEngine,
 {
-    fn enable_rx_ints(&self) {
-        self.registers().enable_receive_interrupts();
-    }
-
-    fn enable_tx_ints(&self) {
-        self.registers().enable_transmit_interrupts();
-    }
-
     /// Schedule sending a START command and await it being pulled from the FIFO.
     ///
     /// Does not indicate that the command was responded to.
@@ -1104,7 +1124,7 @@ where
     /// arm their cancellation guards only *after* the start (see the
     /// seamed branch), so nobody else would clean up either kind of
     /// abort.
-    async fn async_start(&self, address: u8, read: bool) -> Result<(), IOError> {
+    async fn async_start(&self, address: u8, read: bool) -> Result<Started, IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
@@ -1130,12 +1150,7 @@ where
 
         let waited = embassy_time::with_timeout(
             self.timeout,
-            self.info.wait_cell().wait_for(|| {
-                // enable interrupts
-                self.enable_tx_ints();
-                // if the command FIFO is empty, we're done sending start
-                self.registers().tx_settled()
-            }),
+            self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
         )
         .await;
         on_drop.defuse();
@@ -1166,7 +1181,7 @@ where
             self.remediation();
         }
 
-        res
+        res.map(|()| Started)
     }
 
     /// Schedule a STOP command and await it being pulled from the FIFO.
@@ -1183,7 +1198,8 @@ where
     /// warn about), so nobody else would clean up a failed stop. The
     /// awaited wait is guarded against drop-cancellation for the same
     /// reason — see `async_start`.
-    async fn async_stop(&self) -> Result<(), IOError> {
+    async fn async_stop(&self, open: Started) -> Result<(), IOError> {
+        let Started = open;
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
@@ -1195,12 +1211,7 @@ where
 
         let waited = embassy_time::with_timeout(
             self.timeout,
-            self.info.wait_cell().wait_for(|| {
-                // enable interrupts
-                self.enable_tx_ints();
-                // if the command FIFO is empty, we're done sending stop
-                self.registers().tx_settled()
-            }),
+            self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
         )
         .await;
         on_drop.defuse();
@@ -1248,12 +1259,10 @@ where
     /// - `IOError::AddressNack`: If the device does not acknowledge the address.
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
-    pub fn async_read<'a>(
-        &'a mut self,
-        address: u8,
-        read: &'a mut [u8],
-    ) -> impl Future<Output = Result<(), IOError>> + 'a {
+    pub async fn async_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
         <Self as AsyncEngine>::async_read_internal(self, address, read, SendStop::Yes)
+            .await
+            .map(|_| ())
     }
 
     /// Writes data to the specified I2C address from the provided buffer asynchronously.
@@ -1275,12 +1284,10 @@ where
     /// - `IOError::AddressNack`: If the device does not acknowledge the address.
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
-    pub fn async_write<'a>(
-        &'a mut self,
-        address: u8,
-        write: &'a [u8],
-    ) -> impl Future<Output = Result<(), IOError>> + 'a {
+    pub async fn async_write(&mut self, address: u8, write: &[u8]) -> Result<(), IOError> {
         <Self as AsyncEngine>::async_write_internal(self, address, write, SendStop::Yes)
+            .await
+            .map(|_| ())
     }
 
     /// Performs a combined write and read operation on the specified I2C
@@ -1319,8 +1326,13 @@ where
         // still open and the bus held — nothing would ever send the
         // STOP.
         <Self as AsyncEngine>::read_preflight(self, read)?;
-        <Self as AsyncEngine>::async_write_internal(self, address, write, SendStop::No).await?;
-        <Self as AsyncEngine>::async_read_internal(self, address, read, SendStop::Yes).await
+        let open = <Self as AsyncEngine>::async_write_internal(self, address, write, SendStop::No).await?;
+        // The read half's repeated START continues this open
+        // transaction; its trailing STOP closes it.
+        drop(open);
+        <Self as AsyncEngine>::async_read_internal(self, address, read, SendStop::Yes)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -1330,19 +1342,21 @@ trait AsyncEngine {
     /// run it at entry. Must stay side-effect free.
     fn read_preflight(&self, read: &[u8]) -> Result<(), IOError>;
 
+    /// Returns the still-open transaction when `send_stop` is `No`.
     fn async_read_internal<'a>(
         &'a mut self,
         address: u8,
         read: &'a mut [u8],
         send_stop: SendStop,
-    ) -> impl Future<Output = Result<(), IOError>> + 'a;
+    ) -> impl Future<Output = Result<Option<Started>, IOError>> + 'a;
 
+    /// Returns the still-open transaction when `send_stop` is `No`.
     fn async_write_internal<'a>(
         &'a mut self,
         address: u8,
         write: &'a [u8],
         send_stop: SendStop,
-    ) -> impl Future<Output = Result<(), IOError>> + 'a;
+    ) -> impl Future<Output = Result<Option<Started>, IOError>> + 'a;
 }
 
 impl<'d> I2c<'d, Async> {
@@ -1396,8 +1410,8 @@ impl<'d> I2c<'d, Async> {
 impl<'d> I2c<'d, Async> {
     /// One read as a single addressed transaction with chained RECEIVE
     /// commands. Does not send the trailing STOP.
-    async fn async_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
-        self.async_start(address, true).await?;
+    async fn async_read_chained(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
+        let open = self.async_start(address, true).await?;
 
         // perform corrective action if the future is dropped or an
         // error happens between here and the end of the read.
@@ -1438,13 +1452,7 @@ impl<'d> I2c<'d, Async> {
 
             let timed_out = match embassy_time::with_timeout(
                 self.timeout,
-                self.info.wait_cell().wait_for(|| {
-                    // enable interrupts
-                    self.enable_rx_ints();
-                    // wake on data, or on a fault that means no more
-                    // data will ever arrive
-                    self.registers().rx_ready()
-                }),
+                self.info.wait_cell().wait_for(|| self.registers().rx_wake()),
             )
             .await
             {
@@ -1471,16 +1479,19 @@ impl<'d> I2c<'d, Async> {
 
         on_drop.defuse();
 
-        Ok(())
+        Ok(open)
     }
 
     /// Fallback: one read as re-addressed 256-byte chunks, each ended
     /// with a STOP. Not atomic, but immune to the chained-boundary
     /// early-termination quirk. Does not send the trailing STOP.
-    async fn async_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+    async fn async_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
         let nchunks = read.len().div_ceil(256);
+        // Carries the final chunk's transaction out of the loop; every
+        // non-final chunk's is consumed by its seam STOP.
+        let mut last_open = None;
         for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            self.async_start(address, true).await?;
+            let open = self.async_start(address, true).await?;
 
             // See async_read_chained for the OnDrop placement rationale.
             let on_drop = OnDrop::new(|| self.remediation());
@@ -1491,10 +1502,7 @@ impl<'d> I2c<'d, Async> {
                 loop {
                     let timed_out = match embassy_time::with_timeout(
                         self.timeout,
-                        self.info.wait_cell().wait_for(|| {
-                            self.enable_rx_ints();
-                            self.registers().rx_ready()
-                        }),
+                        self.info.wait_cell().wait_for(|| self.registers().rx_wake()),
                     )
                     .await
                     {
@@ -1524,10 +1532,13 @@ impl<'d> I2c<'d, Async> {
             // right after the auto-NACK of a consumed RECEIVE command is
             // not reliably accepted on this silicon.
             if idx + 1 < nchunks {
-                self.async_stop().await?;
+                self.async_stop(open).await?;
+            } else {
+                last_open = Some(open);
             }
         }
-        Ok(())
+        // Non-empty reads are guaranteed by the preflight, so the loop ran.
+        Ok(last_open.expect("async_read_seamed called with an empty buffer"))
     }
 }
 
@@ -1539,7 +1550,12 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         Ok(())
     }
 
-    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+    async fn async_read_internal(
+        &mut self,
+        address: u8,
+        read: &mut [u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
         self.read_preflight(read)?;
 
         // A chained read that died mid-transfer leaves the device in an
@@ -1548,26 +1564,31 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         // them. Re-reading from the caller's buffer start would return
         // shifted data as success, so it happens only when the caller
         // has explicitly accepted that trade.
-        match self.async_read_chained(address, read).await {
-            Ok(()) => {}
+        let open = match self.async_read_chained(address, read).await {
+            Ok(open) => open,
             Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
                 let _ = e;
-                self.async_read_seamed(address, read).await?;
+                self.async_read_seamed(address, read).await?
             }
             Err(e) => return Err(e),
-        }
+        };
 
         if send_stop == SendStop::Yes {
-            self.async_stop().await?;
+            self.async_stop(open).await?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 
-    async fn async_write_internal(&mut self, address: u8, write: &[u8], send_stop: SendStop) -> Result<(), IOError> {
-        self.async_start(address, false).await?;
+    async fn async_write_internal(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
+        let open = self.async_start(address, false).await?;
 
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
@@ -1583,9 +1604,10 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             #[cfg(feature = "defmt")]
             defmt::trace!("Empty write, write probing?");
             if send_stop == SendStop::Yes {
-                self.async_stop().await?;
+                self.async_stop(open).await?;
+                return Ok(None);
             }
-            return Ok(());
+            return Ok(Some(open));
         }
 
         // Corrective action if the future is dropped or a write step
@@ -1603,12 +1625,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
 
             match embassy_time::with_timeout(
                 self.timeout,
-                self.info.wait_cell().wait_for(|| {
-                    // enable interrupts
-                    self.enable_tx_ints();
-                    // if the tx FIFO is empty, we're done transmiting
-                    self.registers().tx_settled()
-                }),
+                self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
             )
             .await
             {
@@ -1636,10 +1653,10 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
         on_drop.defuse();
 
         if send_stop == SendStop::Yes {
-            self.async_stop().await?;
+            self.async_stop(open).await?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 }
 
@@ -1762,10 +1779,9 @@ impl<'d> I2c<'d, Dma<'d>> {
             }
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
             // The interrupt handler disables MIER on wake; re-arm the
-            // error sources for the next wait.
-            self.registers().enable_error_interrupts();
-            if let Err(e) = self.status() {
-                return core::task::Poll::Ready(Err(e));
+            // error sources and check, as one operation.
+            if let Some(e) = self.registers().error_wake() {
+                return core::task::Poll::Ready(Err(IOError::from(e)));
             }
             // Early termination with the DMA incomplete: no more data
             // will arrive and the DMA would wait forever.
@@ -1796,8 +1812,8 @@ impl<'d> I2c<'d, Dma<'d>> {
     /// One read as a single addressed transaction: every RECEIVE command
     /// queued up front (caller checks they fit the FIFO), one DMA
     /// transfer over the whole buffer. Does not send the trailing STOP.
-    async fn dma_read_chained(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
-        self.async_start(address, true).await?;
+    async fn dma_read_chained(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
+        let open = self.async_start(address, true).await?;
 
         // NOTE: OnDrop *after* async_start — see the seamed branch.
         let on_drop = OnDrop::new(|| {
@@ -1831,7 +1847,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         self.dma_read_into(read).await?;
 
         on_drop.defuse();
-        Ok(())
+        Ok(open)
     }
 }
 
@@ -1849,7 +1865,12 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         Ok(())
     }
 
-    async fn async_read_internal(&mut self, address: u8, read: &mut [u8], send_stop: SendStop) -> Result<(), IOError> {
+    async fn async_read_internal(
+        &mut self,
+        address: u8,
+        read: &mut [u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
         self.read_preflight(read)?;
 
         // Chain all RECEIVE commands under a single address phase when
@@ -1861,9 +1882,13 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // sleeps on the DMA completion.
         let ncmds = read.len().div_ceil(256);
         let mut seamed = ncmds > self.registers().tx_fifo_capacity();
+        // The open transaction carried between branches: set by a
+        // successful chained attempt or by the seamed loop's final
+        // chunk.
+        let mut open = None;
         if !seamed {
             match self.dma_read_chained(address, read).await {
-                Ok(()) => {}
+                Ok(o) => open = Some(o),
                 // A chained read that died mid-transfer leaves the device in an
                 // unknown state: its pointer has advanced by however many bytes
                 // were clocked out, and destructive reads have already consumed
@@ -1882,7 +1907,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         if seamed {
             let nchunks = read.len().div_ceil(256);
             for (idx, chunk) in read.chunks_mut(256).enumerate() {
-                self.async_start(address, true).await?;
+                let chunk_open = self.async_start(address, true).await?;
 
                 // perform corrective action if the future is dropped or
                 // an error happens between here and the end of the read.
@@ -1916,20 +1941,30 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 // right after the auto-NACK of a consumed RECEIVE command
                 // is not reliably accepted on this silicon.
                 if idx + 1 < nchunks {
-                    self.async_stop().await?;
+                    self.async_stop(chunk_open).await?;
+                } else {
+                    open = Some(chunk_open);
                 }
             }
         }
 
+        // One of the branches ran to completion, so a transaction is
+        // open here.
+        let open = open.expect("read completed without an open transaction");
         if send_stop == SendStop::Yes {
-            self.async_stop().await?;
+            self.async_stop(open).await?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 
-    async fn async_write_internal(&mut self, address: u8, write: &[u8], send_stop: SendStop) -> Result<(), IOError> {
-        self.async_start(address, false).await?;
+    async fn async_write_internal(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        send_stop: SendStop,
+    ) -> Result<Option<Started>, IOError> {
+        let open = self.async_start(address, false).await?;
 
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
@@ -1945,9 +1980,10 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             #[cfg(feature = "defmt")]
             defmt::trace!("Empty write, write probing?");
             if send_stop == SendStop::Yes {
-                self.async_stop().await?;
+                self.async_stop(open).await?;
+                return Ok(None);
             }
-            return Ok(());
+            return Ok(Some(open));
         }
 
         // perform corrective action if the future is dropped
@@ -2003,10 +2039,9 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 }
                 while self.info.wait_cell().poll_wait(cx).is_ready() {}
                 // The interrupt handler disables MIER on wake; re-arm the
-                // error sources for the next wait.
-                self.registers().enable_error_interrupts();
-                if let Err(e) = self.status() {
-                    return core::task::Poll::Ready(Err(e));
+                // error sources and check, as one operation.
+                if let Some(e) = self.registers().error_wake() {
+                    return core::task::Poll::Ready(Err(IOError::from(e)));
                 }
                 core::task::Poll::Pending
             });
@@ -2034,10 +2069,10 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         on_drop.defuse();
 
         if send_stop == SendStop::Yes {
-            self.async_stop().await?;
+            self.async_stop(open).await?;
+            return Ok(None);
         }
-
-        Ok(())
+        Ok(Some(open))
     }
 }
 
@@ -2094,14 +2129,16 @@ impl<'d, M: Mode> embedded_hal_02::blocking::i2c::Transactional for I2c<'d, M> {
 
         if let Some((last, rest)) = operations.split_last_mut() {
             for op in rest {
-                match op {
+                // Each op's transaction stays open (`SendStop::No`);
+                // the next op's repeated START continues it.
+                let _continues = match op {
                     embedded_hal_02::blocking::i2c::Operation::Read(buf) => {
                         self.blocking_read_internal(address, buf, SendStop::No)?
                     }
                     embedded_hal_02::blocking::i2c::Operation::Write(buf) => {
                         self.blocking_write_internal(address, buf, SendStop::No)?
                     }
-                }
+                };
             }
 
             match last {
@@ -2112,6 +2149,7 @@ impl<'d, M: Mode> embedded_hal_02::blocking::i2c::Transactional for I2c<'d, M> {
                     self.blocking_write_internal(address, buf, SendStop::Yes)
                 }
             }
+            .map(|_| ())
         } else {
             Ok(())
         }
@@ -2154,14 +2192,16 @@ impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
         let result = (|| {
             if let Some((last, rest)) = operations.split_last_mut() {
                 for op in rest {
-                    match op {
+                    // Each op's transaction stays open (`SendStop::No`);
+                    // the next op's repeated START continues it.
+                    let _continues = match op {
                         embedded_hal_1::i2c::Operation::Read(buf) => {
                             self.blocking_read_internal(address, buf, SendStop::No)?
                         }
                         embedded_hal_1::i2c::Operation::Write(buf) => {
                             self.blocking_write_internal(address, buf, SendStop::No)?
                         }
-                    }
+                    };
                 }
 
                 match last {
@@ -2172,6 +2212,7 @@ impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
                         self.blocking_write_internal(address, buf, SendStop::Yes)
                     }
                 }
+                .map(|_| ())
             } else {
                 Ok(())
             }
@@ -2209,14 +2250,16 @@ where
         let result = async {
             if let Some((last, rest)) = operations.split_last_mut() {
                 for op in rest {
-                    match op {
+                    // Each op's transaction stays open (`SendStop::No`);
+                    // the next op's repeated START continues it.
+                    let _continues = match op {
                         embedded_hal_async::i2c::Operation::Read(buf) => {
                             <Self as AsyncEngine>::async_read_internal(self, address, buf, SendStop::No).await?
                         }
                         embedded_hal_async::i2c::Operation::Write(buf) => {
                             <Self as AsyncEngine>::async_write_internal(self, address, buf, SendStop::No).await?
                         }
-                    }
+                    };
                 }
 
                 match last {
@@ -2227,6 +2270,7 @@ where
                         <Self as AsyncEngine>::async_write_internal(self, address, buf, SendStop::Yes).await
                     }
                 }
+                .map(|_| ())
             } else {
                 Ok(())
             }
