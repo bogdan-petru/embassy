@@ -830,7 +830,9 @@ pub mod tests {
         pub fef_retries: u32,
         /// Total operations retried after an `UnexpectedStop` (a chained
         /// read terminated early with SDF/EPF latched and no fault —
-        /// same spurious-flag silicon family as the ALF quirk).
+        /// same spurious-flag silicon family as the ALF quirk) or a
+        /// `Timeout` (no progress for a full window; the same
+        /// silent-termination family caught by the bounded waits).
         pub end_retries: u32,
     }
 
@@ -1618,22 +1620,12 @@ pub mod tests {
             CTRL_SERVE_STATS,
         ];
         for attempt in 0..=MAX_RETRIES {
-            // Raw writes/reads, whole-sequence retry: a failed read
-            // consumed the one-shot stats view, so re-arm each time.
-            if let Err(e) = ctrl.write(TARGET_ADDR, &arm).await {
-                match e {
-                    ControllerIOError::ArbitrationLoss => stats.alf_retries += 1,
-                    ControllerIOError::UnexpectedStop | ControllerIOError::Timeout => stats.end_retries += 1,
-                    _ => {
-                        defmt::error!("settle audit: arm failed {}", e);
-                        return Err("settle_audit: arm failed");
-                    }
-                }
-                if attempt == MAX_RETRIES {
-                    return Err("settle_audit: retries exhausted");
-                }
-                continue;
-            }
+            // Classified arm write, then read, whole-sequence retry: a
+            // failed read consumed the one-shot stats view, so re-arm
+            // each time.
+            ctl_write(ctrl, &arm, stats)
+                .await
+                .map_err(|_| "settle_audit: arm failed")?;
             let mut r = [0u8; STATS_LEN];
             match ctrl.read(TARGET_ADDR, &mut r).await {
                 Ok(()) => {
@@ -1657,17 +1649,9 @@ pub mod tests {
                         CTRL_MAGIC[3],
                         CTRL_RESET_STATS,
                     ];
-                    let mut acked = false;
-                    for _ in 0..=MAX_RETRIES {
-                        if ctrl.write(TARGET_ADDR, &ack).await.is_ok() {
-                            acked = true;
-                            break;
-                        }
-                        stats.alf_retries += 1;
-                    }
-                    if !acked {
-                        return Err("settle_audit: reset ack failed");
-                    }
+                    ctl_write(ctrl, &ack, stats)
+                        .await
+                        .map_err(|_| "settle_audit: reset ack failed")?;
                     if count > PREMATURE_NEEDMORE_BUDGET {
                         defmt::error!(
                             "settle audit: {} premature NeedMore events (budget {})",
@@ -1687,6 +1671,7 @@ pub mod tests {
                 Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
                     stats.end_retries += 1;
                 }
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
                 Err(e) => {
                     defmt::error!("settle audit: read failed {}", e);
                     return Err("settle_audit: read failed");
@@ -1697,6 +1682,56 @@ pub mod tests {
             }
         }
         Err("settle_audit: retries exhausted")
+    }
+
+    /// One control write, retried with the harness's honest error
+    /// classification: every recoverable class — arbitration loss,
+    /// the early-termination/timeout family, and the documented
+    /// transient FIFO fault — retries in its own telemetry bucket;
+    /// anything else (a NACK, a write failure) is fatal and loud.
+    /// Control writes are idempotent, so retrying one that may
+    /// already have landed is always safe.
+    async fn ctl_write<C: Controller>(ctrl: &mut C, msg: &[u8], stats: &mut RetryStats) -> TestResult {
+        for attempt in 0..=MAX_RETRIES {
+            match ctrl.write(TARGET_ADDR, msg).await {
+                Ok(()) => return Ok(()),
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(e) => {
+                    defmt::error!("control write failed {}", e);
+                    return Err("control write failed");
+                }
+            }
+            if attempt == MAX_RETRIES {
+                break;
+            }
+        }
+        Err("control write: retries exhausted")
+    }
+
+    /// Blocking twin of [`ctl_write`].
+    fn b_ctl_write(ctrl: &mut ControllerI2c<'_, Blocking>, msg: &[u8], stats: &mut RetryStats) -> TestResult {
+        for attempt in 0..=MAX_RETRIES {
+            match ctrl.blocking_write(TARGET_ADDR, msg) {
+                Ok(()) => return Ok(()),
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(e) => {
+                    defmt::error!("control write (blocking) failed {}", e);
+                    return Err("control write failed");
+                }
+            }
+            if attempt == MAX_RETRIES {
+                break;
+            }
+        }
+        Err("control write: retries exhausted")
     }
 
     /// Scrub the target's audit state (counter AND pending stats
@@ -1712,26 +1747,7 @@ pub mod tests {
             CTRL_MAGIC[3],
             CTRL_RESET_STATS,
         ];
-        for attempt in 0..=MAX_RETRIES {
-            match ctrl.write(TARGET_ADDR, &msg).await {
-                Ok(()) => return Ok(()),
-                // The reset is idempotent (and may already have landed
-                // despite the reported error), so every recoverable
-                // class retries — counted in its own bucket.
-                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
-                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
-                    stats.end_retries += 1;
-                }
-                Err(e) => {
-                    defmt::error!("audit reset: write failed {}", e);
-                    return Err("audit_reset: write failed");
-                }
-            }
-            if attempt == MAX_RETRIES {
-                break;
-            }
-        }
-        Err("audit_reset: retries exhausted")
+        ctl_write(ctrl, &msg, stats).await.map_err(|_| "audit_reset: failed")
     }
 
     /// Blocking-phase variant of [`t_audit_reset`].
@@ -1743,25 +1759,7 @@ pub mod tests {
             CTRL_MAGIC[3],
             CTRL_RESET_STATS,
         ];
-        for attempt in 0..=MAX_RETRIES {
-            match ctrl.blocking_write(TARGET_ADDR, &msg) {
-                Ok(()) => return Ok(()),
-                // Same classification as `t_audit_reset`: idempotent,
-                // so recoverable classes retry in their own buckets.
-                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
-                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
-                    stats.end_retries += 1;
-                }
-                Err(e) => {
-                    defmt::error!("audit reset (blocking): write failed {}", e);
-                    return Err("audit_reset(b): write failed");
-                }
-            }
-            if attempt == MAX_RETRIES {
-                break;
-            }
-        }
-        Err("audit_reset(b): retries exhausted")
+        b_ctl_write(ctrl, &msg, stats).map_err(|_| "audit_reset(b): failed")
     }
 
     /// Blocking-phase settle audit — same protocol as
@@ -1785,28 +1783,12 @@ pub mod tests {
             CTRL_RESET_STATS,
         ];
         for attempt in 0..=MAX_RETRIES {
-            if ctrl.blocking_write(TARGET_ADDR, &arm).is_err() {
-                stats.alf_retries += 1;
-                if attempt == MAX_RETRIES {
-                    return Err("settle_audit(b): retries exhausted");
-                }
-                continue;
-            }
+            b_ctl_write(ctrl, &arm, stats).map_err(|_| "settle_audit(b): arm failed")?;
             let mut r = [0u8; STATS_LEN];
             match ctrl.blocking_read(TARGET_ADDR, &mut r) {
                 Ok(()) if r[..4] == STATS_ECHO => {
                     let count = u32::from_le_bytes(r[4..8].try_into().unwrap());
-                    let mut acked = false;
-                    for _ in 0..=MAX_RETRIES {
-                        if ctrl.blocking_write(TARGET_ADDR, &ack).is_ok() {
-                            acked = true;
-                            break;
-                        }
-                        stats.alf_retries += 1;
-                    }
-                    if !acked {
-                        return Err("settle_audit(b): reset ack failed");
-                    }
+                    b_ctl_write(ctrl, &ack, stats).map_err(|_| "settle_audit(b): reset ack failed")?;
                     if count > PREMATURE_NEEDMORE_BUDGET {
                         defmt::error!(
                             "settle audit (blocking): {} premature NeedMore (budget {})",
@@ -1825,8 +1807,14 @@ pub mod tests {
                 Ok(()) => {
                     // Arm never landed; buffer data served. Retry.
                 }
-                Err(_) => {
-                    stats.alf_retries += 1;
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(ControllerIOError::FifoError) => stats.fef_retries += 1,
+                Err(e) => {
+                    defmt::error!("settle audit (blocking): read failed {}", e);
+                    return Err("settle_audit(b): read failed");
                 }
             }
             if attempt == MAX_RETRIES {
