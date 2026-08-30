@@ -13,14 +13,15 @@
 # window so every run starts on a clean bus.
 #
 # Build recipe that matches the validated configuration:
-#   DEFMT_LOG=info cargo build --release --bin i2c-twoboard-controller \
+#   $env:DEFMT_LOG = 'info'
+#   cargo build --release --bin i2c-twoboard-controller `
 #       --bin i2c-twoboard-target --bin i2c-twoboard-target-dma
 # (`DEFMT_LOG=info` is also this crate's `.cargo/config.toml` default;
 # higher log volume can fault the MCU-Link debug connection mid-run.)
-# For probes that cannot hold a full three-phase session, build the
-# controller with SUITE_PHASES=async / SUITE_PHASES=dma,blocking and
-# run each subset as its own session — the binary warns loudly when
-# filtered.
+# For probes that cannot hold a full three-phase session, set
+# $env:SUITE_PHASES = 'async' (or 'dma,blocking'), rebuild the
+# controller, and run each subset as its own session — the binary
+# warns loudly when filtered and rejects unknown phase names.
 #
 # Exit 0 = every enabled phase passed (semihosting exit); nonzero =
 # test failure (panic -> HardFault), timeout (124), probe loss, a
@@ -40,8 +41,10 @@ param(
     # session attaches to the target DURING the run and the captured
     # `[T]` RTT transcript is printed after it — wire-level evidence of
     # what the target saw (aborted serves, restarts, residue handling).
-    # Build the target with e.g.
-    #   DEFMT_LOG='info,embassy_mcxa::i2c::target=trace' DEFMT_RTT_BUFFER_SIZE=16384
+    # Build the target for it with (PowerShell):
+    #   $env:DEFMT_LOG = 'info,embassy_mcxa::i2c::target=trace'
+    #   $env:DEFMT_RTT_BUFFER_SIZE = '16384'
+    #   cargo build --release --bin i2c-twoboard-target
     # for a transcript with per-serve abort lines.
     [string]$TargetElf = ''
 )
@@ -67,6 +70,9 @@ $markerDeadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $markerDeadline) {
     $txt = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
     if ($txt -and $txt.Contains('quiet window')) { $sawMarker = $true; break }
+    # A controller session that already died (flash failure, probe
+    # loss) will never print the marker — fail closed now, not in 30 s.
+    if ($proc.HasExited) { break }
     Start-Sleep -Milliseconds 200
 }
 if (-not $sawMarker) {

@@ -75,6 +75,17 @@ MANIFEST = [
             "`Sasr`.",
         ],
     ),
+    (
+        "star",
+        "ReadWrite",
+        [
+            "Target Transmit ACK Register (TXNACK). Mapped for",
+            "completeness; measured on FRDM-MCXA577 to be UNUSABLE for",
+            "a data-phase NACK: raised from idle it NACKs the next",
+            "ADDRESS, raised at the address-release window or mid-data",
+            "it has no effect on in-flight bytes. PAC type: `Star`.",
+        ],
+    ),
     ("stdr", "WriteOnly", ["Target Transmit Data Register. Write-only. PAC type: `Stdr`."]),
     (
         "srdr",

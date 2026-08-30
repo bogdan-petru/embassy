@@ -74,7 +74,13 @@ register_structs! {
         /// stretch), so reading it is a protocol action. PAC type:
         /// `Sasr`.
         (0x150 => pub sasr: ReadOnly<u32>),
-        (0x154 => _reserved7),
+        /// Target Transmit ACK Register (TXNACK). Mapped for
+        /// completeness; measured on FRDM-MCXA577 to be UNUSABLE for
+        /// a data-phase NACK: raised from idle it NACKs the next
+        /// ADDRESS, raised at the address-release window or mid-data
+        /// it has no effect on in-flight bytes. PAC type: `Star`.
+        (0x154 => pub star: ReadWrite<u32>),
+        (0x158 => _reserved7),
         /// Target Transmit Data Register. Write-only. PAC type: `Stdr`.
         (0x160 => pub stdr: WriteOnly<u32>),
         (0x164 => _reserved8),
@@ -136,6 +142,7 @@ pub(super) fn check_layout(regs: crate::pac::lpi2c::Lpi2c) {
     check!(sier, sier);
     check!(sder, sder);
     check!(sasr, sasr);
+    check!(star, star);
     check!(stdr, stdr);
     check!(srdr, srdr);
     // END GENERATED: layout checks
@@ -160,6 +167,7 @@ const _: () = {
     assert!(offset_of!(LpI2cRegisters, sier) == 0x118);
     assert!(offset_of!(LpI2cRegisters, sder) == 0x11c);
     assert!(offset_of!(LpI2cRegisters, sasr) == 0x150);
+    assert!(offset_of!(LpI2cRegisters, star) == 0x154);
     assert!(offset_of!(LpI2cRegisters, stdr) == 0x160);
     assert!(offset_of!(LpI2cRegisters, srdr) == 0x170);
 };

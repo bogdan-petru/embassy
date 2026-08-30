@@ -73,13 +73,27 @@ async fn main(spawner: Spawner) {
     defmt::info!("i2c-twoboard-controller: driving 0x2a on LPI2C3 (P3_21 SCL / P3_20 SDA)");
 
     // A phase-filtered build must say so loudly (a leaked env var in a
-    // CI build would otherwise skip phases yet exit success), and a
-    // filter that enables NO phase is a footgun, not a run.
+    // CI build would otherwise skip phases yet exit success), a
+    // filter that enables NO phase is a footgun, not a run — and so
+    // is a misspelled token, which would silently drop the phase it
+    // meant to name.
     if let Some(list) = option_env!("SUITE_PHASES") {
         defmt::warn!(
             "SUITE_PHASES={=str}: phase-filtered build, NOT a full validation run",
             list
         );
+        for tok in list.split(',') {
+            let t = tok.trim();
+            // A trailing or doubled comma is a formatting artifact,
+            // not a phase name — only real tokens must match.
+            if t.is_empty() {
+                continue;
+            }
+            assert!(
+                matches!(t, "async" | "dma" | "blocking"),
+                "SUITE_PHASES: unknown phase name"
+            );
+        }
         assert!(
             ["async", "dma", "blocking"].iter().any(|p| phase_enabled(p)),
             "SUITE_PHASES enables no phase"

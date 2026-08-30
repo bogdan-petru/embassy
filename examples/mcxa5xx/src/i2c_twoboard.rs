@@ -381,8 +381,8 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             // stale counter, a pending stats latch (it
                             // would serve a stats payload to the next
                             // data read), a stateless-read mode, or an
-                            // armed overflow probe behind for the next
-                            // run's phases.
+                            // armed overflow probe
+                            // behind for the next run's phases.
                             premature_needmore = 0;
                             stats_pending = false;
                             stateless = false;
@@ -502,8 +502,8 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             // stale counter, a pending stats latch (it
                             // would serve a stats payload to the next
                             // data read), a stateless-read mode, or an
-                            // armed overflow probe behind for the next
-                            // run's phases.
+                            // armed overflow probe
+                            // behind for the next run's phases.
                             premature_needmore = 0;
                             stats_pending = false;
                             stateless = false;
@@ -749,6 +749,7 @@ pub mod harness {
         // design), and running it earlier would wipe the evidence the
         // phase-end audit exists to judge.
         run_test!("cancellation", tests::t_cancellation(ctrl, &mut model, &mut stats));
+        run_test!("data_nack", tests::t_data_nack(ctrl, &mut model, &mut stats));
 
         defmt::info!(
             "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
@@ -1028,13 +1029,21 @@ pub mod tests {
     /// The bad-address probes are deliberate raw calls (no retry): any
     /// error is the expected outcome there.
     pub async fn t_edges<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
-        if ctrl.write(BAD_ADDR, &[0x00]).await.is_ok() {
-            return Err("E1: expected NACK on bad-addr write");
+        // Exact class, not merely "some error": an address NACK is the
+        // one deterministic outcome here (no data phase ever starts,
+        // so the spurious read quirks cannot fire), and accepting any
+        // error would let a misclassified fault pose as the NACK.
+        match ctrl.write(BAD_ADDR, &[0x00]).await {
+            Err(ControllerIOError::AddressNack) => {}
+            Ok(()) => return Err("E1: expected NACK on bad-addr write"),
+            Err(_) => return Err("E1: wrong error class for bad-addr write"),
         }
 
         let mut r = [0u8; 2];
-        if ctrl.read(BAD_ADDR, &mut r).await.is_ok() {
-            return Err("E2: expected NACK on bad-addr read");
+        match ctrl.read(BAD_ADDR, &mut r).await {
+            Err(ControllerIOError::AddressNack) => {}
+            Ok(()) => return Err("E2: expected NACK on bad-addr read"),
+            Err(_) => return Err("E2: wrong error class for bad-addr read"),
         }
 
         let mut full = [0u8; BUF_LEN];
@@ -1811,6 +1820,40 @@ pub mod tests {
                     return Err("cancellation: post-write_read-cancel verify mismatch");
                 }
             }
+
+            // Continue-transition races: an EMPTY-write write_read
+            // reaches its repeated START almost immediately (the write
+            // half is one addressed probe, ~0.3 ms), so these
+            // deadlines bracket the continue transition's own settle
+            // await — forcing drops INSIDE `async_start_continue`,
+            // which the wide ladder above cannot pin. No data phase
+            // precedes them and the transaction runs ≥ ~2.7 ms, so
+            // cancel is the only legal outcome, asserted in place.
+            for &d in &[250u64, 350, 450] {
+                resync(ctrl, model).await?;
+                let mut wr_r = [0u8; 24];
+                match select(ctrl.write_read(TARGET_ADDR, &[], &mut wr_r), Timer::after_micros(d)).await {
+                    Either::Second(()) => cancelled += 1,
+                    Either::First(Ok(())) => {
+                        return Err("cancellation: continue race completed before it physically could");
+                    }
+                    Either::First(Err(_)) => {
+                        return Err("cancellation: continue race faulted");
+                    }
+                }
+
+                let mut verify = [0u8; 32];
+                op_read(ctrl, &mut verify, model, stats).await?;
+                if !model.check_read(&verify) {
+                    defmt::error!(
+                        "cancellation continue d={=u64}us: got={:02x} want={:02x}",
+                        d,
+                        verify[..8],
+                        model.buf[..8]
+                    );
+                    return Err("cancellation: post-continue-cancel verify mismatch");
+                }
+            }
         }
 
         // Long chained-read races: a >256-byte read puts multiple
@@ -2061,6 +2104,94 @@ pub mod tests {
             CTRL_RESET_STATS,
         ];
         ctl_write(ctrl, &msg, stats).await.map_err(|_| "audit_reset: failed")
+    }
+
+    /// Late-NACK (mid-write NDF) coverage — the halting-fault recovery
+    /// paths, exercised without target cooperation: a MULTI-BYTE write
+    /// to an absent address. The settle wake fires when the START is
+    /// pulled from the FIFO — a full address-time (~90 µs at the
+    /// suite's Standard speed) before the NACK bit — so under any
+    /// realistic scheduling the session mints and the write body
+    /// queues its first byte(s) before NDF latches MID-WRITE with a
+    /// queued suffix. (A margin, not an architectural guarantee: an
+    /// interleaving that loses it degrades this into a plain
+    /// address-NACK probe with identical assert outcomes — both
+    /// shapes classify AddressNack and both must recover clean — so
+    /// the late-NDF claim rests on the timing arithmetic, and the
+    /// asserts prove outcome-safety across ALL interleavings.)
+    /// From the driver's side that is exactly the data-phase-NACK
+    /// shape: the halt-preserving classify must freeze the suffix
+    /// (nothing may reach the wire after the failure returns), and
+    /// remediate must discriminate the auto-STOP sub-cases by
+    /// observation, since the fault instant's FIFO state varies with
+    /// byte timing.
+    ///
+    /// A true wire-level DATA NACK from the emulated target is not
+    /// producible — hardware-measured on FRDM-MCXA577: STAR[TXNACK]
+    /// raised from idle NACKs the next ADDRESS (the transaction never
+    /// matches), and raised at the address-release window or mid-data
+    /// it changes nothing (8 further bytes still ACKed). NXP-ticket
+    /// material; noted so nobody re-attempts it.
+    pub async fn t_data_nack<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        use embassy_futures::select::{Either, select};
+        use embassy_time::Timer;
+
+        // MSB-clear payload. NOTE the verifies below prove BUS
+        // recovery, not suffix death directly — a BAD_ADDR suffix can
+        // never land in the target's buffer in any interleaving, and
+        // a replayed stale TRANSMIT's wire signature (FEF on the next
+        // transaction) would be absorbed by the anchoring resync's
+        // retries. Suffix death is the driver-side property enforced
+        // by the halt-preserving classify, which this test drives
+        // through its paths; it is not independently observable from
+        // this rig.
+        let mut w = [0u8; 12];
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = 0x50 + i as u8;
+        }
+
+        // Straight late-NACK: exact class, then prove the bus fully
+        // recovered with an anchored byte-exact read.
+        match ctrl.write(BAD_ADDR, &w).await {
+            Err(ControllerIOError::AddressNack) => {}
+            Ok(()) => return Err("data_nack: write to an absent address succeeded"),
+            Err(_) => return Err("data_nack: wrong error class for the NACK"),
+        }
+        let mut verify = [0u8; 32];
+        op_read(ctrl, &mut verify, model, stats).await?;
+        if !model.check_read(&verify) {
+            return Err("data_nack: post-NACK verify mismatch");
+        }
+
+        // Cancellation racing the late NACK: the drop lands before,
+        // around, and after NDF latches (~0.3-0.6 ms in), so recovery
+        // variously runs with the fault already latched, latching
+        // concurrently, or never — the wait_out_halting_fault
+        // sub-cases. Legal outcomes are ONLY cancel or the exact
+        // class.
+        for &d in &[150u64, 400, 800] {
+            match select(ctrl.write(BAD_ADDR, &w), Timer::after_micros(d)).await {
+                Either::First(Err(ControllerIOError::AddressNack)) => {}
+                Either::Second(()) => {}
+                Either::First(Ok(())) => {
+                    return Err("data_nack: raced write to an absent address succeeded");
+                }
+                Either::First(Err(_)) => return Err("data_nack: raced write failed with wrong class"),
+            }
+            let mut verify = [0u8; 32];
+            op_read(ctrl, &mut verify, model, stats).await?;
+            if !model.check_read(&verify) {
+                defmt::error!(
+                    "data_nack d={=u64}us: got={:02x} want={:02x}",
+                    d,
+                    verify[..8],
+                    model.buf[..8]
+                );
+                return Err("data_nack: post-race verify mismatch");
+            }
+        }
+
+        Ok(())
     }
 
     /// Blocking-phase variant of [`t_audit_reset`].

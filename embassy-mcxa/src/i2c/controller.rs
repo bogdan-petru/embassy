@@ -404,30 +404,65 @@ enum Abort {
 /// leave a clean slate. Free-standing so [`Session`]'s drop can run it
 /// without borrowing the controller; `I2c::remediation` is the same
 /// code.
-/// A halting fault (NDF/FEF) latched on a busy engine. With commands
-/// still queued the hardware auto-STOP ends the transaction (RM
-/// 40.7.1.5: a NACK with a non-empty command FIFO auto-STOPs): wait
-/// it out — never clear first, or the un-halted engine fetches the
-/// stale pipeline and REPLAYS it (a stale queued repeated START goes
-/// out as a fresh transaction). With an empty FIFO no auto-STOP is
-/// coming and there is nothing to replay: clear the halt so the
-/// caller can queue and run the manual close instead of burning the
-/// deadline on a wait that cannot end.
+/// A halting fault (NDF/FEF) latched on a busy engine. Whether the
+/// hardware auto-STOP ends the transaction was decided AT THE FAULT
+/// INSTANT (RM 40.7.1.5: NACK with a non-empty command FIFO), and
+/// TXCOUNT read now says nothing about it — recovery's own queued
+/// close, or a suffix byte queued after the fault, both make it
+/// nonzero — so the sub-case is resolved by OBSERVATION, never by
+/// inspecting the FIFO:
 ///
-/// Returns whether the abort is fully resolved (transaction ended by
-/// the auto-STOP; only the trailing cleanup remains).
-fn wait_out_halting_fault(regs: &ControllerRegisters, deadline: embassy_time::Instant) -> bool {
+/// * a fired auto-STOP idles the engine on its own within a short
+///   grace (a STOP is a bit-time; the grace covers scheduling and
+///   moderate stretch) — the abort is then fully resolved and the
+///   trailing cleanup discards whatever is left queued;
+/// * no idle within the grace means no auto-STOP is coming (the FIFO
+///   was empty at the fault): the bus is held mid-transaction and
+///   the engine is HALTED over its frozen pipeline. NDF/FEF genuinely
+///   halt (the spurious-latch families on this silicon are
+///   ALF/SDF/EPF), and a FIFO reset on a *halted* engine is safe — it
+///   is the actively-running case that corrupts — so the frozen
+///   pipeline (any suffix included) is discarded FIRST, then the halt
+///   cleared over the empty FIFO, and the caller's drain runs the
+///   manual close. Nothing stale can replay, and no deadline is
+///   burned waiting for a STOP that cannot arrive. (Residual trade: a
+///   target stretching a fired auto-STOP past the grace lands in the
+///   reset-while-executing hazard; that ends bounded in the drain's
+///   deadline escalation, and beats delivering stale bytes.)
+///
+/// Returns whether the abort is fully resolved.
+fn wait_out_halting_fault(
+    regs: &ControllerRegisters,
+    timeout: embassy_time::Duration,
+    deadline: embassy_time::Instant,
+) -> bool {
+    // Fast path — and the one place TXCOUNT is sound: EMPTY now means
+    // nothing is queued, so there is nothing a clear could replay,
+    // whatever the auto-STOP history. Clear the halt and let the
+    // drain close manually (a stretch-executing auto-STOP just
+    // finishes underneath; a close it obsoletes ends in the drain's
+    // bogus-close break).
     if regs.tx_pending() == 0 {
         regs.clear_all_status();
         return false;
     }
+    // The observation window scales with the configured timeout:
+    // heavy stretchers are configured with a larger transfer_timeout
+    // (its own doc says to raise it), and a LEGALLY stretched
+    // auto-STOP must not be reset mid-execution just because it
+    // outlived a fixed window. Floored for scheduling margin, clamped
+    // to the caller's remaining budget (a caller already past its
+    // deadline gets the bounded ending immediately — no fresh
+    // window).
+    let grace_len = core::cmp::max(embassy_time::Duration::from_millis(2), timeout / 8);
+    let now = embassy_time::Instant::now();
+    let grace_end = core::cmp::min(now + grace_len, deadline);
     while regs.master_busy() {
         regs.discard_rx();
-        if embassy_time::Instant::now() > deadline {
-            #[cfg(feature = "defmt")]
-            defmt::warn!("recovery: auto-STOP did not finish; resetting the engine");
-            regs.reset_engine();
-            break;
+        if embassy_time::Instant::now() > grace_end {
+            regs.reset_fifos();
+            regs.clear_all_status();
+            return false;
         }
     }
     true
@@ -474,7 +509,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     } else {
         match regs.recovery_fault_step() {
             Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
-                resolved = wait_out_halting_fault(regs, deadline);
+                resolved = wait_out_halting_fault(regs, timeout, deadline);
             }
             _ => {}
         }
@@ -576,9 +611,18 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
             //   manual close.
             match regs.recovery_fault_step() {
                 Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
-                    if wait_out_halting_fault(regs, deadline) {
+                    if wait_out_halting_fault(regs, timeout, deadline) {
                         break;
                     }
+                    // Unresolved: the no-auto-STOP path just discarded
+                    // the frozen pipeline — the drain's own queued
+                    // close included. Re-queue it, or every exit
+                    // condition goes dead (settled needs the close to
+                    // run; the idle-pending break needs something
+                    // pending) and the loop would burn the deadline
+                    // into the engine reset.
+                    queued = false;
+                    idle_since = None;
                 }
                 _ => {}
             }
@@ -1602,7 +1646,18 @@ where
                     spins += 1;
                     embassy_futures::yield_now().await;
                 }
-                None => embassy_time::Timer::after_micros(100).await,
+                None => {
+                    // Clamp the back-off to the remaining budget so a
+                    // short configured timeout is not overrun by a
+                    // whole sleep step (the residual overrun is one
+                    // timer tick, inherent to a tick-based sleep).
+                    let now = embassy_time::Instant::now();
+                    if now >= deadline {
+                        return Err(IOError::Timeout);
+                    }
+                    let step = core::cmp::min(deadline - now, embassy_time::Duration::from_micros(100));
+                    embassy_time::Timer::after(step).await;
+                }
             }
         }
 
@@ -2007,8 +2062,18 @@ impl<'d> I2c<'d, Async> {
 
             // NOT `take_status_and_recover`: recovery here belongs to
             // the session's drop on the error return — this is
-            // classification only, keeping recovery exactly-once.
-            self.parse_status(self.registers().take_status())?;
+            // classification only, keeping recovery exactly-once. And
+            // HALT-PRESERVING: byte N can NACK after byte N+1 was
+            // queued (the settle wake is "pulled from the FIFO", and
+            // tx_settled also trips on the error flag with the next
+            // byte still queued), so a raw clearing take would un-halt
+            // the engine over that queued suffix — which, with no
+            // auto-STOP fired (the FIFO was empty at the NACK
+            // instant), continues the still-open transaction and
+            // delivers the suffix to the target AFTER this call
+            // returned failure. Preserved, the suffix stays frozen
+            // until the session drop discards it.
+            self.parse_status(self.registers().take_status_preserving_halts())?;
         }
 
         Ok(open)
