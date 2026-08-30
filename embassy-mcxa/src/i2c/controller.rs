@@ -68,7 +68,8 @@ use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
 use super::controller_registers::{
-    ControllerCommand, ControllerRegisters, ControllerStatusError, HaltSlot, HaltedFault, RxStep, TransferFault, TxStep,
+    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, HaltSlot, HaltedFault, RecoveryClose,
+    RxStep, StartAction, TransferFault,
 };
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -330,11 +331,11 @@ struct Session {
     /// The owner's transfer timeout at session start, bounding the
     /// recovery drain.
     timeout: embassy_time::Duration,
-    /// Whether the transaction's most recent START addressed a READ.
-    /// Recovery needs it: aborting a read must clock+NACK one byte
-    /// before the STOP (see `remediate`), and the wire direction is
-    /// not observable from the registers.
-    read: bool,
+    /// The recovery phase currently required by the wire state. Repeated
+    /// STARTs and first RECEIVEs stay explicitly pending so cancellation
+    /// and a captured halted fault can select their separately proven
+    /// recovery policies.
+    phase: SessionPhase,
     /// A transfer-time NDF/FEF observation that must be resolved by
     /// this session's cleanup, rather than rediscovered from a later
     /// status read. It is populated immediately before the error path
@@ -343,10 +344,92 @@ struct Session {
 }
 
 impl Session {
+    /// Mint the only capability that may emit a first read-data command.
+    /// Its constructor is private to this module, and the facade consumes it
+    /// synchronously when it queues the command. A failed enqueue therefore
+    /// keeps the conservative `ReadAddressed` recovery state.
+    fn first_receive_permit(&mut self) -> FirstReceivePermit<'_> {
+        assert!(
+            self.phase == SessionPhase::Stable(Abort::ReadAddressed),
+            "i2c: a first read command was requested outside the addressed-read phase"
+        );
+        FirstReceivePermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
+    }
+
+    /// Mint the opaque permit required for an ordinary CPU command. Its
+    /// borrow ties the facade call to this live recovery owner; sibling I2C
+    /// modules can name the type but cannot construct one.
+    fn command_permit(&mut self) -> CommandPermit<'_> {
+        let owner = ControllerRegisters::new(self.info.regs()).identity();
+        CommandPermit::from_session(owner, self)
+    }
+
+    /// Mint a capability for a later RECEIVE only after the first command
+    /// entered the FIFO. A first command still pending is valid here: the
+    /// follow-on command remains ordered behind it and preserves ACKing.
+    fn read_receive_permit(&self) -> ReadReceivePermit<'_> {
+        assert!(
+            matches!(
+                self.phase,
+                SessionPhase::FirstReceivePending | SessionPhase::Stable(Abort::ReadStreaming)
+            ),
+            "i2c: a chained read command was requested before the first RECEIVE"
+        );
+        ReadReceivePermit::new(ControllerRegisters::new(self.info.regs()).identity(), self)
+    }
+
+    /// A received byte proves the first queued RECEIVE executed. Later
+    /// cleanup may now rely on its auto-NACK rather than inject a release
+    /// command after a fault-frozen FIFO.
+    fn note_read_progress(&mut self) {
+        self.phase = self.phase.after_read_progress();
+    }
+
+    /// Mint the only capability that may enqueue a START for this session.
+    /// The facade commits `StartPending` only if MTDR accepted the action;
+    /// a Full/fault result leaves the predecessor phase untouched.
+    fn start_transition_permit(&mut self) -> StartTransitionPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was continued"
+        );
+        StartTransitionPermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
+    }
+
+    /// Make a drained repeated START's successor phase stable. This is
+    /// called only after `tx_settled` completed without a fault; error and
+    /// cancellation paths instead consult the pending phase's explicit
+    /// recovery policy.
+    fn finish_start_transition(&mut self) {
+        self.phase = match self.phase {
+            SessionPhase::StartPending { after, .. } => SessionPhase::Stable(after),
+            SessionPhase::Stable(_) | SessionPhase::FirstReceivePending => {
+                panic!("i2c: a repeated START completed without a pending transition")
+            }
+        };
+    }
+
     /// Convert a classified fault to the public error only after a
     /// halting observation has been made this session's cleanup proof.
+    /// An ordinary ALF/PLTF intentionally leaves a pending command phase
+    /// intact: a later NDF/FEF in cleanup still needs that predecessor
+    /// policy. A halting NDF/FEF freezes its queued suffix immediately,
+    /// so only that class collapses the phase to its fault recovery shape.
     fn bind_fault(&mut self, fault: TransferFault) -> IOError {
-        self.halt.capture(fault).into()
+        // A fault may be observed by a command/top-up path before the RX
+        // consumer gets its next turn. If the first RECEIVE has already
+        // placed a byte in the hardware FIFO, it executed even though DMA
+        // may not yet have moved that byte to memory. Classify this before
+        // choosing the halted-fault recovery side so every CPU/DMA caller
+        // shares the same proof rule.
+        self.phase = self
+            .phase
+            .with_rx_fifo_progress(&ControllerRegisters::new(self.info.regs()));
+        let error = self.halt.capture(fault);
+        if !self.halt.is_empty() {
+            self.phase = SessionPhase::Stable(recovery_abort_for(error, self.phase.abort_for_halted_fault()));
+        }
+        error.into()
     }
 
     /// Consume without recovery: the transaction reached its defined
@@ -366,25 +449,25 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // A session always postdates the address phase, and every
-        // read engine issues its FIRST data command unconditionally,
-        // before any fallible or awaitable step (the chained engines
-        // and every seam chunk lead with their RECEIVE — enforced so
-        // this mapping stays sound). An abandoned read is therefore
-        // always aborted as ReadStreaming: its RECEIVE ends in the
-        // auto-NACK that releases the target — no extra clocking
-        // needed, and a command injected after that auto-NACK would
-        // trip the repeated-command silicon quirk.
-        let abort = if self.read {
-            Abort::ReadStreaming
-        } else {
-            Abort::General
-        };
         let regs = ControllerRegisters::new(self.info.regs());
+        // Capture a fault that arrived after the caller's last event step
+        // before selecting a pending-command close policy. In particular a
+        // halted first RECEIVE must recover as ReadAddressed because its
+        // frozen command will be discarded rather than auto-NACKing.
+        if self.halt.is_empty() {
+            if let Some(fault) = regs.take_active_fault() {
+                let _ = self.bind_fault(fault);
+            }
+        }
         if let Some(halt) = self.halt.take() {
+            let abort = self.phase.abort_for_cancellation();
             remediate_halted(&regs, self.timeout, abort, halt);
         } else {
-            remediate(&regs, self.timeout, abort);
+            // A NDF/FEF can latch after the snapshot above. Preserve the
+            // pending-command phase for the recovery loop so a late halt
+            // selects the frozen-pipeline close shape, not the ordinary
+            // cancellation/successor shape.
+            remediate_pending(&regs, self.timeout, self.phase);
         }
         self.info
             .session_open
@@ -405,7 +488,7 @@ impl Drop for Session {
 ///   releases the target, and a command after an auto-NACK is the
 ///   documented unreliable shape on this silicon);
 /// * everything else closes with a bare STOP.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Abort {
     /// Writes, STARTs that never reached the wire, STOP failures,
     /// fault-halted engines: a bare STOP always forms.
@@ -419,15 +502,376 @@ enum Abort {
     ReadStreaming,
 }
 
-/// A failure detected while waiting for command-FIFO space.
+/// The live transaction phase, including commands that entered the FIFO but
+/// whose execution cannot yet be inferred. Cancellation and a captured
+/// halted fault deliberately choose different conservative recovery sides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    Stable(Abort),
+    StartPending { before: Abort, after: Abort },
+    FirstReceivePending,
+}
+
+impl SessionPhase {
+    /// Fold a non-consuming RX FIFO observation into the first-read phase.
+    /// This is safe to call repeatedly. A resident byte proves the first
+    /// RECEIVE executed even if a later fault is observed by a command or
+    /// recovery path before that byte reaches its normal consumer.
+    fn with_rx_fifo_progress(self, regs: &ControllerRegisters) -> Self {
+        if regs.rx_pending() {
+            self.after_read_progress()
+        } else {
+            self
+        }
+    }
+
+    /// Retain proof that at least one byte was received. Unlike the FIFO
+    /// observation above, this is used after recovery deliberately popped
+    /// the byte, so the phase cannot be reconstructed from hardware later.
+    const fn after_read_progress(self) -> Self {
+        match self {
+            Self::FirstReceivePending => Self::Stable(Abort::ReadStreaming),
+            Self::Stable(_) | Self::StartPending { .. } => self,
+        }
+    }
+
+    /// Commit the first RECEIVE gate outcome. The `Some` result is limited
+    /// to the addressed-read state: no later-read or unrelated transaction
+    /// phase can be made streaming by this transition.
+    const fn after_first_receive_enqueue(self, queued: bool) -> Option<Self> {
+        match self {
+            Self::Stable(Abort::ReadAddressed) => {
+                if queued {
+                    Some(Self::FirstReceivePending)
+                } else {
+                    Some(Self::Stable(Abort::ReadAddressed))
+                }
+            }
+            Self::Stable(Abort::General)
+            | Self::Stable(Abort::ReadStreaming)
+            | Self::StartPending { .. }
+            | Self::FirstReceivePending => None,
+        }
+    }
+
+    /// Commit a START gate outcome. The predecessor is preserved on a
+    /// Full/fault result; on `Queued`, both the predecessor and the
+    /// START action's requested successor remain explicit until status
+    /// settles or a halted fault discards the FIFO suffix.
+    const fn after_start_enqueue(self, read: bool, queued: bool) -> Option<Self> {
+        match self {
+            Self::Stable(before) => {
+                if queued {
+                    Some(Self::StartPending {
+                        before,
+                        after: if read { Abort::ReadAddressed } else { Abort::General },
+                    })
+                } else {
+                    Some(Self::Stable(before))
+                }
+            }
+            Self::StartPending { .. } | Self::FirstReceivePending => None,
+        }
+    }
+
+    /// On cancellation, queued commands remain ordered ahead of recovery.
+    /// A pending repeated START may therefore reach the bus before close,
+    /// and a pending first RECEIVE will auto-NACK before the STOP; use the
+    /// successor/streaming close shape rather than sampling volatile FIFO
+    /// state in an attempt to guess which side is already on the wire.
+    const fn abort_for_cancellation(self) -> Abort {
+        match self {
+            Self::Stable(abort) => abort,
+            Self::StartPending { after, .. } => after,
+            Self::FirstReceivePending => Abort::ReadStreaming,
+        }
+    }
+
+    /// A halting NDF/FEF freezes and later discards the queued suffix, so
+    /// its pending command cannot be relied on to release the bus.
+    const fn abort_for_halted_fault(self) -> Abort {
+        match self {
+            Self::StartPending { before, .. } => before,
+            Self::FirstReceivePending => Abort::ReadAddressed,
+            Self::Stable(abort) => abort,
+        }
+    }
+}
+
+// Compile the first-RECEIVE and pending-recovery transition tables into every
+// target build. The facade consumes these exact transitions through
+// `FirstReceivePermit` and the recovery owner, so a Full/fault result cannot
+// silently promote an addressed-only read or collapse the wrong side of a
+// pending command.
+const _: () = {
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadAddressed).after_first_receive_enqueue(true),
+        Some(SessionPhase::FirstReceivePending)
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadAddressed).after_first_receive_enqueue(false),
+        Some(SessionPhase::Stable(Abort::ReadAddressed))
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.after_first_receive_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::General).after_first_receive_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadStreaming).after_first_receive_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::ReadAddressed,
+        }
+        .after_first_receive_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::General).after_start_enqueue(true, true),
+        Some(SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::ReadAddressed,
+        })
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadAddressed).after_start_enqueue(false, false),
+        Some(SessionPhase::Stable(Abort::ReadAddressed))
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.after_start_enqueue(true, true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.after_read_progress(),
+        SessionPhase::Stable(Abort::ReadStreaming)
+    ));
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::ReadAddressed,
+        }
+        .abort_for_cancellation(),
+        Abort::ReadAddressed
+    ));
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::ReadAddressed,
+        }
+        .abort_for_halted_fault(),
+        Abort::General
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.abort_for_cancellation(),
+        Abort::ReadStreaming
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.abort_for_halted_fault(),
+        Abort::ReadAddressed
+    ));
+    assert!(matches!(
+        recovery_abort_for(ControllerStatusError::AddressNack, Abort::ReadAddressed),
+        Abort::General
+    ));
+    assert!(matches!(
+        recovery_abort_for(ControllerStatusError::Fifo, Abort::ReadAddressed),
+        Abort::ReadAddressed
+    ));
+};
+
+/// Authority to submit one ordinary CPU command through the facade.
 ///
-/// Timeout is not a hardware status proof. Every status-derived arm is a
-/// [`TransferFault`], which remains opaque until it reaches the
-/// start-recovery owner or the live [`Session`].
+/// This is deliberately non-constructible outside `controller.rs`. A
+/// permit is minted only from a live [`Session`], then immediately consumed
+/// by the MMIO facade. START has its own stronger
+/// [`StartTransitionPermit`], so a future sibling-module edit cannot enqueue
+/// a START, TRANSMIT, or STOP without choosing its matching ownership path.
 #[must_use]
-enum TxRoomFailure {
-    Timeout,
-    Fault(TransferFault),
+pub(in crate::i2c) struct CommandPermit<'a> {
+    owner: usize,
+    _owner: PhantomData<&'a mut ()>,
+}
+
+impl<'a> CommandPermit<'a> {
+    fn from_session(owner: usize, _owner: &'a mut Session) -> Self {
+        Self {
+            owner,
+            _owner: PhantomData,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+}
+
+/// Capability consumed by a START action. It carries the mutable phase that
+/// must become `StartPending` exactly when the facade accepted that START.
+#[must_use]
+pub(in crate::i2c) struct StartTransitionPermit<'a> {
+    owner: usize,
+    phase: &'a mut SessionPhase,
+}
+
+impl<'a> StartTransitionPermit<'a> {
+    fn new(owner: usize, phase: &'a mut SessionPhase) -> Self {
+        assert!(
+            matches!(*phase, SessionPhase::Stable(_)),
+            "i2c: a START was requested outside a stable transaction phase"
+        );
+        Self { owner, phase }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn finish_enqueue(self, action: StartAction, queued: bool) {
+        *self.phase = (*self.phase)
+            .after_start_enqueue(action.is_read(), queued)
+            .expect("i2c: a START was committed from the wrong phase");
+    }
+}
+
+/// Authority to use recovery's deliberate active-fault bypass. Only the
+/// controller's self-contained remediation code can mint this token, so a
+/// sibling I2C module cannot turn the recovery batch into a general raw-MTDR
+/// command path.
+#[must_use]
+pub(in crate::i2c) struct RecoveryPermit {
+    owner: usize,
+}
+
+impl RecoveryPermit {
+    fn new(owner: usize) -> Self {
+        Self { owner }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+}
+
+/// Runtime reservation made before a fresh START is accepted. Its drop
+/// releases the single-session slot on every pre-command error/cancellation
+/// path; converting it into `Session` transfers that responsibility without
+/// a manual unreserve call.
+#[must_use]
+struct StartReservation {
+    info: &'static Info,
+    armed: bool,
+    phase: SessionPhase,
+}
+
+impl StartReservation {
+    fn acquire(info: &'static Info) -> Self {
+        assert!(
+            !info.session_open.swap(true, core::sync::atomic::Ordering::Relaxed),
+            "i2c: a transaction started while another session is live"
+        );
+        Self {
+            info,
+            armed: true,
+            phase: SessionPhase::Stable(Abort::General),
+        }
+    }
+
+    fn start_transition_permit(&mut self) -> StartTransitionPermit<'_> {
+        assert!(self.armed, "i2c: a fresh START used a released reservation");
+        StartTransitionPermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
+    }
+
+    fn into_pending_session(mut self, timeout: embassy_time::Duration) -> Session {
+        assert!(self.armed, "i2c: a fresh START consumed a released reservation");
+        assert!(
+            matches!(self.phase, SessionPhase::StartPending { .. }),
+            "i2c: a fresh START reservation became a session before its command was queued"
+        );
+        let phase = self.phase;
+        // Only disarm after all assertions that can unwind. From here the
+        // returned Session, rather than this reservation's Drop, owns the
+        // liveness slot.
+        self.armed = false;
+        Session {
+            info: self.info,
+            timeout,
+            phase,
+            halt: HaltSlot::empty(),
+        }
+    }
+}
+
+impl Drop for StartReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.info
+                .session_open
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Capability consumed by the first RECEIVE after a read START.
+///
+/// Its constructor is private to this controller module. The register
+/// facade can inspect its controller identity and commit its phase change,
+/// but cannot mint one; that prevents sibling code from treating an
+/// addressed-only read as streaming without actually queueing a command.
+#[must_use]
+pub(in crate::i2c) struct FirstReceivePermit<'a> {
+    owner: usize,
+    phase: &'a mut SessionPhase,
+}
+
+impl<'a> FirstReceivePermit<'a> {
+    fn new(owner: usize, phase: &'a mut SessionPhase) -> Self {
+        assert!(
+            *phase == SessionPhase::Stable(Abort::ReadAddressed),
+            "i2c: a first read command was requested outside the addressed-read phase"
+        );
+        Self { owner, phase }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    /// Consume this permit with the single gate outcome. Both success and
+    /// failure assign through the same transition table, making the
+    /// addressed-state preservation on Full/fault an explicit invariant.
+    pub(in crate::i2c) fn finish_enqueue(self, queued: bool) {
+        *self.phase = (*self.phase)
+            .after_first_receive_enqueue(queued)
+            .expect("i2c: a first read command was committed from the wrong phase");
+    }
+}
+
+/// Capability for follow-on RECEIVE commands after the first command
+/// entered the command FIFO. It remains valid while that command is pending
+/// and after a received byte proves it executed.
+#[must_use]
+pub(in crate::i2c) struct ReadReceivePermit<'a> {
+    owner: usize,
+    _session: PhantomData<&'a Session>,
+}
+
+impl<'a> ReadReceivePermit<'a> {
+    fn new(owner: usize, _session: &'a Session) -> Self {
+        Self {
+            owner,
+            _session: PhantomData,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
 }
 
 /// A DMA wait can end because the controller stopped without a status
@@ -439,31 +883,10 @@ enum DmaWaitError {
     UnexpectedStop,
 }
 
-impl TxRoomFailure {
-    /// Resolve a failure before any session has been minted.
-    fn recover_before_start(self, regs: &ControllerRegisters, timeout: embassy_time::Duration) -> IOError {
-        match self {
-            Self::Timeout => {
-                remediate(regs, timeout, Abort::General);
-                IOError::Timeout
-            }
-            Self::Fault(fault) => recover_transfer_fault(regs, timeout, Abort::General, fault),
-        }
-    }
-
-    /// Transfer a halt proof into the session that owns recovery.
-    fn bind_session(self, session: &mut Session) -> IOError {
-        match self {
-            Self::Timeout => IOError::Timeout,
-            Self::Fault(fault) => session.bind_fault(fault),
-        }
-    }
-}
-
 /// Select the recovery shape for a transfer fault. An address NACK has
 /// no ACKing target, so its manual close is always the general form;
 /// every other class retains the caller's known wire direction.
-fn recovery_abort_for(error: ControllerStatusError, abort: Abort) -> Abort {
+const fn recovery_abort_for(error: ControllerStatusError, abort: Abort) -> Abort {
     match error {
         ControllerStatusError::AddressNack => Abort::General,
         ControllerStatusError::ArbitrationLoss | ControllerStatusError::Fifo | ControllerStatusError::PinLowTimeout => {
@@ -492,28 +915,37 @@ fn recover_transfer_fault(
 }
 
 fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort) {
-    remediate_inner(regs, timeout, abort, None);
+    remediate_inner(regs, timeout, abort, None, None);
+}
+
+/// Recover a session that may still describe a command accepted into MTDR
+/// but not yet known to have executed. A late NDF/FEF must select the
+/// frozen-pipeline policy from that phase, rather than the ordinary
+/// cancellation policy used before any halt is observed.
+fn remediate_pending(regs: &ControllerRegisters, timeout: embassy_time::Duration, phase: SessionPhase) {
+    remediate_inner(regs, timeout, phase.abort_for_cancellation(), None, Some(phase));
 }
 
 /// Recover using a halt proof retained by the transaction that observed
 /// it. This avoids a second status observation between the API error and
 /// the session's cleanup.
 fn remediate_halted(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort, halt: HaltedFault) {
-    remediate_inner(regs, timeout, abort, Some(halt));
+    remediate_inner(regs, timeout, abort, Some(halt), None);
 }
 
 fn remediate_inner(
     regs: &ControllerRegisters,
     timeout: embassy_time::Duration,
-    abort: Abort,
+    mut abort: Abort,
     known_halt: Option<HaltedFault>,
+    mut late_halt_phase: Option<SessionPhase>,
 ) {
     #[cfg(feature = "defmt")]
     defmt::trace!("Recovering controller",);
 
-    // Recovery must not re-enter the fault-aware wait/classify
-    // paths that lead here (`take_status_and_recover`, the session
-    // drop): with a fault that keeps re-latching, that cycle
+    // Recovery must not re-enter the fault-aware transfer paths that
+    // lead here (a session drop or pre-start recovery): with a fault
+    // that keeps re-latching, that cycle
     // recurses until the stack overflows. Everything below is
     // self-contained.
     //
@@ -538,6 +970,10 @@ fn remediate_inner(
     // close. Everything else is scrubbed snapshot-honestly, which
     // cannot erase a halting fault racing in.
     let deadline = embassy_time::Instant::now() + timeout;
+    // A queued first RECEIVE may have executed before recovery began,
+    // leaving its byte in the hardware FIFO. Retain that proof even if a
+    // halting status is only observed later in the recovery drain.
+    late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
     let busy = regs.master_busy();
     let mut resolved = false;
     if let Some(halt) = known_halt {
@@ -551,6 +987,13 @@ fn remediate_inner(
         regs.discard_idle_recovery_state();
     } else {
         if let Some(halt) = regs.observe_recovery_halt() {
+            // The halt freezes the engine, so this is the authoritative
+            // FIFO observation for a first RECEIVE that raced recovery's
+            // entry snapshot.
+            late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
+            if let Some(phase) = late_halt_phase {
+                abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+            }
             resolved = regs.resolve_halted_fault(halt, timeout, deadline);
         }
     }
@@ -579,7 +1022,6 @@ fn remediate_inner(
         // left pending (those commands run out first; a read
         // pipeline's final byte auto-NACKs, which is exactly what
         // frees the target for the STOP).
-        let need = if abort == Abort::ReadAddressed { 2usize } else { 1 };
         let mut queued = false;
         let mut idle_since: Option<embassy_time::Instant> = None;
         loop {
@@ -605,28 +1047,6 @@ fn remediate_inner(
             } else {
                 idle_since = None;
             }
-            // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
-            // stalls the engine in SCL flow control (no fault!) the
-            // moment the un-popped FIFO fills, and would otherwise
-            // never finish — see `discard_rx`.
-            regs.discard_rx();
-
-            if !queued && regs.tx_fifo_capacity() - regs.tx_pending() >= need {
-                if abort == Abort::ReadAddressed {
-                    regs.write_command(ControllerCommand::RECEIVE, 0);
-                }
-                regs.write_command(ControllerCommand::STOP, 0);
-                queued = true;
-            }
-
-            // Settled only counts once the closing commands are in:
-            // the engine idles between the aborted pipeline and the
-            // close, and exiting there would leave the transaction
-            // open.
-            if queued && regs.recovery_settled() {
-                break;
-            }
-
             // The master HALTS on a latched fault and consumes no
             // further commands until it is cleared. What happens next
             // is CLASS-specific (recovery has no caller to classify
@@ -643,13 +1063,15 @@ fn remediate_inner(
             //   engine, which the idle-with-close-pending break above
             //   then ends.
             // * NDF/FEF are real sequencing verdicts, and the latched
-            //   flag is what keeps the stale pipeline frozen —
-            //   `resolve_halted_fault` waits out the hardware
-            //   auto-STOP and the abort is done (trailing reset
-            //   discards everything, the close included), or, with an
-            //   empty FIFO, clears the halt and the drain runs the
-            //   manual close.
+            //   flag is what keeps the stale pipeline frozen. Observe
+            //   them BEFORE choosing this iteration's close: once the
+            //   halt is observed, the FIFO snapshot is stable proof of
+            //   whether a pending first RECEIVE executed.
             if let Some(halt) = regs.observe_recovery_halt() {
+                late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
+                if let Some(phase) = late_halt_phase {
+                    abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+                }
                 if regs.resolve_halted_fault(halt, timeout, deadline) {
                     break;
                 }
@@ -662,6 +1084,33 @@ fn remediate_inner(
                 // into the engine reset.
                 queued = false;
                 idle_since = None;
+            } else {
+                // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
+                // stalls the engine in SCL flow control (no fault!) the
+                // moment the un-popped FIFO fills, and would otherwise
+                // never finish — see `discard_rx`. Retain a byte that this
+                // drain consumes as first-RECEIVE execution evidence for a
+                // fault that may latch on a later iteration.
+                if regs.discard_rx() {
+                    late_halt_phase = late_halt_phase.map(SessionPhase::after_read_progress);
+                }
+            }
+
+            let close = if abort == Abort::ReadAddressed {
+                RecoveryClose::ReleaseAddressedRead
+            } else {
+                RecoveryClose::Stop
+            };
+            if !queued && regs.try_enqueue_recovery_close(RecoveryPermit::new(regs.identity()), close) {
+                queued = true;
+            }
+
+            // Settled only counts once the closing commands are in:
+            // the engine idles between the aborted pipeline and the
+            // close, and exiting there would leave the transaction
+            // open.
+            if queued && regs.recovery_settled() {
+                break;
             }
 
             // A target holding SCL low satisfies no exit condition,
@@ -929,11 +1378,15 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// is not lifetime-branded — see [`Session`]) but are a severe
     /// protocol violation, so they fail deterministically here, before
     /// the defuse.
-    fn consume_session(&self, open: Session) {
+    fn assert_session_owner(&self, open: &Session) {
         assert!(
             core::ptr::eq(open.info, self.info),
             "i2c: transaction session from a different controller instance"
         );
+    }
+
+    fn consume_session(&self, open: Session) {
+        self.assert_session_owner(&open);
         open.defuse();
     }
 
@@ -946,32 +1399,11 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// recovery ownership of a single wire transaction. The
     /// reservation, not the mint, is the mutual-exclusion point: a
     /// second start must fail BEFORE its START touches the bus, not
-    /// after. Every start-transition failure path releases it; the
-    /// mint converts it into the [`Session`], whose defuse/drop
-    /// releases it.
-    fn reserve_session(&self) {
-        assert!(
-            !self.info.session_open.swap(true, core::sync::atomic::Ordering::Relaxed),
-            "i2c: a transaction started while another session is live"
-        );
-    }
-
-    /// Release a reservation whose start failed before the mint.
-    fn unreserve_session(&self) {
-        self.info
-            .session_open
-            .store(false, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Mint the session for the reservation taken at the start
-    /// transition — see [`Self::reserve_session`].
-    fn open_session(&self, read: bool) -> Session {
-        Session {
-            info: self.info,
-            timeout: self.timeout,
-            read,
-            halt: HaltSlot::empty(),
-        }
+    /// after. The returned RAII reservation releases the slot on every
+    /// pre-command error/cancellation path; conversion to [`Session`]
+    /// transfers that responsibility once a START enters MTDR.
+    fn reserve_session(&self) -> StartReservation {
+        StartReservation::acquire(self.info)
     }
 
     /// Blocking wait for the command FIFO to drain (or a fault to
@@ -988,63 +1420,123 @@ impl<'d, M: Mode> I2c<'d, M> {
         Ok(())
     }
 
-    /// Blocking wait for room in the command FIFO, honoring faults: a
-    /// halted transfer never frees space, so a data-only wait here would
-    /// spin forever. Classification ONLY — recovery belongs to the
-    /// caller's context: `start`/`stop` recover directly (no session
-    /// exists there), everywhere else the live [`Session`]'s drop is
-    /// the single recoverer.
-    fn wait_tx_room(&self) -> Result<(), TxRoomFailure> {
+    /// Form a semantic START action after the public address preflight.
+    fn start_action(&self, address: u8, read: bool) -> StartAction {
+        StartAction::new(address, read, self.is_hs)
+            .expect("i2c: checked seven-bit address could not form a START action")
+    }
+
+    /// Attempt one active command on a live session. The facade combines
+    /// fault classification, capacity validation, and MTDR emission; a
+    /// caller may only choose whether a full FIFO should be waited on.
+    fn try_enqueue_session(&self, action: ControllerAction, open: &mut Session) -> Result<bool, IOError> {
+        self.assert_session_owner(open);
+        let step = {
+            let permit = open.command_permit();
+            self.registers().try_enqueue_active(permit, action)
+        };
+        match step {
+            CommandStep::Queued => Ok(true),
+            CommandStep::Full => Ok(false),
+            CommandStep::Fault(fault) => Err(open.bind_fault(fault)),
+        }
+    }
+
+    /// Attempt a START through the only path that can atomically commit
+    /// `StartPending` when the command enters MTDR.
+    fn try_enqueue_start_session(&self, action: StartAction, open: &mut Session) -> Result<bool, IOError> {
+        self.assert_session_owner(open);
+        let step = {
+            let permit = open.start_transition_permit();
+            self.registers().try_enqueue_start(permit, action)
+        };
+        match step {
+            CommandStep::Queued => Ok(true),
+            CommandStep::Full => Ok(false),
+            CommandStep::Fault(fault) => Err(open.bind_fault(fault)),
+        }
+    }
+
+    /// Bounded blocking enqueue before a session exists. It owns recovery
+    /// because no live session can retain a halt proof yet.
+    fn enqueue_before_start(&self, action: StartAction, reservation: &mut StartReservation) -> Result<(), IOError> {
+        let regs = self.registers();
         let deadline = embassy_time::Instant::now() + self.timeout;
         loop {
+            match regs.try_enqueue_start(reservation.start_transition_permit(), action) {
+                CommandStep::Queued => return Ok(()),
+                CommandStep::Fault(fault) => {
+                    return Err(recover_transfer_fault(&regs, self.timeout, Abort::General, fault));
+                }
+                CommandStep::Full if embassy_time::Instant::now() > deadline => {
+                    remediate(&regs, self.timeout, Abort::General);
+                    return Err(IOError::Timeout);
+                }
+                CommandStep::Full => {}
+            }
+        }
+    }
+
+    /// Bounded blocking enqueue after a session exists. Error returns leave
+    /// the session live, so its drop remains the single recovery owner.
+    fn enqueue_session_blocking(&self, action: ControllerAction, open: &mut Session) -> Result<(), IOError> {
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        loop {
+            if self.try_enqueue_session(action, open)? {
+                return Ok(());
+            }
             if embassy_time::Instant::now() > deadline {
-                return Err(TxRoomFailure::Timeout);
-            }
-            match self.registers().tx_room_step() {
-                Some(TxStep::Room) => return Ok(()),
-                Some(TxStep::Fault(fault)) => return Err(TxRoomFailure::Fault(fault)),
-                None => {}
+                return Err(IOError::Timeout);
             }
         }
     }
 
-    /// Take-and-classify the status, then recover for the classes a
-    /// START transition must not leave behind. ONLY for the start
-    /// transitions (no session exists yet) — everywhere else the live
-    /// [`Session`]'s drop owns recovery, and `stop` classifies without
-    /// recovering (its error returns drop the session).
-    ///
-    /// On a NACK: per RM 40.7.1.5, the controller auto-STOPs only with
-    /// MCFGR1[AUTOSTOP] or a non-empty transmit FIFO; otherwise the
-    /// recovery STOP is ours to send — and an address NACK means the
-    /// target never ACKed, so nobody is driving SDA and the General
-    /// close is always right for it. The fault classes (arbitration
-    /// loss / FIFO error / pin-low timeout) leave aborted commands
-    /// queued for the next transaction to trip over, so they recover
-    /// too — and they take the CALLER's abort shape: the spurious-ALF
-    /// silicon quirk raises "arbitration loss" on a transfer that is
-    /// still running, so a fault after a read's address phase can be
-    /// sitting on exactly the target-drives-SDA wire state whose bare
-    /// STOP wedges the engine (see [`Abort::ReadAddressed`]).
-    fn take_status_and_recover(&self, abort: Abort) -> Result<(), IOError> {
-        // Halt-preserving observation: a latched NDF/FEF keeps the engine
-        // frozen off whatever is still queued until `remediate` — the
-        // continue shape queues its repeated START while the write
-        // half is still draining, and a plain take's clear would let
-        // that stale START fetch and replay on the wire in the gap.
-        let regs = self.registers();
-        match regs.take_start_status() {
-            Ok(()) => Ok(()),
-            Err(fault) => Err(recover_transfer_fault(&regs, self.timeout, abort, fault)),
+    /// Blocking START enqueue for an existing session. Full FIFO waits keep
+    /// the session borrowed, while the successful gate itself commits the
+    /// phase transition.
+    fn enqueue_start_session_blocking(&self, action: StartAction, open: &mut Session) -> Result<(), IOError> {
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        loop {
+            if self.try_enqueue_start_session(action, open)? {
+                return Ok(());
+            }
+            if embassy_time::Instant::now() > deadline {
+                return Err(IOError::Timeout);
+            }
         }
     }
 
-    /// Inserts the given command into the outgoing FIFO.
-    ///
-    /// Caller must ensure there is space in the FIFO for the new
-    /// command.
-    fn send_cmd(&self, command: ControllerCommand, data: u8) {
-        self.registers().write_command(command, data);
+    /// Emit the first RECEIVE immediately after a read START. If it cannot
+    /// be queued, the session remains in `ReadAddressed`, so its drop uses
+    /// the only safe no-data read abort sequence.
+    fn enqueue_first_receive(&self, bytes: usize, open: &mut Session) -> Result<(), IOError> {
+        self.assert_session_owner(open);
+        let step = {
+            let permit = open.first_receive_permit();
+            self.registers().try_enqueue_first_receive(permit, bytes)
+        };
+        match step {
+            CommandStep::Queued => Ok(()),
+            CommandStep::Full => Err(IOError::Other),
+            CommandStep::Fault(fault) => Err(open.bind_fault(fault)),
+        }
+    }
+
+    /// Enqueue a RECEIVE only after the session's first command committed
+    /// it to the streaming recovery shape. There is deliberately no plain
+    /// `ControllerAction::receive`: this capability is the API boundary
+    /// that prevents a future edit from skipping the first-read transition.
+    fn try_enqueue_read_receive(&self, bytes: usize, open: &mut Session) -> Result<bool, IOError> {
+        self.assert_session_owner(open);
+        let step = {
+            let permit = open.read_receive_permit();
+            self.registers().try_enqueue_read_receive(permit, bytes)
+        };
+        match step {
+            CommandStep::Queued => Ok(true),
+            CommandStep::Full => Ok(false),
+            CommandStep::Fault(fault) => Err(open.bind_fault(fault)),
+        }
     }
 
     /// Prepares an appropriate Start condition on bus by issuing a
@@ -1064,61 +1556,59 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.start_raw(address, read)
     }
 
-    /// Continue an open transaction with a repeated START, consuming
-    /// its session and minting the successor. On a preflight rejection
-    /// the session is dropped — i.e. the open transaction is
-    /// RECOVERED, not abandoned.
-    fn start_continue(&self, address: u8, read: bool, open: Session) -> Result<Session, IOError> {
+    /// Continue an open transaction with a repeated START. The existing
+    /// session remains live until the START is accepted into MTDR, then is
+    /// retargeted in place. This makes a full FIFO, a fault, or a cancelled
+    /// async twin recover the predecessor rather than briefly leaving an
+    /// open bus with no owner.
+    fn start_continue(&self, address: u8, read: bool, mut open: Session) -> Result<Session, IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
-        // The repeated START takes the predecessor over on the wire;
-        // if the START then fails, `start_raw`'s arms recover.
-        self.consume_session(open);
-        self.start_raw(address, read)
+        self.assert_session_owner(&open);
+
+        self.enqueue_start_session_blocking(self.start_action(address, read), &mut open)?;
+
+        if let Err(error) = self.wait_tx_settled() {
+            return Err(error);
+        }
+        match self.registers().take_start_status() {
+            Ok(()) => {
+                open.finish_start_transition();
+                Ok(open)
+            }
+            Err(fault) => Err(open.bind_fault(fault)),
+        }
     }
 
     fn start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
         // The reservation precedes the START going on the wire — see
         // `reserve_session` — so every failure below must release it.
-        self.reserve_session();
+        let mut reservation = self.reserve_session();
 
-        // Wait until we have space in the TxFIFO. No session exists
-        // yet, so every failure class recovers HERE (`wait_tx_room` is
-        // classification-only). The START is not on the wire yet, so
-        // this is not a read abort.
-        if let Err(failure) = self.wait_tx_room() {
-            let error = failure.recover_before_start(&self.registers(), self.timeout);
-            self.unreserve_session();
+        // The active-command facade combines the FIFO check, fault
+        // classification, and actual MTDR write. No session exists yet,
+        // so this path owns recovery for a stale fault/full FIFO.
+        if let Err(error) = self.enqueue_before_start(self.start_action(address, read), &mut reservation) {
             return Err(error);
         }
 
-        let addr_rw = address << 1 | if read { 1 } else { 0 };
-        self.send_cmd(
-            if self.is_hs {
-                ControllerCommand::START_HS
-            } else {
-                ControllerCommand::START
-            },
-            addr_rw,
-        );
-
-        // Wait for TxFIFO to be drained. Timeout is its only failure:
-        // the START is still queued behind a stretched clock — drop
-        // it. The address MAY complete (and, for a read, ACK) while
-        // recovery runs, so the abort carries the direction.
+        // The queued START now has a live recovery owner. Its pending
+        // phase remains intact through the drain/status boundary, so a
+        // cancellation or late halt cannot flatten fresh-read recovery
+        // into the wrong close shape.
+        let mut open = reservation.into_pending_session(self.timeout);
         if let Err(e) = self.wait_tx_settled() {
-            let abort = if read { Abort::ReadAddressed } else { Abort::General };
-            remediate(&self.registers(), self.timeout, abort);
-            self.unreserve_session();
             return Err(e);
         }
 
-        let res = self.take_status_and_recover(if read { Abort::ReadAddressed } else { Abort::General });
-        if res.is_err() {
-            self.unreserve_session();
+        match self.registers().take_start_status() {
+            Ok(()) => {
+                open.finish_start_transition();
+                Ok(open)
+            }
+            Err(fault) => Err(open.bind_fault(fault)),
         }
-        res.map(|()| self.open_session(read))
     }
 
     /// Prepares a Stop condition on the bus and waits for it to
@@ -1134,11 +1624,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// the session, whose recovery closes the transaction. Nothing
     /// here recovers explicitly, so recovery stays exactly-once.
     fn stop(&self, mut open: Session) -> Result<(), IOError> {
-        if let Err(failure) = self.wait_tx_room() {
-            return Err(failure.bind_session(&mut open));
-        }
-
-        self.send_cmd(ControllerCommand::STOP, 0);
+        self.enqueue_session_blocking(ControllerAction::stop(), &mut open)?;
 
         let deadline = embassy_time::Instant::now() + self.timeout;
         let completed = loop {
@@ -1233,23 +1719,21 @@ impl<'d, M: Mode> I2c<'d, M> {
         // (read session ⇒ a data command exists, so its abort closes
         // as ReadStreaming behind that command's auto-NACK).
         let first = total.min(256);
-        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
+        self.enqueue_first_receive(first, &mut open)?;
         let mut queued = first;
         let mut drained = 0usize;
         let mut deadline = embassy_time::Instant::now() + self.timeout;
         while drained < total {
             // Top up the command pipeline whenever there is room.
             while queued < total {
-                match self.registers().tx_room_step() {
-                    Some(TxStep::Room) => {
+                match self.try_enqueue_read_receive((total - queued).min(256), &mut open)? {
+                    true => {
                         let chunk = (total - queued).min(256);
-                        self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                         queued += chunk;
                     }
-                    Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     // Command FIFO full: plenty is queued ahead of
                     // the data; go drain some of it.
-                    None => break,
+                    false => break,
                 }
             }
 
@@ -1258,6 +1742,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             // arrive, and a data-only wait would spin forever.
             match self.registers().rx_step() {
                 Some(RxStep::Byte(b)) => {
+                    open.note_read_progress();
                     read[drained] = b;
                     drained += 1;
                     deadline = embassy_time::Instant::now() + self.timeout;
@@ -1309,13 +1794,14 @@ impl<'d, M: Mode> I2c<'d, M> {
         // like the async/DMA seam chunks, the RECEIVE must be the
         // FIRST statement so the session never exists without a data
         // command behind it (the drop invariant — see [`Session`]).
-        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+        self.enqueue_first_receive(chunk.len(), &mut open)?;
 
         let mut deadline = embassy_time::Instant::now() + self.timeout;
         for byte in chunk.iter_mut() {
             *byte = loop {
                 match self.registers().rx_step() {
                     Some(RxStep::Byte(b)) => {
+                        open.note_read_progress();
                         deadline = embassy_time::Instant::now() + self.timeout;
                         break b;
                     }
@@ -1372,12 +1858,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
 
         for byte in write {
-            // Wait until we have space in the TxFIFO
-            if let Err(failure) = self.wait_tx_room() {
-                return Err(failure.bind_session(&mut open));
-            }
-
-            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+            self.enqueue_session_blocking(ControllerAction::transmit(*byte), &mut open)?;
         }
 
         Ok(open)
@@ -1499,18 +1980,61 @@ impl<'d, M: AsyncMode> I2c<'d, M>
 where
     Self: AsyncEngine,
 {
+    /// Bounded async enqueue for a live session. The session remains
+    /// borrowed (and therefore owns cancellation cleanup) while a full
+    /// command FIFO waits for an interrupt-driven wake.
+    async fn enqueue_session_async(&self, action: ControllerAction, open: &mut Session) -> Result<(), IOError> {
+        loop {
+            if self.try_enqueue_session(action, open)? {
+                return Ok(());
+            }
+
+            match embassy_time::with_timeout(
+                self.timeout,
+                self.info.wait_cell().wait_for(|| self.registers().tx_room_wake()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(IOError::Other),
+                Err(_) => return Err(IOError::Timeout),
+            }
+        }
+    }
+
+    /// Async START enqueue for an existing session. The successful facade
+    /// call owns the `StartPending` transition; awaiting FIFO room cannot
+    /// leave a START action and its recovery state out of sync.
+    async fn enqueue_start_session_async(&self, action: StartAction, open: &mut Session) -> Result<(), IOError> {
+        loop {
+            if self.try_enqueue_start_session(action, open)? {
+                return Ok(());
+            }
+
+            match embassy_time::with_timeout(
+                self.timeout,
+                self.info.wait_cell().wait_for(|| self.registers().tx_room_wake()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(IOError::Other),
+                Err(_) => return Err(IOError::Timeout),
+            }
+        }
+    }
+
     /// Schedule sending a START command and await it being pulled from the FIFO.
     ///
     /// Does not indicate that the command was responded to.
     ///
     /// The wait is bounded by [`Config::transfer_timeout`] like its
     /// blocking counterpart: a target stretching SCL indefinitely
-    /// satisfies neither the drain condition nor any error flag. A
-    /// start that fails is returned with the controller recovered and
-    /// NO session minted, so recovery for a failed start runs
-    /// exactly once, here. The awaited wait is guarded against
-    /// drop-cancellation for the same reason: no session exists while
-    /// it is pending, so nobody else would clean up that abort.
+    /// satisfies neither the drain condition nor any error flag. Once
+    /// the command enters MTDR, a pending [`Session`] owns every
+    /// failure and cancellation path until the START status settles.
+    /// The pre-command FIFO-room wait remains separately guarded because
+    /// no command, and therefore no session, exists before acceptance.
     async fn async_start_fresh(&self, address: u8, read: bool) -> Result<Session, IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
@@ -1518,79 +2042,102 @@ where
         self.async_start_raw(address, read).await
     }
 
-    /// Continue an open transaction with a repeated START — the async
-    /// twin of [`Self::start_continue`]: a preflight rejection drops
-    /// (= recovers) the session; past that, the raw start's arms own
-    /// every failure.
-    async fn async_start_continue(&self, address: u8, read: bool, open: Session) -> Result<Session, IOError> {
+    /// Continue an open transaction with a repeated START. The predecessor
+    /// stays live through any FIFO-room await, then is retargeted once the
+    /// command is actually queued; cancellation therefore always has one
+    /// session that can close the bus.
+    async fn async_start_continue(&self, address: u8, read: bool, mut open: Session) -> Result<Session, IOError> {
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
-        self.consume_session(open);
-        self.async_start_raw(address, read).await
+        self.assert_session_owner(&open);
+
+        self.enqueue_start_session_async(self.start_action(address, read), &mut open)
+            .await?;
+
+        match embassy_time::with_timeout(
+            self.timeout,
+            self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(IOError::Other),
+            Err(_) => return Err(IOError::Timeout),
+        }
+
+        match self.registers().take_start_status() {
+            Ok(()) => {
+                open.finish_start_transition();
+                Ok(open)
+            }
+            Err(fault) => Err(open.bind_fault(fault)),
+        }
     }
 
     async fn async_start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
         // The reservation precedes the START going on the wire — see
-        // `reserve_session` — so every failure below (the cancellation
-        // guard included) must release it.
-        self.reserve_session();
+        // `reserve_session` — so every failure below must release it.
+        let mut reservation = self.reserve_session();
 
-        // send the start command
-        let addr_rw = address << 1 | if read { 1 } else { 0 };
-        self.send_cmd(
-            if self.is_hs {
-                ControllerCommand::START_HS
-            } else {
-                ControllerCommand::START
-            },
-            addr_rw,
-        );
+        // A full FIFO is the one pre-command async wait that has no
+        // session yet. Its guard uses the general recovery shape because
+        // this fresh START has not been emitted until the gate says so.
+        {
+            let queued_guard = OnDrop::new(|| {
+                remediate(&self.registers(), self.timeout, Abort::General);
+            });
+            loop {
+                match self
+                    .registers()
+                    .try_enqueue_start(reservation.start_transition_permit(), self.start_action(address, read))
+                {
+                    CommandStep::Queued => break,
+                    CommandStep::Fault(fault) => {
+                        queued_guard.defuse();
+                        let error = recover_transfer_fault(&self.registers(), self.timeout, Abort::General, fault);
+                        return Err(error);
+                    }
+                    CommandStep::Full => {
+                        match embassy_time::with_timeout(
+                            self.timeout,
+                            self.info.wait_cell().wait_for(|| self.registers().tx_room_wake()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => return Err(IOError::Other),
+                            Err(_) => return Err(IOError::Timeout),
+                        }
+                    }
+                }
+            }
+            queued_guard.defuse();
+        }
 
-        // Cancellation guard for THIS await: if the caller's future is
-        // dropped here (an outer select/timeout), the queued START
-        // still executes autonomously on the wire and opens a
-        // transaction nothing would ever close — for a read it may
-        // ACK its address with no RECEIVE behind it, the exact shape
-        // whose recovery needs the direction (see `remediate`).
-        // Defused the moment the wait resolves — the arms below own
-        // their remediation, so recovery stays exactly-once.
-        let abort = if read { Abort::ReadAddressed } else { Abort::General };
-        let on_drop = OnDrop::new(|| {
-            remediate(&self.registers(), self.timeout, abort);
-            self.unreserve_session();
-        });
-
+        // From this point the queued START can execute autonomously, so
+        // create its pending session before the first await. Drop owns
+        // cancellation and late-fault cleanup, including the distinction
+        // between a frozen START and its requested read successor.
+        let mut open = reservation.into_pending_session(self.timeout);
         let waited = embassy_time::with_timeout(
             self.timeout,
             self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
         )
         .await;
-        on_drop.defuse();
-
         match waited {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                self.unreserve_session();
-                return Err(IOError::Other);
-            }
-            Err(_) => {
-                // The START never drained: drop it, or the next
-                // transaction trips over the stale queued command —
-                // and the address may still complete mid-recovery.
-                remediate(&self.registers(), self.timeout, abort);
-                self.unreserve_session();
-                return Err(IOError::Timeout);
-            }
+            Ok(Err(_)) => return Err(IOError::Other),
+            Err(_) => return Err(IOError::Timeout),
         }
 
-        // Note: the START + ACK/NACK have not necessarily been finished here.
-        // thus this might return Ok(()), but might at a later state result in NAK or FifoError.
-        let res = self.take_status_and_recover(abort);
-        if res.is_err() {
-            self.unreserve_session();
+        match self.registers().take_start_status() {
+            Ok(()) => {
+                open.finish_start_transition();
+                Ok(open)
+            }
+            Err(fault) => Err(open.bind_fault(fault)),
         }
-        res.map(|()| self.open_session(read))
     }
 
     /// Schedule a STOP command and wait for it to PHYSICALLY complete
@@ -1606,8 +2153,10 @@ where
     /// "pulled" to "bus idle" is a bounded poll: a bit-time normally,
     /// a clock stretch capped by the deadline pathologically.
     async fn async_stop(&self, mut open: Session) -> Result<(), IOError> {
-        // send the stop command
-        self.send_cmd(ControllerCommand::STOP, 0);
+        // TX DMA completion does not prove the controller FIFO already
+        // has room for a CPU STOP. The common gate keeps this close from
+        // bypassing capacity/fault classification.
+        self.enqueue_session_async(ControllerAction::stop(), &mut open).await?;
 
         let deadline = embassy_time::Instant::now() + self.timeout;
         let waited = embassy_time::with_timeout(
@@ -1902,7 +2451,7 @@ impl<'d> I2c<'d, Async> {
         let total = read.len();
         // First command unconditionally — see `blocking_read_chained`.
         let first = total.min(256);
-        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
+        self.enqueue_first_receive(first, &mut open)?;
         // Chain RECEIVE commands under the single address phase: the
         // controller ACKs across a command boundary only when the next
         // command is already queued (otherwise it NACKs and terminates
@@ -1916,16 +2465,14 @@ impl<'d> I2c<'d, Async> {
         while drained < total {
             // Top up the command pipeline whenever there is room.
             while queued < total {
-                match self.registers().tx_room_step() {
-                    Some(TxStep::Room) => {
+                match self.try_enqueue_read_receive((total - queued).min(256), &mut open)? {
+                    true => {
                         let chunk = (total - queued).min(256);
-                        self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                         queued += chunk;
                     }
-                    Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     // Command FIFO full: plenty is queued ahead of the
                     // data; go drain some of it.
-                    None => break,
+                    false => break,
                 }
             }
 
@@ -1942,6 +2489,7 @@ impl<'d> I2c<'d, Async> {
 
             match self.registers().rx_step() {
                 Some(RxStep::Byte(b)) => {
+                    open.note_read_progress();
                     read[drained] = b;
                     drained += 1;
                 }
@@ -1988,7 +2536,7 @@ impl<'d> I2c<'d, Async> {
     /// drop-cancellation alike — drop the session, whose recovery
     /// closes the transaction.
     async fn async_read_seam_chunk(&self, chunk: &mut [u8], mut open: Session) -> Result<Session, IOError> {
-        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+        self.enqueue_first_receive(chunk.len(), &mut open)?;
 
         for byte in chunk.iter_mut() {
             loop {
@@ -2005,6 +2553,7 @@ impl<'d> I2c<'d, Async> {
 
                 match self.registers().rx_step() {
                     Some(RxStep::Byte(b)) => {
+                        open.note_read_progress();
                         *byte = b;
                         break;
                     }
@@ -2041,7 +2590,8 @@ impl<'d> I2c<'d, Async> {
 
         for byte in write {
             // initiate transmit
-            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
+            self.enqueue_session_async(ControllerAction::transmit(*byte), &mut open)
+                .await?;
 
             match embassy_time::with_timeout(
                 self.timeout,
@@ -2057,9 +2607,9 @@ impl<'d> I2c<'d, Async> {
                 Err(_) => return Err(IOError::Timeout),
             }
 
-            // NOT `take_status_and_recover`: recovery here belongs to
-            // the session's drop on the error return — this is
-            // classification only, keeping recovery exactly-once. And
+            // This is classification only: recovery belongs to the
+            // session's drop on the error return, keeping
+            // recovery exactly-once. And
             // HALT-PRESERVING: byte N can NACK after byte N+1 was
             // queued (the settle wake is "pulled from the FIFO", and
             // tx_settled also trips on the error flag with the next
@@ -2201,6 +2751,24 @@ impl<'d> I2c<'d, Dma<'d>> {
         self.mode.rx_dma.quiesce()
     }
 
+    /// Quiesce RX DMA and update the session phase from a post-quiesce byte
+    /// count. An incomplete major loop retains CITER, while a completed one
+    /// reloads it, so `quiesce`'s DONE result distinguishes the two cases.
+    /// This matters on a fault: a byte in memory *or still resident in the
+    /// RX FIFO* proves the first RECEIVE did execute, so recovery must not
+    /// inject another release RECEIVE.
+    fn finish_rx_dma_and_note(&self, total: usize, open: &mut Session) {
+        let complete = self.finish_rx_dma();
+        let moved = if complete {
+            total
+        } else {
+            self.mode.rx_dma.transferred_bytes()
+        };
+        if moved != 0 || self.registers().rx_pending() {
+            open.note_read_progress();
+        }
+    }
+
     /// TX twin of [`Self::finish_rx_dma`].
     fn finish_tx_dma(&self) -> bool {
         cortex_m::asm::dsb();
@@ -2269,14 +2837,22 @@ impl<'d> I2c<'d, Dma<'d>> {
         });
         // ~1 ms/byte of margin on top of a generous floor.
         let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
-        match embassy_time::with_timeout(bound, wait).await {
+        let total = buf.len();
+        // This inner guard carries the session phase across cancellation of
+        // the DMA wait itself. The outer read guards still protect their
+        // wider pipelines; this one is the only layer that can distinguish
+        // an incomplete DMA major loop with a partially received first byte.
+        let cleanup = OnDrop::new(|| self.finish_rx_dma_and_note(total, open));
+        let result = embassy_time::with_timeout(bound, wait).await;
+        cleanup.defuse();
+        self.finish_rx_dma_and_note(total, open);
+
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(DmaWaitError::Fault(fault))) => return Err(open.bind_fault(fault)),
             Ok(Err(DmaWaitError::UnexpectedStop)) => return Err(IOError::UnexpectedStop),
             Err(_) => return Err(IOError::Timeout),
         }
-
-        self.finish_rx_dma();
 
         // Completion and a bus error can race: the polling fast path sees
         // the completed major loop first, so take one final typed status
@@ -2351,18 +2927,20 @@ impl<'d> I2c<'d, Dma<'d>> {
         // goes in unconditionally — see `blocking_read_chained`.
         let total = read.len();
         let first = total.min(256);
-        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
+        self.enqueue_first_receive(first, &mut open)?;
         let mut queued = first;
+        let queue_deadline = embassy_time::Instant::now() + self.timeout;
         while queued < total {
-            match self.registers().tx_room_step() {
-                Some(TxStep::Room) => {
+            match self.try_enqueue_read_receive((total - queued).min(256), &mut open)? {
+                true => {
                     let chunk = (total - queued).min(256);
-                    self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                     queued += chunk;
                 }
-                Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
-                // Transiently full while the START drains.
-                None => {}
+                // The CPU queues the full DMA pipeline up front. A
+                // stretched START must not turn that spin into an
+                // unbounded wait just because no data DMA is active yet.
+                false if embassy_time::Instant::now() > queue_deadline => return Err(IOError::Timeout),
+                false => {}
             }
         }
 
@@ -2409,7 +2987,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         });
 
         // send receive command
-        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+        self.enqueue_first_receive(chunk.len(), &mut open)?;
 
         self.dma_read_into(chunk, &mut open).await?;
 

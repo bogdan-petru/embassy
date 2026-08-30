@@ -25,8 +25,11 @@
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
+use crate::i2c::controller::{
+    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, StartTransitionPermit,
+};
 use crate::pac;
-pub(in crate::i2c) use crate::pac::lpi2c::Cmd as ControllerCommand;
+use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
     Alf, Dmf, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param, Pltf, Stf,
 };
@@ -93,7 +96,10 @@ pub(in crate::i2c) struct HaltedFault {
 }
 
 impl HaltedFault {
-    fn error(&self) -> ControllerStatusError {
+    /// The error class of this still-live halt. Recovery may inspect it to
+    /// select a protocol close, but cannot extract or resolve the proof
+    /// except through this facade.
+    pub(in crate::i2c) fn error(&self) -> ControllerStatusError {
         self.error
     }
 
@@ -197,17 +203,242 @@ pub(in crate::i2c) enum RxStep {
     Ended,
 }
 
-/// One step of transmit-space progress. Faults surface before space:
-/// pushing more commands into a halted transfer would never complete.
+/// An ordinary non-START command whose wire-level shape has been checked by
+/// this facade.
 ///
-/// Like [`RxStep`], its fault arm transfers a live halt proof instead
-/// of forcing callers to re-read and reinterpret the status register.
+/// The controller implementation never writes a raw `Cmd`/`DATA` pair.
+/// Keeping the PAC encoding private here prevents a new call site from
+/// accidentally emitting a receive count of zero or a command whose
+/// FIFO/fault precondition was checked elsewhere. START has a separate
+/// [`StartAction`] type, so it cannot enter the ordinary command gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(in crate::i2c) struct ControllerAction(ControllerActionKind);
+
+/// A semantic START action. It is separate from ordinary active commands
+/// because the facade consumes it with a [`StartTransitionPermit`], making
+/// the queued-START phase transition inseparable from its MTDR write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(in crate::i2c) struct StartAction(StartSpec);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControllerActionKind {
+    Transmit(u8),
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartSpec {
+    address: u8,
+    read: bool,
+    high_speed: bool,
+}
+
+impl ControllerAction {
+    pub(in crate::i2c) const fn transmit(byte: u8) -> Self {
+        Self(ControllerActionKind::Transmit(byte))
+    }
+
+    pub(in crate::i2c) const fn stop() -> Self {
+        Self(ControllerActionKind::Stop)
+    }
+
+    fn encode(self) -> (ControllerCommand, u8) {
+        match self.0 {
+            ControllerActionKind::Transmit(byte) => (ControllerCommand::TRANSMIT, byte),
+            ControllerActionKind::Stop => (ControllerCommand::STOP, 0),
+        }
+    }
+}
+
+impl StartAction {
+    /// Construct a seven-bit START action. Invalid addresses cannot be
+    /// represented by this type.
+    pub(in crate::i2c) const fn new(address: u8, read: bool, high_speed: bool) -> Option<Self> {
+        if address < 0x80 {
+            Some(Self(StartSpec {
+                address,
+                read,
+                high_speed,
+            }))
+        } else {
+            None
+        }
+    }
+
+    fn encode(self) -> (ControllerCommand, u8) {
+        (
+            if self.0.high_speed {
+                ControllerCommand::START_HS
+            } else {
+                ControllerCommand::START
+            },
+            self.0.address << 1 | u8::from(self.0.read),
+        )
+    }
+
+    pub(in crate::i2c) fn is_read(self) -> bool {
+        self.0.read
+    }
+}
+
+/// The indivisible outcome of trying to emit one ordinary CPU command.
+///
+/// `try_enqueue_active` takes the fault snapshot, checks FIFO capacity,
+/// and writes MTDR in one facade operation. Callers cannot observe room and
+/// later bypass error classification with a raw write.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) enum TxStep {
-    Room,
+pub(in crate::i2c) enum CommandStep {
+    Queued,
+    Full,
     Fault(TransferFault),
 }
+
+/// The pure decision at the ordinary CPU-command gate. It deliberately
+/// models fault and FIFO-full as simultaneous facts, even though the live
+/// path refuses to read FIFO state after obtaining a fault proof. The
+/// combined case keeps the required priority executable in a const table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveGateInput {
+    fault: bool,
+    pending: usize,
+    capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveGate {
+    Fault,
+    Full,
+    Ready,
+}
+
+const fn decide_active_gate(input: ActiveGateInput) -> ActiveGate {
+    if input.fault {
+        ActiveGate::Fault
+    } else if input.pending >= input.capacity {
+        ActiveGate::Full
+    } else {
+        ActiveGate::Ready
+    }
+}
+
+/// The only command sequences recovery may emit while a fault can still be
+/// latched. This replaces a boolean flag so both protocol shapes stay
+/// auditable at the sole active-fault bypass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::i2c) enum RecoveryClose {
+    Stop,
+    ReleaseAddressedRead,
+}
+
+/// The literal recovery command plan. Capacity and emission both consume
+/// this one value, so a close can neither reserve one slot and emit two
+/// commands nor accidentally reorder the manual receive and STOP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryCommand {
+    ReceiveOne,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryBatch {
+    first: Option<RecoveryCommand>,
+    second: RecoveryCommand,
+}
+
+impl RecoveryBatch {
+    const fn slots(self) -> usize {
+        1 + self.first.is_some() as usize
+    }
+
+    const fn fits(self, pending: usize, capacity: usize) -> bool {
+        capacity.saturating_sub(pending) >= self.slots()
+    }
+}
+
+impl RecoveryClose {
+    const fn batch(self) -> RecoveryBatch {
+        match self {
+            Self::Stop => RecoveryBatch {
+                first: None,
+                second: RecoveryCommand::Stop,
+            },
+            Self::ReleaseAddressedRead => RecoveryBatch {
+                first: Some(RecoveryCommand::ReceiveOne),
+                second: RecoveryCommand::Stop,
+            },
+        }
+    }
+}
+
+// These are compiled for every supported embedded target, rather than only
+// by a host test harness. The production methods below call the same pure
+// classifiers and plans, so they reject a regression in these decision and
+// batch rules. They complement — rather than replace — hardware timing
+// tests for the MMIO observations surrounding the rules.
+const _: () = {
+    assert!(matches!(
+        decide_active_gate(ActiveGateInput {
+            fault: true,
+            pending: 4,
+            capacity: 4,
+        }),
+        ActiveGate::Fault
+    ));
+    assert!(matches!(
+        decide_active_gate(ActiveGateInput {
+            fault: false,
+            pending: 4,
+            capacity: 4,
+        }),
+        ActiveGate::Full
+    ));
+    assert!(matches!(
+        decide_active_gate(ActiveGateInput {
+            fault: false,
+            pending: 5,
+            capacity: 4,
+        }),
+        ActiveGate::Full
+    ));
+    assert!(matches!(
+        decide_active_gate(ActiveGateInput {
+            fault: false,
+            pending: 3,
+            capacity: 4,
+        }),
+        ActiveGate::Ready
+    ));
+
+    assert!(matches!(
+        RecoveryClose::Stop.batch(),
+        RecoveryBatch {
+            first: None,
+            second: RecoveryCommand::Stop
+        }
+    ));
+    assert!(matches!(
+        RecoveryClose::ReleaseAddressedRead.batch(),
+        RecoveryBatch {
+            first: Some(RecoveryCommand::ReceiveOne),
+            second: RecoveryCommand::Stop
+        }
+    ));
+    assert!(RecoveryClose::Stop.batch().fits(3, 4));
+    assert!(!RecoveryClose::Stop.batch().fits(4, 4));
+    assert!(RecoveryClose::ReleaseAddressedRead.batch().fits(2, 4));
+    assert!(!RecoveryClose::ReleaseAddressedRead.batch().fits(3, 4));
+    assert!(!RecoveryClose::ReleaseAddressedRead.batch().fits(5, 4));
+
+    assert!(matches!(StartAction::new(0x7f, false, false), Some(_)));
+    assert!(matches!(StartAction::new(0x80, false, false), None));
+    assert!(matches!(ControllerRegisters::encode_receive(1), Some(0)));
+    assert!(matches!(ControllerRegisters::encode_receive(256), Some(255)));
+    assert!(matches!(ControllerRegisters::encode_receive(0), None));
+    assert!(matches!(ControllerRegisters::encode_receive(257), None));
+};
 
 /// Safe controller-specific operations over the LPI2C register block.
 pub(in crate::i2c) struct ControllerRegisters {
@@ -245,6 +476,12 @@ impl ControllerRegisters {
 
     fn register_address(&self) -> usize {
         self.regs as *const LpI2cRegisters as usize
+    }
+
+    /// Stable identity used by non-copyable protocol capabilities that
+    /// cross from the session layer into this facade.
+    pub(in crate::i2c) fn identity(&self) -> usize {
+        self.register_address()
     }
 
     fn write_mier(&self, f: impl FnOnce(&mut Mier)) {
@@ -303,6 +540,15 @@ impl ControllerRegisters {
     pub(in crate::i2c) fn tx_settle_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_settled()
+    }
+
+    /// Arm the transmit-path sources and report whether a CPU command may
+    /// make progress. This is deliberately non-consuming: the caller must
+    /// immediately retry [`Self::try_enqueue_active`] so the actual MTDR
+    /// write still shares the fault/capacity check with every other command.
+    pub(in crate::i2c) fn tx_room_wake(&self) -> bool {
+        self.enable_transmit_interrupts();
+        self.tx_pending() < self.tx_fifo_capacity() || self.read_status().error().is_some()
     }
 
     /// Arm the receive-path interrupt set and evaluate its wake
@@ -591,7 +837,7 @@ impl ControllerRegisters {
         let now = embassy_time::Instant::now();
         let grace_end = core::cmp::min(now + grace_len, deadline);
         while self.master_busy() {
-            self.discard_rx();
+            let _ = self.discard_rx();
             if embassy_time::Instant::now() > grace_end {
                 self.discard_frozen_halt(halt);
                 return false;
@@ -660,6 +906,14 @@ impl ControllerRegisters {
     /// termination is pending.
     pub(in crate::i2c) fn rx_ready(&self) -> bool {
         self.mfsr().rxcount() != 0 || self.read_status().error().is_some() || self.transfer_ended()
+    }
+
+    /// Non-consuming observation that at least one received byte remains
+    /// in the hardware FIFO. DMA cleanup uses this after it has disabled
+    /// requests and quiesced the channel: a byte that reached the FIFO but
+    /// not memory still proves that the first RECEIVE executed.
+    pub(in crate::i2c) fn rx_pending(&self) -> bool {
+        self.mfsr().rxcount() != 0
     }
 
     /// True when this controller has ended the packet (EPF) and gone
@@ -789,10 +1043,17 @@ impl ControllerRegisters {
     /// forever, rxcount pinned at the FIFO depth, zero faults). The
     /// recovery drain must keep popping to let it run to its
     /// auto-NACKed end.
-    pub(in crate::i2c) fn discard_rx(&self) {
+    ///
+    /// Returns whether at least one byte was removed. A recovery owner uses
+    /// that fact to retain proof that a pending first RECEIVE executed even
+    /// when the byte is intentionally discarded rather than delivered.
+    pub(in crate::i2c) fn discard_rx(&self) -> bool {
+        let mut discarded = false;
         while self.mfsr().rxcount() != 0 {
             let _ = self.regs.mrdr.get();
+            discarded = true;
         }
+        discarded
     }
 
     /// Last-resort recovery escalation: reset the master engine by
@@ -819,20 +1080,151 @@ impl ControllerRegisters {
         self.modify_mcr(|w| w.set_men(true));
     }
 
-    /// One step of transmit-space progress: room in the command FIFO, a
-    /// fault that means the transfer is dead, or `None` to keep waiting.
-    pub(in crate::i2c) fn tx_room_step(&self) -> Option<TxStep> {
-        if let Some(fault) = self.take_active_fault() {
-            return Some(TxStep::Fault(fault));
-        }
-        if (self.mfsr().txcount() as usize) < self.tx_fifo_capacity() {
-            return Some(TxStep::Room);
-        }
-        None
+    /// Try to enqueue one ordinary CPU command.
+    ///
+    /// This is the only active-transfer path to MTDR. It observes and
+    /// retains a halting fault before it considers FIFO space, then emits
+    /// the already-validated semantic action immediately when space exists.
+    /// A full FIFO is deliberately distinct from a fault so blocking and
+    /// async callers can choose their own bounded wait without flattening a
+    /// live [`TransferFault`].
+    pub(in crate::i2c) fn try_enqueue_active(
+        &self,
+        permit: CommandPermit<'_>,
+        action: ControllerAction,
+    ) -> CommandStep {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a command permit was used through a different controller"
+        );
+        let (command, data) = action.encode();
+        self.try_enqueue_encoded(command, data)
     }
 
-    /// Push a typed controller command into the transmit FIFO.
-    pub(in crate::i2c) fn write_command(&self, command: ControllerCommand, data: u8) {
+    /// Queue a START and atomically record its pending transition in the
+    /// owning session/reservation. Ordinary command permits cannot enter
+    /// this path, so a START cannot be emitted without its recovery phase.
+    pub(in crate::i2c) fn try_enqueue_start(
+        &self,
+        permit: StartTransitionPermit<'_>,
+        action: StartAction,
+    ) -> CommandStep {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a START-transition permit was used through a different controller"
+        );
+        let (command, data) = action.encode();
+        let step = self.try_enqueue_encoded(command, data);
+        permit.finish_enqueue(action, matches!(&step, CommandStep::Queued));
+        step
+    }
+
+    fn try_enqueue_encoded(&self, command: ControllerCommand, data: u8) -> CommandStep {
+        match self.take_active_fault() {
+            Some(fault) => match decide_active_gate(ActiveGateInput {
+                // Do not sample FIFO state on this path. The model's
+                // fault+full table verifies that this priority stays the
+                // correct decision even if both facts exist in hardware.
+                fault: true,
+                pending: 0,
+                capacity: 0,
+            }) {
+                ActiveGate::Fault => CommandStep::Fault(fault),
+                ActiveGate::Full | ActiveGate::Ready => unreachable!("i2c: fault gate classification drifted"),
+            },
+            None => match decide_active_gate(ActiveGateInput {
+                fault: false,
+                pending: self.tx_pending(),
+                capacity: self.tx_fifo_capacity(),
+            }) {
+                ActiveGate::Fault => unreachable!("i2c: FIFO gate classification drifted"),
+                ActiveGate::Full => CommandStep::Full,
+                ActiveGate::Ready => {
+                    self.emit_encoded(command, data);
+                    CommandStep::Queued
+                }
+            },
+        }
+    }
+
+    /// Queue the first RECEIVE behind a read START and atomically record
+    /// the recovery-phase transition in its owning session.
+    ///
+    /// `FirstReceivePermit` can be minted only by an addressed read session.
+    /// A `Full` or `Fault` result leaves that session in the addressed phase,
+    /// while `Queued` moves it to the explicit first-RECEIVE-pending phase;
+    /// byte/FIFO evidence later promotes it to streaming.
+    pub(in crate::i2c) fn try_enqueue_first_receive(
+        &self,
+        permit: FirstReceivePermit<'_>,
+        bytes: usize,
+    ) -> CommandStep {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a first-read permit was used through a different controller"
+        );
+        let step = self.try_enqueue_encoded(ControllerCommand::RECEIVE, Self::receive_data(bytes));
+        permit.finish_enqueue(matches!(&step, CommandStep::Queued));
+        step
+    }
+
+    /// Queue a follow-on RECEIVE. The phase-specific permit means a normal
+    /// active action can never accidentally begin a read stream: only the
+    /// first-read transition above may do that.
+    pub(in crate::i2c) fn try_enqueue_read_receive(&self, permit: ReadReceivePermit<'_>, bytes: usize) -> CommandStep {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a streaming-read permit was used through a different controller"
+        );
+        self.try_enqueue_encoded(ControllerCommand::RECEIVE, Self::receive_data(bytes))
+    }
+
+    /// Queue recovery's only allowed close sequence once its entire batch
+    /// fits. Recovery intentionally runs with a fault latched, so it must
+    /// not use [`Self::try_enqueue_active`]; exposing this narrow operation
+    /// keeps that exception from becoming a second raw-MTDR escape hatch.
+    pub(in crate::i2c) fn try_enqueue_recovery_close(&self, permit: RecoveryPermit, close: RecoveryClose) -> bool {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a recovery permit was used through a different controller"
+        );
+        let batch = close.batch();
+        if !batch.fits(self.tx_pending(), self.tx_fifo_capacity()) {
+            return false;
+        }
+        if let Some(command) = batch.first {
+            self.emit_recovery_command(command);
+        }
+        self.emit_recovery_command(batch.second);
+        true
+    }
+
+    /// Validate and encode the LPI2C `RECEIVE` byte count. This stays
+    /// private so only the first-read and streaming-read capability paths
+    /// can ever reach the raw RECEIVE command.
+    const fn encode_receive(bytes: usize) -> Option<u8> {
+        if bytes != 0 && bytes <= 256 {
+            Some((bytes - 1) as u8)
+        } else {
+            None
+        }
+    }
+
+    fn receive_data(bytes: usize) -> u8 {
+        Self::encode_receive(bytes).expect("i2c: RECEIVE length must be in the LPI2C range 1..=256")
+    }
+
+    fn emit_recovery_command(&self, command: RecoveryCommand) {
+        match command {
+            RecoveryCommand::ReceiveOne => self.emit_encoded(ControllerCommand::RECEIVE, 0),
+            RecoveryCommand::Stop => self.emit_encoded(ControllerCommand::STOP, 0),
+        }
+    }
+
+    /// Raw MTDR emission. Keeping it private means every normal command is
+    /// checked by `try_enqueue_active`, while recovery is constrained to the
+    /// dedicated close batch above.
+    fn emit_encoded(&self, command: ControllerCommand, data: u8) {
         #[cfg(feature = "defmt")]
         defmt::trace!(
             "Sending cmd '{}' ({}) with data '{:02x}' MSR: {:08x}",
