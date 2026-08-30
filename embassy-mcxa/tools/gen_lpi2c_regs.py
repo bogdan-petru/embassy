@@ -98,27 +98,45 @@ CHECK_END = "// END GENERATED: layout checks"
 
 
 def find_pac() -> str:
-    """Resolve the SAME nxp-pac checkout the build uses, via cargo
-    metadata (which honors Cargo.lock and CARGO_HOME) — never by
-    globbing caches, which can silently pick another cached revision.
-    `--pac` remains the manual override."""
-    manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml")
+    """Resolve the SAME nxp-pac checkout the build uses, via
+    `cargo metadata --locked` (honors Cargo.lock and CARGO_HOME, and
+    REFUSES to update the lockfile — a `--check` must never mutate the
+    tree). The package is resolved as embassy-mcxa's DIRECT dependency
+    through the resolve graph, so it stays unambiguous even if several
+    `nxp-pac` versions ever enter the dependency graph. `--pac` remains
+    the manual override."""
+    manifest = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml"))
     try:
         out = subprocess.check_output(
-            ["cargo", "metadata", "--format-version", "1", "--manifest-path", manifest],
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--manifest-path", manifest],
             text=True,
         )
     except (OSError, subprocess.CalledProcessError) as e:
-        sys.exit(f"cargo metadata failed ({e}); pass --pac explicitly")
+        sys.exit(
+            f"cargo metadata --locked failed ({e}); on a fresh checkout run a "
+            "cargo check first so Cargo.lock exists, or pass --pac explicitly"
+        )
     meta = json.loads(out)
-    for pkg in meta["packages"]:
-        if pkg["name"] == "nxp-pac":
-            root = os.path.dirname(pkg["manifest_path"])
-            path = os.path.join(root, "src", "meta_peripherals", "mcxa", "LPI2C.rs")
-            if not os.path.exists(path):
-                sys.exit(f"resolved nxp-pac at {root} but LPI2C.rs is missing (layout changed?)")
-            return path
-    sys.exit("nxp-pac not found in cargo metadata; pass --pac")
+
+    root_id = (meta.get("resolve") or {}).get("root")
+    if root_id is None:
+        sys.exit("cargo metadata has no resolve root (workspace layout changed?); pass --pac")
+    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
+    packages = {p["id"]: p for p in meta["packages"]}
+
+    dep_ids = [
+        d["pkg"]
+        for d in nodes[root_id].get("deps", [])
+        if packages.get(d["pkg"], {}).get("name") == "nxp-pac"
+    ]
+    if len(dep_ids) != 1:
+        sys.exit(f"expected exactly one direct nxp-pac dependency, found {len(dep_ids)}; pass --pac")
+
+    root = os.path.dirname(packages[dep_ids[0]]["manifest_path"])
+    path = os.path.join(root, "src", "meta_peripherals", "mcxa", "LPI2C.rs")
+    if not os.path.exists(path):
+        sys.exit(f"resolved nxp-pac at {root} but LPI2C.rs is missing (layout changed?)")
+    return path
 
 
 def parse_offsets(pac_path: str) -> dict:

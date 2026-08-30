@@ -122,6 +122,25 @@ const CTRL_LEN: usize = 5;
 const CTRL_STATELESS_OFF: u8 = 0;
 const CTRL_STATELESS_ON: u8 = 1;
 const CTRL_ARM_OVERFLOW_PROBE: u8 = 2;
+/// Serve the audit counters on the next Read request (WITHOUT
+/// resetting them — see [`CTRL_RESET_STATS`]).
+const CTRL_SERVE_STATS: u8 = 3;
+/// Acknowledge a served audit: reset the counters. Separate from the
+/// serve so a stats read that fails controller-side (the audit read is
+/// retried) cannot destroy the evidence it was fetching.
+const CTRL_RESET_STATS: u8 = 4;
+
+/// Stats view layout: echo marker, then the premature-NeedMore counter
+/// (LE u32). Marker constraints, all load-bearing: first byte MSB
+/// CLEAR (an MSB-set first data byte trips the ~every-other-read
+/// spurious-ALF quirk — on the audit read itself); not the forward
+/// magic prefix (a partially committed control write can leave that in
+/// the buffer); adjacent-byte XORs not of the form 2^k - 1 (every
+/// generated test pattern is an additive sequence xor a constant, so
+/// its adjacent XORs are exactly that form — this marker is therefore
+/// unreachable as committed data).
+const STATS_LEN: usize = 8;
+const STATS_ECHO: [u8; 4] = [0x3C, 0x5A, 0xC3, 0xA5];
 
 /// Buffer size the overflow probe serves the next write with — small
 /// enough that a probe-length-plus-one write overflows it.
@@ -258,6 +277,11 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
     // One-shot overflow probe (see `t_overflow_write`): armed by the
     // control write, consumed by the next Write request.
     let mut overflow_probe = false;
+    // Settle-audit counter (see `t_settle_audit`): incremented on
+    // every NeedMore whose follow-up terminates with zero bytes;
+    // served and reset by the one-shot stats mode.
+    let mut premature_needmore: u32 = 0;
+    let mut stats_pending = false;
 
     loop {
         let request = tgt.listen().await.unwrap();
@@ -347,6 +371,12 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             overflow_probe = true;
                             defmt::info!("[T] overflow probe re-armed");
                         }
+                        CTRL_SERVE_STATS => {
+                            stats_pending = true;
+                        }
+                        CTRL_RESET_STATS => {
+                            premature_needmore = 0;
+                        }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
                             defmt::info!("[T] stateless-read mode: {}", stateless);
@@ -358,6 +388,21 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                     buf[..chunk.len()].copy_from_slice(chunk);
                 }
                 cursor = 0;
+            }
+            Request::Read(_) if stats_pending => {
+                // One-shot: serve the audit counters instead of the
+                // buffer. Deliberately NOT resetting here — the
+                // controller-side read can fail after this serve (the
+                // ALF quirk, an early termination), and a
+                // reset-on-serve would destroy the evidence before
+                // the auditor saw it; the auditor acknowledges with
+                // [`CTRL_RESET_STATS`] once the count is safely read.
+                // Cursor and buffer are untouched.
+                stats_pending = false;
+                let mut view = [0u8; STATS_LEN];
+                view[..4].copy_from_slice(&STATS_ECHO);
+                view[4..8].copy_from_slice(&premature_needmore.to_le_bytes());
+                let _ = tgt.respond_read(&view).await.unwrap();
             }
             Request::Read(_) => {
                 if stateless {
@@ -391,6 +436,7 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                     // legitimate producer is the razor TDF-then-NACK
                     // race, so a correct driver logs ~zero of these.
                     if after_needmore && n == 0 && !more {
+                        premature_needmore += 1;
                         defmt::info!("[T] premature NeedMore (0-byte follow-up)");
                     }
                     after_needmore = more;
@@ -435,6 +481,12 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                         CTRL_ARM_OVERFLOW_PROBE => {
                             overflow_probe = true;
                             defmt::info!("[T] overflow probe armed");
+                        }
+                        CTRL_SERVE_STATS => {
+                            stats_pending = true;
+                        }
+                        CTRL_RESET_STATS => {
+                            premature_needmore = 0;
                         }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
@@ -660,6 +712,7 @@ pub mod harness {
             tests::t_chunked_optin(ctrl, &mut model, &mut stats, caps)
         );
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
+        run_test!("settle_audit", tests::t_settle_audit(ctrl, &mut stats));
 
         defmt::info!(
             "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
@@ -689,6 +742,14 @@ pub mod harness {
             Ok(()) => defmt::info!("[{=str}] battery PASS ({=u64} ms)", mode, t0.elapsed().as_millis()),
             Err(e) => {
                 defmt::error!("[{=str}] battery FAIL: {=str}", mode, e);
+                panic!("test failure");
+            }
+        }
+
+        match tests::b_settle_audit(ctrl, &mut stats) {
+            Ok(()) => {}
+            Err(e) => {
+                defmt::error!("[{=str}] settle_audit FAIL: {=str}", mode, e);
                 panic!("test failure");
             }
         }
@@ -1491,6 +1552,185 @@ pub mod tests {
             result = Err("set_config restore failed");
         }
         result
+    }
+
+    /// Budget for premature-NeedMore events per phase. The documented
+    /// razor race — TDF asserting as the final byte enters the shifter
+    /// just before the controller NACK+STOPs — is legitimate and rare;
+    /// the pre-settle defect fires on EVERY read ending exactly at a
+    /// served-view boundary (several per phase via the 40/80-byte
+    /// lengths), far above this.
+    const PREMATURE_NEEDMORE_BUDGET: u32 = 1;
+
+    /// Query the target's premature-NeedMore counter, acknowledge it
+    /// (an explicit reset control write), and FAIL the phase if it
+    /// exceeds the budget. This is the enforcement for the TX-settle
+    /// contract — reverting the settle fix turns the suite red here;
+    /// the serve-side log line remains the diagnostic. The
+    /// serve/acknowledge split matters: the audit read itself is
+    /// retried on bus errors, and a reset-on-serve would let a failed
+    /// first read (the MSB-quirk class) destroy the very evidence
+    /// under audit, turning the gate probabilistically green.
+    pub async fn t_settle_audit<C: Controller>(ctrl: &mut C, stats: &mut RetryStats) -> TestResult {
+        let arm = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_SERVE_STATS,
+        ];
+        for attempt in 0..=MAX_RETRIES {
+            // Raw writes/reads, whole-sequence retry: a failed read
+            // consumed the one-shot stats view, so re-arm each time.
+            if let Err(e) = ctrl.write(TARGET_ADDR, &arm).await {
+                match e {
+                    ControllerIOError::ArbitrationLoss => stats.alf_retries += 1,
+                    ControllerIOError::UnexpectedStop | ControllerIOError::Timeout => stats.end_retries += 1,
+                    _ => {
+                        defmt::error!("settle audit: arm failed {}", e);
+                        return Err("settle_audit: arm failed");
+                    }
+                }
+                if attempt == MAX_RETRIES {
+                    return Err("settle_audit: retries exhausted");
+                }
+                continue;
+            }
+            let mut r = [0u8; STATS_LEN];
+            match ctrl.read(TARGET_ADDR, &mut r).await {
+                Ok(()) => {
+                    if r[..4] != STATS_ECHO {
+                        // The arm never reached the target (its write
+                        // failed on the wire), so this read served
+                        // buffer data: restart the sequence.
+                        if attempt == MAX_RETRIES {
+                            return Err("settle_audit: retries exhausted");
+                        }
+                        continue;
+                    }
+                    let count = u32::from_le_bytes(r[4..8].try_into().unwrap());
+                    // Acknowledge BEFORE the verdict: reset the
+                    // counter so the next phase audits independently
+                    // whatever this one concludes. Loud on failure.
+                    let ack = [
+                        CTRL_MAGIC[0],
+                        CTRL_MAGIC[1],
+                        CTRL_MAGIC[2],
+                        CTRL_MAGIC[3],
+                        CTRL_RESET_STATS,
+                    ];
+                    let mut acked = false;
+                    for _ in 0..=MAX_RETRIES {
+                        if ctrl.write(TARGET_ADDR, &ack).await.is_ok() {
+                            acked = true;
+                            break;
+                        }
+                        stats.alf_retries += 1;
+                    }
+                    if !acked {
+                        return Err("settle_audit: reset ack failed");
+                    }
+                    if count > PREMATURE_NEEDMORE_BUDGET {
+                        defmt::error!(
+                            "settle audit: {} premature NeedMore events (budget {})",
+                            count,
+                            PREMATURE_NEEDMORE_BUDGET
+                        );
+                        return Err("settle_audit: premature NeedMore over budget");
+                    }
+                    defmt::info!(
+                        "  settle audit: {} premature NeedMore (budget {})",
+                        count,
+                        PREMATURE_NEEDMORE_BUDGET
+                    );
+                    return Ok(());
+                }
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(e) => {
+                    defmt::error!("settle audit: read failed {}", e);
+                    return Err("settle_audit: read failed");
+                }
+            }
+            if attempt == MAX_RETRIES {
+                return Err("settle_audit: retries exhausted");
+            }
+        }
+        Err("settle_audit: retries exhausted")
+    }
+
+    /// Blocking-phase settle audit — same protocol as
+    /// [`t_settle_audit`] over the blocking API. Also prevents
+    /// blocking-phase boundary reads from leaking their counts into a
+    /// later run's async audit when the target is not rebooted in
+    /// between.
+    pub fn b_settle_audit(ctrl: &mut ControllerI2c<'_, Blocking>, stats: &mut RetryStats) -> TestResult {
+        let arm = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_SERVE_STATS,
+        ];
+        let ack = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_RESET_STATS,
+        ];
+        for attempt in 0..=MAX_RETRIES {
+            if ctrl.blocking_write(TARGET_ADDR, &arm).is_err() {
+                stats.alf_retries += 1;
+                if attempt == MAX_RETRIES {
+                    return Err("settle_audit(b): retries exhausted");
+                }
+                continue;
+            }
+            let mut r = [0u8; STATS_LEN];
+            match ctrl.blocking_read(TARGET_ADDR, &mut r) {
+                Ok(()) if r[..4] == STATS_ECHO => {
+                    let count = u32::from_le_bytes(r[4..8].try_into().unwrap());
+                    let mut acked = false;
+                    for _ in 0..=MAX_RETRIES {
+                        if ctrl.blocking_write(TARGET_ADDR, &ack).is_ok() {
+                            acked = true;
+                            break;
+                        }
+                        stats.alf_retries += 1;
+                    }
+                    if !acked {
+                        return Err("settle_audit(b): reset ack failed");
+                    }
+                    if count > PREMATURE_NEEDMORE_BUDGET {
+                        defmt::error!(
+                            "settle audit (blocking): {} premature NeedMore (budget {})",
+                            count,
+                            PREMATURE_NEEDMORE_BUDGET
+                        );
+                        return Err("settle_audit(b): over budget");
+                    }
+                    defmt::info!(
+                        "  settle audit (blocking): {} premature NeedMore (budget {})",
+                        count,
+                        PREMATURE_NEEDMORE_BUDGET
+                    );
+                    return Ok(());
+                }
+                Ok(()) => {
+                    // Arm never landed; buffer data served. Retry.
+                }
+                Err(_) => {
+                    stats.alf_retries += 1;
+                }
+            }
+            if attempt == MAX_RETRIES {
+                return Err("settle_audit(b): retries exhausted");
+            }
+        }
+        Err("settle_audit(b): retries exhausted")
     }
 
     /// Long soak: 2000 iters of a randomized op mix (W / R / WR) with

@@ -27,6 +27,20 @@ fi
 # always run check to prime cache
 cargo embassy-devtool check --force-incremental
 
+# Generated-map drift guard: the LPI2C Tock register map's offsets are
+# generated from the PAC; a PAC bump without regeneration compiles fine
+# and would otherwise only fail at hardware init (check_layout panic).
+# After the cache-priming check, so the lockfile the resolver locks
+# against exists on a fresh checkout. (On Windows, `python3` may be the
+# Store stub while real Python is `python` — accept either.)
+if command -v python3 &> /dev/null && python3 -c '' &> /dev/null; then
+    python3 embassy-mcxa/tools/gen_lpi2c_regs.py --check
+elif command -v python &> /dev/null; then
+    python embassy-mcxa/tools/gen_lpi2c_regs.py --check
+else
+    echo "python not found; skipping the generated-map drift check (tools/gen_lpi2c_regs.py --check)"
+fi
+
 if [[ -z "${TELEPROBE_TOKEN-}" ]]; then
     echo No teleprobe token found, skipping running HIL tests
     exit

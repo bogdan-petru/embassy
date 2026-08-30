@@ -115,6 +115,11 @@ async fn main(spawner: Spawner) {
     }
 
     defmt::info!("== two-board i2c test: all phases passed ==");
+    // Let the host drain the final RTT lines before the semihosting
+    // exit tears the session down — the tail (including the verdict
+    // line above) was otherwise observed truncated, with only the
+    // exit code carrying the result.
+    embassy_time::Timer::after_millis(100).await;
     debug::exit(debug::EXIT_SUCCESS);
     unreachable!();
 }

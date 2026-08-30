@@ -285,28 +285,43 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 }
 
 /// Proof that a START was issued and its transaction is open on the
-/// wire — a linear transaction token.
+/// wire — a transaction token. Produced only by `start`/`async_start`;
+/// consumed either by `stop`/`async_stop` or by the NEXT start (a
+/// repeated START surrenders the prior transaction's token to mint
+/// its successor). The engines are split into `*_txn` operations,
+/// which leave the transaction open and hand the token back, and
+/// `*_close` operations, which consume it with a trailing STOP and
+/// return nothing.
 ///
-/// Produced only by `start`/`async_start`; consumed either by
-/// `stop`/`async_stop` or by the NEXT `start` (a repeated START
-/// surrenders the prior transaction's token to mint its successor).
-/// The engines are split into `*_txn` operations, which leave the
-/// transaction open and hand the token back, and `*_close`
-/// operations, which consume it with a trailing STOP and return
-/// nothing — so a path that promises a STOP has no token to leak, and
-/// a path that keeps the transaction open must thread the token into
-/// whatever continues it. `#[must_use]` backs this up as a lint
-/// (an error under this repo's `-Dwarnings` builds), but the
-/// structural guarantee comes from the split: there is no operation
-/// that both ends a transaction and yields a token.
+/// Being precise about what each tier enforces:
 ///
-/// Deliberately zero-sized and non-owning: cleanup on abandonment
+/// - **Compile-enforced**: a driver-initiated trailing stop cannot be
+///   issued without a token (`remediation()`'s recovery STOP is
+///   outside the token discipline by design — it is cleanup, not
+///   protocol); no operation both ends a transaction and yields a
+///   token (a path that promises a STOP has nothing to leak); a token
+///   cannot be used twice (no `Copy`/`Clone` — moves are checked).
+/// - **Runtime-enforced**: the token carries its controller's
+///   register-block address, and every consumption asserts it — a
+///   token from a different instance fails deterministically instead
+///   of silently continuing the wrong bus's transaction.
+/// - **Advisory**: the token is not lifetime-branded to the controller
+///   (branding would forbid holding it across the `&mut self`
+///   operations a transaction chain is made of), so abandoning one —
+///   an explicit drop, or passing `None` where a live continuation
+///   exists — remains expressible. `#[must_use]` makes that a
+///   visible, deliberate act (an error under this repo's
+///   `-Dwarnings` builds) rather than an accident.
+///
+/// No `Drop` impl, deliberately: cleanup on abandonment
 /// (drop-cancellation, error unwind) stays with the hardware-
 /// validated OnDrop guards and the self-recovering start/stop arms —
-/// the token encodes ORDER, not cleanup, which is why it has no
-/// `Drop` of its own.
+/// the token encodes ORDER and IDENTITY, not cleanup.
 #[must_use]
-struct Started;
+struct Started {
+    /// The owning controller's register-block address.
+    block: usize,
+}
 
 /// I2C controller configuration
 #[derive(Clone, Copy)]
@@ -591,6 +606,24 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().clear_current_status();
     }
 
+    /// The register-block address identifying this controller for
+    /// transaction-token binding.
+    fn block_addr(&self) -> usize {
+        self.info.regs().as_ptr() as usize
+    }
+
+    /// Consume a transaction token, asserting it belongs to THIS
+    /// controller. Cross-instance tokens compile (the token is not
+    /// lifetime-branded — see [`Started`]) but are a severe protocol
+    /// violation, so they fail deterministically here.
+    fn consume_token(&self, open: Started) {
+        let Started { block } = open;
+        assert!(
+            block == self.block_addr(),
+            "i2c: transaction token from a different controller instance"
+        );
+    }
+
     /// Resets both TX and RX FIFOs dropping their contents.
     fn reset_fifos(&self) {
         self.registers().reset_fifos();
@@ -698,9 +731,11 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// empty ensuring the command was sent.
     fn start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
         // A repeated START surrenders the prior transaction's token
-        // and mints the successor atomically; a fresh START passes
-        // `None`.
-        drop(continues);
+        // and mints the successor atomically (verified to belong to
+        // this controller); a fresh START passes `None`.
+        if let Some(open) = continues {
+            self.consume_token(open);
+        }
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
@@ -750,7 +785,9 @@ impl<'d, M: Mode> I2c<'d, M> {
             self.remediation();
         }
 
-        res.map(|()| Started)
+        res.map(|()| Started {
+            block: self.block_addr(),
+        })
     }
 
     /// Prepares a Stop condition on the bus.
@@ -760,7 +797,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// waiting for the FIFO to become empty ensuring the command was
     /// sent.
     fn stop(&self, open: Started) -> Result<(), IOError> {
-        let Started = open;
+        self.consume_token(open);
         // Wait until we have space in the TxFIFO. Timeout recovery
         // mirrors `start`: fault classes were remediated inside
         // `wait_tx_room`, a timeout leaves the clog queued.
@@ -1136,9 +1173,11 @@ where
     /// abort.
     async fn async_start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
         // A repeated START surrenders the prior transaction's token
-        // and mints the successor atomically; a fresh START passes
-        // `None`.
-        drop(continues);
+        // and mints the successor atomically (verified to belong to
+        // this controller); a fresh START passes `None`.
+        if let Some(open) = continues {
+            self.consume_token(open);
+        }
         if address >= 0x80 {
             return Err(IOError::AddressOutOfRange(address));
         }
@@ -1195,7 +1234,9 @@ where
             self.remediation();
         }
 
-        res.map(|()| Started)
+        res.map(|()| Started {
+            block: self.block_addr(),
+        })
     }
 
     /// Schedule a STOP command and await it being pulled from the FIFO.
@@ -1213,7 +1254,7 @@ where
     /// awaited wait is guarded against drop-cancellation for the same
     /// reason — see `async_start`.
     async fn async_stop(&self, open: Started) -> Result<(), IOError> {
-        let Started = open;
+        self.consume_token(open);
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
