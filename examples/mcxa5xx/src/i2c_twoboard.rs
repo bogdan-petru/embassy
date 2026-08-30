@@ -78,7 +78,7 @@ use hal::i2c::controller::{
 };
 use hal::i2c::target::{self, Address, Config as TargetConfig, InterruptHandler, ReadStatus, Request, WriteStatus};
 use hal::interrupt::typelevel::Binding;
-use hal::peripherals::{LPI2C3, P3_20, P3_21};
+use hal::peripherals::{DMA0_CH0, DMA0_CH1, LPI2C3, P3_20, P3_21};
 
 pub const TARGET_ADDR: u8 = 0x2A;
 
@@ -180,6 +180,65 @@ pub async fn target_task(
     config.address = Address::Single(TARGET_ADDR as u16);
 
     let mut tgt = target::I2c::new_async(peri, scl, sda, irq, config).unwrap();
+    serve(&mut tgt).await
+}
+
+/// [`target_task`], but constructed over the DMA target driver, so the
+/// suite exercises the target's DMA respond paths — the half of the
+/// closed vocabulary the interrupt-mode target never touches (and where
+/// the terminated-transfer RDF drain lives).
+pub async fn target_task_dma(
+    peri: Peri<'static, LPI2C3>,
+    scl: Peri<'static, P3_21>,
+    sda: Peri<'static, P3_20>,
+    tx_dma: Peri<'static, DMA0_CH0>,
+    rx_dma: Peri<'static, DMA0_CH1>,
+    irq: impl Binding<<LPI2C3 as hal::i2c::Instance>::Interrupt, InterruptHandler<LPI2C3>> + 'static,
+) -> ! {
+    let mut config = TargetConfig::default();
+    config.address = Address::Single(TARGET_ADDR as u16);
+
+    let mut tgt = target::I2c::new_async_with_dma(peri, scl, sda, tx_dma, rx_dma, irq, config).unwrap();
+    serve(&mut tgt).await
+}
+
+/// Abstraction over the two async target constructions, so one serve
+/// loop runs against both. The driver's mode-generic bounds are
+/// private, hence a harness-side trait over the concrete types.
+#[allow(async_fn_in_trait)]
+pub trait TargetPort {
+    async fn listen(&mut self) -> Result<Request, target::IOError>;
+    async fn respond_read(&mut self, buf: &[u8]) -> Result<ReadStatus, target::IOError>;
+    async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError>;
+}
+
+impl TargetPort for target::I2c<'static, hal::i2c::Async> {
+    async fn listen(&mut self) -> Result<Request, target::IOError> {
+        self.async_listen().await
+    }
+    async fn respond_read(&mut self, buf: &[u8]) -> Result<ReadStatus, target::IOError> {
+        self.async_respond_to_read(buf).await
+    }
+    async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError> {
+        self.async_respond_to_write(buf).await
+    }
+}
+
+impl TargetPort for target::I2c<'static, hal::i2c::Dma<'static>> {
+    async fn listen(&mut self) -> Result<Request, target::IOError> {
+        self.async_listen().await
+    }
+    async fn respond_read(&mut self, buf: &[u8]) -> Result<ReadStatus, target::IOError> {
+        self.async_respond_to_read(buf).await
+    }
+    async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError> {
+        self.async_respond_to_write(buf).await
+    }
+}
+
+/// The emulated device's serve loop — see [`target_task`] for the
+/// behavioral contract (cursor, writes, stateless mode).
+async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
     let mut buf = [FILL; BUF_LEN];
     // Persistent read cursor: survives STOP and re-addressing.
     let mut cursor = 0usize;
@@ -188,7 +247,7 @@ pub async fn target_task(
     let mut stateless = false;
 
     loop {
-        let request = tgt.async_listen().await.unwrap();
+        let request = tgt.listen().await.unwrap();
         defmt::trace!("[T] event {}", request);
         match request {
             Request::Read(_) => {
@@ -206,7 +265,7 @@ pub async fn target_task(
                         *b = buf[(cursor + i) % BUF_LEN];
                     }
                     defmt::trace!("[T] R serve @{} {:02x}", cursor, view[..2]);
-                    let status = tgt.async_respond_to_read(&view).await.unwrap();
+                    let status = tgt.respond_read(&view).await.unwrap();
                     let (n, more) = match status {
                         ReadStatus::NeedMore(n) => (n, true),
                         ReadStatus::Complete(n) | ReadStatus::EarlyStop(n) => (n, false),
@@ -234,7 +293,7 @@ pub async fn target_task(
                 // would clear the pending STOP flag and misattribute the
                 // *next* transaction's bytes to this one.
                 let mut scratch = [0u8; MAX_READ + 1];
-                let n = match tgt.async_respond_to_write(&mut scratch).await.unwrap() {
+                let n = match tgt.respond_write(&mut scratch).await.unwrap() {
                     WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
                     _ => 0,
                 };

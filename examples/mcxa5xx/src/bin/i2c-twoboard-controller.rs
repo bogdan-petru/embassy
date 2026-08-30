@@ -3,8 +3,10 @@
 //!
 //! Flash this to board A with `probe-rs run`. It drives the shared
 //! `i2c_twoboard::harness` suite against the other board running
-//! `i2c-twoboard-target`, in three phases over the same physical bus:
-//! interrupt-driven async, DMA, then a blocking-path battery.
+//! `i2c-twoboard-target` (interrupt-driven) or `i2c-twoboard-target-dma`
+//! (DMA respond paths) — the suite is identical against either — in
+//! three phases over the same physical bus: interrupt-driven async,
+//! DMA, then a blocking-path battery.
 //!
 //! Coverage per async/DMA phase (see `i2c_twoboard::tests`): basic_rw,
 //! lengths, burst, edges (wrong-address NACK on write and read, recovery,

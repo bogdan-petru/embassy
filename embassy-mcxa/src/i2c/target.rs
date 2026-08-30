@@ -990,17 +990,53 @@ impl<'d> I2c<'d, Dma<'d>> {
         // Ensure all writes by DMA are visible to the CPU
         fence(Ordering::Acquire);
 
-        let bytes = if filled {
+        let mut bytes = if filled {
             chunk_len
         } else {
             self.mode.rx_dma.transferred_bytes()
         };
+
+        // The termination wake races the final byte's DMA handoff: the
+        // controller can deliver a byte (RDF set, DMA request asserted)
+        // and STOP before the eDMA arbitrates the request, and shutting
+        // the request path down above rescinds it — marooning the byte
+        // in the FIFO while the count reads one short. Drain what the
+        // FIFO still holds through the vocabulary, whose order (data
+        // before termination) is exactly what the interrupt path's
+        // `rx_event` already enforces and what the reference driver
+        // does. Nothing new can arrive mid-drain: the transaction has
+        // terminated, and ADRSTALL stretches the next address phase
+        // until `listen` services it, so every drained byte belongs to
+        // this transfer. (Residue the chunk has no room for is handled
+        // by the RDF arm of the classification below.)
+        while bytes < chunk_len {
+            match self.registers().rx_event() {
+                Some(TargetRxEvent::Byte(b)) => {
+                    data[bytes] = b;
+                    bytes += 1;
+                }
+                _ => break,
+            }
+        }
+
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
             Err(IOError::FifoError)
         } else if ssr.bef() {
             Err(IOError::BitError)
+        } else if ssr.rdf() && bytes == chunk_len {
+            // Data is still pending with no room left in this chunk —
+            // even if a termination flag is also latched. Mirror the
+            // interrupt engine's data-before-termination contract:
+            // report the chunk full so the caller collects the residue
+            // (next chunk, or `BufferFull` and a follow-up respond —
+            // SDF/RSF stay latched for it, so the follow-up's entry
+            // wait completes immediately, drains the residue, and only
+            // then reports the termination). Affirming `Stopped` here
+            // would maroon the residue in the FIFO to be DMA'd into
+            // the NEXT transaction's first bytes.
+            Ok(RxChunkOutcome::Filled(chunk_len))
         } else if ssr.sdf() {
             Ok(RxChunkOutcome::Stopped(bytes))
         } else if ssr.rsf() {
