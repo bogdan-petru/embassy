@@ -26,14 +26,14 @@ use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
 use crate::pac;
-pub(super) use crate::pac::lpi2c::Cmd as ControllerCommand;
+pub(in crate::i2c) use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
     Alf, Dmf, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param, Pltf, Stf,
 };
 
 /// A typed snapshot of the controller error flags relevant to transfers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ControllerStatus {
+struct ControllerStatus {
     error: Option<ControllerStatusError>,
 }
 
@@ -61,27 +61,133 @@ impl ControllerStatus {
         Self { error }
     }
 
-    pub(super) fn error(self) -> Option<ControllerStatusError> {
+    fn error(self) -> Option<ControllerStatusError> {
         self.error
     }
 }
 
 /// Controller errors represented by the hardware status register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ControllerStatusError {
+pub(in crate::i2c) enum ControllerStatusError {
     AddressNack,
     ArbitrationLoss,
     Fifo,
     PinLowTimeout,
 }
 
+/// Proof that an NDF or FEF snapshot is still latched in hardware.
+///
+/// This is deliberately neither `Copy` nor `Clone`. Only this module can
+/// mint it, and recovery operations consume it before they release a
+/// halted engine or discard its frozen pipeline. Debug/test builds also
+/// fail deterministically if a proof reaches `Drop` unresolved: Rust is
+/// affine rather than linear, so this catches the remaining explicit
+/// discard escape during development.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(in crate::i2c) struct HaltedFault {
+    owner: usize,
+    error: ControllerStatusError,
+    #[cfg(debug_assertions)]
+    armed: bool,
+}
+
+impl HaltedFault {
+    fn error(&self) -> ControllerStatusError {
+        self.error
+    }
+
+    fn resolve(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for HaltedFault {
+    fn drop(&mut self) {
+        assert!(
+            !self.armed,
+            "i2c: a halted-fault proof was dropped without session or recovery ownership"
+        );
+    }
+}
+
+/// A transfer-time fault classified from one status snapshot.
+///
+/// Ordinary errors are cleared from the snapshot that observed them.
+/// NDF/FEF instead produce a non-copyable [`HaltedFault`]: they freeze
+/// the queued command pipeline, so a live [`super::controller::Session`]
+/// must receive the proof before it can return an `IOError`.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(in crate::i2c) struct TransferFault(TransferFaultKind);
+
+/// Private so an I2C driver cannot destructure a fault into an `IOError`
+/// and accidentally drop the corresponding halt proof.
+#[derive(Debug, PartialEq, Eq)]
+enum TransferFaultKind {
+    Error(ControllerStatusError),
+    Halted(HaltedFault),
+}
+
+/// The only container allowed to extract a public error from a
+/// [`TransferFault`]. It owns a halt until session drop or start recovery
+/// consumes it; no borrowed `error()` accessor exists on the carrier.
+#[must_use]
+pub(in crate::i2c) struct HaltSlot(Option<HaltedFault>);
+
+impl HaltSlot {
+    pub(in crate::i2c) const fn empty() -> Self {
+        Self(None)
+    }
+
+    pub(in crate::i2c) fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub(in crate::i2c) fn capture(&mut self, fault: TransferFault) -> ControllerStatusError {
+        match fault.0 {
+            TransferFaultKind::Error(error) => error,
+            TransferFaultKind::Halted(proof) => {
+                assert!(
+                    self.0.is_none(),
+                    "i2c: a transfer fault was bound while another halt proof was unresolved"
+                );
+                let error = proof.error();
+                self.0 = Some(proof);
+                error
+            }
+        }
+    }
+
+    pub(in crate::i2c) fn take(&mut self) -> Option<HaltedFault> {
+        self.0.take()
+    }
+}
+
+/// Proof that a queued STOP physically completed.
+///
+/// Constructed only by [`ControllerRegisters::stop_step`]. Consuming this
+/// token is the sole active-transfer path that may clear every status flag.
+/// It is bound to the register block that observed MTDR empty and MBF
+/// idle, so no halted pipeline can be released on another controller.
+#[must_use]
+pub(in crate::i2c) struct StopCompleted(usize);
+
 /// One step of receive progress. Data drains before faults surface:
 /// bytes that arrived before an error are valid and must not be lost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Its fault arm carries the same [`TransferFault`] as every active
+/// transfer path. In particular, NDF/FEF cannot be flattened to an
+/// `IOError` before the live session owns the corresponding halt proof.
+#[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum RxStep {
+pub(in crate::i2c) enum RxStep {
     Byte(u8),
-    Fault(ControllerStatusError),
+    Fault(TransferFault),
     /// The transfer terminated with no data pending and no fault
     /// flagged. Observed on FRDM-MCXA577 during chained multi-command
     /// reads under interrupt-latency stress: the transfer ends mid-read
@@ -93,23 +199,33 @@ pub(super) enum RxStep {
 
 /// One step of transmit-space progress. Faults surface before space:
 /// pushing more commands into a halted transfer would never complete.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Like [`RxStep`], its fault arm transfers a live halt proof instead
+/// of forcing callers to re-read and reinterpret the status register.
+#[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum TxStep {
+pub(in crate::i2c) enum TxStep {
     Room,
-    Fault(ControllerStatusError),
+    Fault(TransferFault),
 }
 
 /// Safe controller-specific operations over the LPI2C register block.
-pub(super) struct ControllerRegisters {
+pub(in crate::i2c) struct ControllerRegisters {
     regs: &'static LpI2cRegisters,
 }
 
 impl ControllerRegisters {
-    pub(super) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    pub(in crate::i2c) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
             regs: lpi2c_regs::from_pac(regs),
         }
+    }
+
+    /// Cross-check the hidden raw layout against the linked PAC before
+    /// a controller is configured. Keeping this entry point on the
+    /// facade means driver code never needs access to raw MMIO cells.
+    pub(in crate::i2c) fn check_layout(regs: pac::lpi2c::Lpi2c) {
+        lpi2c_regs::check_layout(regs);
     }
 
     // Raw word <-> PAC value type. Field meanings live in the PAC; the
@@ -125,6 +241,10 @@ impl ControllerRegisters {
 
     fn write_msr(&self, v: Msr) {
         self.regs.msr.set(v.0);
+    }
+
+    fn register_address(&self) -> usize {
+        self.regs as *const LpI2cRegisters as usize
     }
 
     fn write_mier(&self, f: impl FnOnce(&mut Mier)) {
@@ -148,7 +268,7 @@ impl ControllerRegisters {
     /// Disable the controller interrupt mask if any source is enabled.
     ///
     /// Returns whether the driver should wake its waiter.
-    pub(super) fn disable_interrupts_if_enabled(&self) -> bool {
+    pub(in crate::i2c) fn disable_interrupts_if_enabled(&self) -> bool {
         if self.regs.mier.get() == 0 {
             return false;
         }
@@ -161,7 +281,7 @@ impl ControllerRegisters {
     /// FIFO error, pin-low timeout). Used while DMA moves the data, where
     /// TDF/RDF service the DMA engine but an error still needs to wake
     /// the waiting task.
-    pub(super) fn enable_error_interrupts(&self) {
+    pub(in crate::i2c) fn enable_error_interrupts(&self) {
         // Note: deliberately no EPIE/SDIE. Both are level-latched and
         // polluted by the silicon's spurious-flag quirks (false STOP
         // detection; EPF from repeated STARTs), so arming them storms
@@ -180,27 +300,31 @@ impl ControllerRegisters {
     /// are defined together so they cannot drift apart (an armed
     /// source outside the wake set re-arms and interrupts forever —
     /// the listen-side RSIE mismatch was exactly this class).
-    pub(super) fn tx_settle_wake(&self) -> bool {
+    pub(in crate::i2c) fn tx_settle_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_settled()
     }
 
     /// Arm the receive-path interrupt set and evaluate its wake
     /// condition, as one operation — see [`Self::tx_settle_wake`].
-    pub(super) fn rx_wake(&self) -> bool {
+    pub(in crate::i2c) fn rx_wake(&self) -> bool {
         self.enable_receive_interrupts();
         self.rx_ready()
     }
 
     /// Arm the error interrupt set (for DMA-driven transfers, where
-    /// TDF/RDF service the engine) and report any latched error, as
-    /// one operation — see [`Self::tx_settle_wake`].
-    pub(super) fn error_wake(&self) -> Option<ControllerStatusError> {
+    /// TDF/RDF service the engine) and take a latched transfer fault,
+    /// as one operation — see [`Self::tx_settle_wake`].
+    ///
+    /// The DMA poller returns the non-copyable [`TransferFault`] to its
+    /// caller; that caller binds a halting proof to the live session
+    /// before returning its public `IOError`.
+    pub(in crate::i2c) fn error_wake(&self) -> Option<TransferFault> {
         self.enable_error_interrupts();
-        self.read_status().error()
+        self.take_active_fault()
     }
 
-    pub(super) fn enable_receive_interrupts(&self) {
+    pub(in crate::i2c) fn enable_receive_interrupts(&self) {
         // No EPIE/SDIE — see `enable_error_interrupts`.
         self.write_mier(|w| {
             w.set_rdie(true);
@@ -211,7 +335,7 @@ impl ControllerRegisters {
         });
     }
 
-    pub(super) fn enable_transmit_interrupts(&self) {
+    pub(in crate::i2c) fn enable_transmit_interrupts(&self) {
         self.write_mier(|w| {
             w.set_tdie(true);
             w.set_ndie(true);
@@ -221,7 +345,15 @@ impl ControllerRegisters {
         });
     }
 
-    pub(super) fn reset_fifos(&self) {
+    /// Reset both FIFOs while the controller is disabled during setup.
+    ///
+    /// Transfer-time resets must instead flow through recovery methods
+    /// that prove the engine is halted, idle, or terminal.
+    pub(in crate::i2c) fn reset_while_disabled(&self) {
+        self.reset_fifos();
+    }
+
+    fn reset_fifos(&self) {
         critical_section::with(|_| {
             self.modify_mcr(|w| {
                 w.set_rtf(McrRtf::Reset);
@@ -230,7 +362,13 @@ impl ControllerRegisters {
         });
     }
 
-    pub(super) fn clear_all_status(&self) {
+    /// Clear every controller status flag.
+    ///
+    /// This is intentionally private: clearing NDF/FEF while commands
+    /// remain queued resumes a halted controller. Public callers must
+    /// prove the phase in which that is safe through one of the narrow
+    /// semantic operations below.
+    fn clear_all_status(&self) {
         let mut v = Msr(0);
         v.set_epf(Epf::IntYes);
         v.set_sdf(MsrSdf::IntYes);
@@ -243,67 +381,251 @@ impl ControllerRegisters {
         self.write_msr(v);
     }
 
-    /// Read and clear one coherent status snapshot.
-    ///
-    /// MSR flags are write-one-to-clear. Writing the sampled snapshot
-    /// back clears only flags observed by this read, avoiding a
-    /// read/clear race with a flag that arrives after the snapshot.
-    pub(super) fn take_status(&self) -> ControllerStatus {
-        let msr = self.msr();
-        self.write_msr(msr);
-        ControllerStatus::from_snapshot(&msr)
+    /// Clear the power-on/configuration residue before any transaction
+    /// has been opened.
+    pub(in crate::i2c) fn clear_after_init(&self) {
+        self.clear_all_status();
     }
 
-    /// [`Self::take_status`], except a latched NDF/FEF is returned
-    /// STILL LATCHED (the write-back masks those two bits off).
+    /// Discard state for a controller that was observed idle before
+    /// recovery began.
     ///
-    /// The halting flags are load-bearing: while one is latched the
-    /// engine fetches nothing, so whatever the aborted transfer left
-    /// queued stays frozen. Clearing them as a side effect of
-    /// classification un-halts the engine in the gap before recovery
-    /// acts — and a stale queued command (the continue shape queues
-    /// its repeated START while the write half is still draining)
-    /// then fetches and REPLAYS on the wire with no owner. Recovery
-    /// paths classify with this and let `remediate` observe and clear
-    /// the halt itself, with the pipeline still frozen.
-    pub(super) fn take_status_preserving_halts(&self) -> ControllerStatus {
-        let msr = self.msr();
+    /// An idle master owns no live command pipeline, so resetting the
+    /// FIFOs and clearing every W1C flag cannot release stale work.
+    pub(in crate::i2c) fn discard_idle_recovery_state(&self) {
+        self.reset_fifos();
+        self.clear_all_status();
+    }
+
+    /// Discard the terminal state of a halt whose controller already
+    /// reached idle before its recovery owner ran.
+    fn discard_idle_halt(&self, mut halt: HaltedFault) {
+        self.assert_halt_owner(&halt);
+        assert!(
+            !self.master_busy(),
+            "i2c: an idle-halt proof was discarded while the controller was busy"
+        );
+        self.reset_fifos();
+        self.clear_all_status();
+        halt.resolve();
+        halt.resolve();
+    }
+
+    /// Release a halted controller only after recovery established that
+    /// no command remains queued.
+    fn release_halted_empty_fifo(&self, mut halt: HaltedFault) {
+        self.assert_halt_owner(&halt);
+        self.clear_all_status();
+        halt.resolve();
+        halt.resolve();
+    }
+
+    /// Discard a frozen command pipeline after the auto-STOP grace
+    /// window expired.
+    fn discard_frozen_halt(&self, mut halt: HaltedFault) {
+        self.assert_halt_owner(&halt);
+        self.reset_fifos();
+        self.clear_all_status();
+        halt.resolve();
+        halt.resolve();
+    }
+
+    fn confirm_auto_stopped_halt(&self, mut halt: HaltedFault) {
+        self.assert_halt_owner(&halt);
+        assert!(
+            !self.master_busy(),
+            "i2c: auto-STOP halt was confirmed while the controller was still busy"
+        );
+        halt.resolve();
+        halt.resolve();
+    }
+
+    /// Close out recovery after the recovery drain reached a terminal
+    /// state. The caller has already made the master idle or escalated
+    /// it, so no live command can be released by this cleanup.
+    pub(in crate::i2c) fn finish_recovery(&self) {
+        self.reset_fifos();
+        self.clear_current_status();
+    }
+
+    fn halted_from_snapshot(&self, msr: &Msr) -> Option<HaltedFault> {
+        if msr.ndf() == Ndf::IntYes {
+            Some(HaltedFault {
+                owner: self.register_address(),
+                error: ControllerStatusError::AddressNack,
+                #[cfg(debug_assertions)]
+                armed: true,
+            })
+        } else if msr.fef() == MsrFef::IntYes {
+            Some(HaltedFault {
+                owner: self.register_address(),
+                error: ControllerStatusError::Fifo,
+                #[cfg(debug_assertions)]
+                armed: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn assert_halt_owner(&self, halt: &HaltedFault) {
+        assert!(
+            self.register_address() == halt.owner,
+            "i2c: a halted-fault proof was resolved through a different controller"
+        );
+    }
+
+    /// Clear only non-halting W1C flags from a sampled status word.
+    ///
+    /// NDF/FEF are deliberately masked out: either one freezes the
+    /// command pipeline, and recovery must consume a [`HaltedFault`]
+    /// before releasing or discarding it.
+    fn clear_snapshot_preserving_halts(&self, msr: Msr) {
         let mut wb = msr;
         wb.set_ndf(Ndf::IntNo);
         wb.set_fef(MsrFef::IntNo);
         self.write_msr(wb);
-        ControllerStatus::from_snapshot(&msr)
     }
 
-    /// One fault step for the recovery drain, honest under races:
-    /// classify and (maybe) clear from a SINGLE MSR snapshot. The
-    /// scrub-safe classes (ALF/PLTF — possibly spurious on this
-    /// silicon, latched on a transfer that is still running) are
-    /// cleared by writing the snapshot back with the halting bits
-    /// masked off, which can touch neither a fault that latched after
-    /// the read (the `take_status` write-back rule) nor a co-latched
-    /// NDF/FEF. The halting classes are returned still latched — what
-    /// to do about a frozen pipeline is the caller's decision.
-    pub(super) fn recovery_fault_step(&self) -> Option<ControllerStatusError> {
+    /// Take a transfer fault from an already-sampled status word.
+    ///
+    /// A halt wins over every ordinary-error priority, including a
+    /// co-latched ALF. The snapshot clear intentionally leaves NDF/FEF
+    /// latched; their proof is transferred to recovery through the
+    /// returned [`TransferFault`]. A clean snapshot is left untouched so
+    /// event state such as EPF remains available to the caller.
+    fn take_active_fault_from_snapshot(&self, msr: &Msr) -> Option<TransferFault> {
+        if let Some(halt) = self.halted_from_snapshot(msr) {
+            self.clear_snapshot_preserving_halts(Msr(msr.0));
+            Some(TransferFault(TransferFaultKind::Halted(halt)))
+        } else if let Some(error) = ControllerStatus::from_snapshot(msr).error() {
+            // Writing the sampled snapshot clears only flags observed by
+            // this read, so a fault that races in afterward remains
+            // available to the next observation.
+            self.write_msr(Msr(msr.0));
+            Some(TransferFault(TransferFaultKind::Error(error)))
+        } else {
+            None
+        }
+    }
+
+    /// Take one currently active transfer fault.
+    ///
+    /// Unlike a bare status read, this either returns the halt proof the
+    /// caller must thread to its session or clears only the ordinary
+    /// fault observed in the same snapshot. It deliberately does
+    /// nothing on a clean snapshot.
+    pub(in crate::i2c) fn take_active_fault(&self) -> Option<TransferFault> {
         let msr = self.msr();
-        let err = ControllerStatus::from_snapshot(&msr).error();
+        self.take_active_fault_from_snapshot(&msr)
+    }
+
+    /// Take and clear the status at a START boundary.
+    ///
+    /// START is the one boundary where a clean snapshot's residual W1C
+    /// bits belong to the predecessor and must be cleared. A fault uses
+    /// the same transfer carrier as RX, TX, STOP, and DMA paths.
+    pub(in crate::i2c) fn take_start_status(&self) -> Result<(), TransferFault> {
+        let msr = self.msr();
+        if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
+            Err(fault)
+        } else {
+            self.write_msr(msr);
+            Ok(())
+        }
+    }
+
+    /// Observe a halting fault during the recovery drain.
+    ///
+    /// This deliberately reports NDF/FEF before any ordinary error
+    /// priority. Scrub-safe ALF/PLTF bits from the same snapshot are
+    /// cleared, but the halting bits stay latched until a recovery
+    /// operation consumes the returned proof.
+    pub(in crate::i2c) fn observe_recovery_halt(&self) -> Option<HaltedFault> {
+        let msr = self.msr();
+        if let Some(halt) = self.halted_from_snapshot(&msr) {
+            self.clear_snapshot_preserving_halts(msr);
+            return Some(halt);
+        }
+
         if matches!(
-            err,
+            ControllerStatus::from_snapshot(&msr).error(),
             Some(ControllerStatusError::ArbitrationLoss) | Some(ControllerStatusError::PinLowTimeout)
         ) {
-            let mut wb = msr;
-            wb.set_ndf(Ndf::IntNo);
-            wb.set_fef(MsrFef::IntNo);
-            self.write_msr(wb);
+            self.write_msr(msr);
         }
-        err
+
+        None
     }
 
-    pub(super) fn read_status(&self) -> ControllerStatus {
+    /// Resolve an NDF/FEF halt without inferring the fault-time FIFO
+    /// state from a later TXCOUNT sample.
+    ///
+    /// If the hardware's auto-STOP reaches idle during a short grace
+    /// window, recovery is finished. Otherwise the controller is still
+    /// frozen: its pipeline is discarded while halted, then the caller
+    /// can queue the manual recovery close. Keeping the observation,
+    /// FIFO predicates, and token consumption together prevents an
+    /// active transfer from being reset or un-halted by a reordered
+    /// controller-side call.
+    pub(in crate::i2c) fn resolve_halted_fault(
+        &self,
+        halt: HaltedFault,
+        timeout: embassy_time::Duration,
+        deadline: embassy_time::Instant,
+    ) -> bool {
+        self.assert_halt_owner(&halt);
+
+        // Empty NOW means no command can be replayed if the halt is
+        // cleared, regardless of the auto-STOP condition at the fault
+        // instant. Let the recovery drain form a manual close.
+        if self.tx_pending() == 0 {
+            self.release_halted_empty_fifo(halt);
+            return false;
+        }
+
+        // A STOP is normally a bit-time. The grace is deliberately
+        // scaled for configurations that permit longer clock stretching,
+        // and clamped to the caller's remaining recovery budget.
+        let grace_len = core::cmp::max(embassy_time::Duration::from_millis(2), timeout / 8);
+        let now = embassy_time::Instant::now();
+        let grace_end = core::cmp::min(now + grace_len, deadline);
+        while self.master_busy() {
+            self.discard_rx();
+            if embassy_time::Instant::now() > grace_end {
+                self.discard_frozen_halt(halt);
+                return false;
+            }
+        }
+
+        self.confirm_auto_stopped_halt(halt);
+        true
+    }
+
+    /// Resolve a halt which was observed by the transaction owner
+    /// before recovery began.
+    ///
+    /// This preserves the proof across an error return instead of
+    /// relying on a later status re-read to rediscover the same latch.
+    pub(in crate::i2c) fn resolve_owned_halt(
+        &self,
+        halt: HaltedFault,
+        timeout: embassy_time::Duration,
+        deadline: embassy_time::Instant,
+    ) -> bool {
+        if self.master_busy() {
+            self.resolve_halted_fault(halt, timeout, deadline)
+        } else {
+            self.discard_idle_halt(halt);
+            true
+        }
+    }
+
+    fn read_status(&self) -> ControllerStatus {
         ControllerStatus::from_snapshot(&self.msr())
     }
 
-    pub(super) fn clear_current_status(&self) {
+    fn clear_current_status(&self) {
         let msr = self.msr();
         self.write_msr(msr);
     }
@@ -312,14 +634,22 @@ impl ControllerRegisters {
     /// FIFO), a fault that means no more data will arrive, an early
     /// termination, or `None` to keep waiting. There is deliberately no
     /// data-only variant of this wait — see the module docs.
-    pub(super) fn rx_step(&self) -> Option<RxStep> {
+    pub(in crate::i2c) fn rx_step(&self) -> Option<RxStep> {
         if self.mfsr().rxcount() != 0 {
             return Some(RxStep::Byte(Mrdr(self.regs.mrdr.get()).data()));
         }
-        if let Some(e) = self.read_status().error() {
-            return Some(RxStep::Fault(e));
+        let msr = self.msr();
+        // A final byte can arrive between the first FIFO observation and
+        // the status snapshot. Preserve data-before-fault ordering by
+        // checking once more before consuming that snapshot: the next
+        // step will classify its still-latched fault or termination.
+        if self.mfsr().rxcount() != 0 {
+            return Some(RxStep::Byte(Mrdr(self.regs.mrdr.get()).data()));
         }
-        if self.transfer_ended() {
+        if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
+            return Some(RxStep::Fault(fault));
+        }
+        if Self::transfer_ended_from_snapshot(&msr) {
             return Some(RxStep::Ended);
         }
         None
@@ -328,7 +658,7 @@ impl ControllerRegisters {
     /// Non-consuming readiness check for [`Self::rx_step`], for use in
     /// wake conditions. True when a byte, a fault, or an early transfer
     /// termination is pending.
-    pub(super) fn rx_ready(&self) -> bool {
+    pub(in crate::i2c) fn rx_ready(&self) -> bool {
         self.mfsr().rxcount() != 0 || self.read_status().error().is_some() || self.transfer_ended()
     }
 
@@ -341,22 +671,27 @@ impl ControllerRegisters {
     /// (observed with MSB-rich data). EPF is set only by this master's
     /// own end-of-packet, and the MBF guard rejects any transient state
     /// while a transfer is still active. Flags from a *previous*
-    /// transaction are cleared by the `take_status` inside the START's
-    /// own status check.
-    pub(super) fn transfer_ended(&self) -> bool {
+    /// transaction are cleared by the START's own
+    /// [`Self::take_start_status`] check.
+    pub(in crate::i2c) fn transfer_ended(&self) -> bool {
         let msr = self.msr();
+        Self::transfer_ended_from_snapshot(&msr)
+    }
+
+    fn transfer_ended_from_snapshot(msr: &Msr) -> bool {
         msr.epf() == Epf::IntYes && msr.mbf() == Mbf::Idle
     }
 
     /// Capacity of the shared command/transmit FIFO, in entries.
-    pub(super) fn tx_fifo_capacity(&self) -> usize {
+    pub(in crate::i2c) fn tx_fifo_capacity(&self) -> usize {
         1usize << Param(self.regs.param.get()).mtxfifo()
     }
 
     /// True when the command FIFO has fully drained *or* a fault is
     /// pending — i.e. the wait for a queued command is over, one way or
-    /// the other. Callers classify with `take_status`/`read_status`.
-    pub(super) fn tx_settled(&self) -> bool {
+    /// the other. Callers classify with [`Self::take_active_fault`] or
+    /// `read_status`.
+    pub(in crate::i2c) fn tx_settled(&self) -> bool {
         self.mfsr().txcount() == 0 || self.read_status().error().is_some()
     }
 
@@ -376,7 +711,7 @@ impl ControllerRegisters {
     /// entirely — recovery has no caller to classify for — and insists
     /// on genuine idleness, so the trailing cleanup runs after the
     /// last autonomous byte and the STOP.
-    pub(super) fn recovery_settled(&self) -> bool {
+    pub(in crate::i2c) fn recovery_settled(&self) -> bool {
         self.mfsr().txcount() == 0 && self.msr().mbf() == Mbf::Idle
     }
 
@@ -387,16 +722,16 @@ impl ControllerRegisters {
     /// is then scrubbed, retries forever: a livelock that burns the
     /// whole recovery deadline. (The old fault-exit drain masked this
     /// by bailing on the FEF and silently discarding the bogus STOP.)
-    pub(super) fn master_busy(&self) -> bool {
+    pub(in crate::i2c) fn master_busy(&self) -> bool {
         self.msr().mbf() == Mbf::Busy
     }
 
     /// Number of commands currently waiting in the transmit FIFO.
-    pub(super) fn tx_pending(&self) -> usize {
+    pub(in crate::i2c) fn tx_pending(&self) -> usize {
         self.mfsr().txcount() as usize
     }
 
-    /// One step of the trailing-STOP completion wait: `Some(Ok(()))`
+    /// One step of the trailing-STOP completion wait: `Some(Ok(..))`
     /// when the STOP has PHYSICALLY completed — command FIFO empty AND
     /// the bus engine idle — `Some(Err(..))` when a fault latched (the
     /// transaction's last chance to classify it as its own), `None` to
@@ -409,15 +744,38 @@ impl ControllerRegisters {
     /// drain hands such faults to whoever runs next, with no recovery
     /// owner. Deliberately not SDF-based either: this silicon raises
     /// SDF spuriously mid-transfer (see `transfer_ended`), while
-    /// MBF reflects the engine actually going idle.
-    pub(super) fn stop_step(&self) -> Option<Result<(), ControllerStatusError>> {
-        if let Some(e) = self.read_status().error() {
-            return Some(Err(e));
+    /// MBF reflects the engine actually going idle. The fault arm carries
+    /// the live transaction's proof; terminal status is cleared only after
+    /// the [`StopCompleted`] proof is returned to [`Self::finish_stop`].
+    pub(in crate::i2c) fn stop_step(&self) -> Option<Result<StopCompleted, TransferFault>> {
+        let msr = self.msr();
+        if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
+            return Some(Err(fault));
         }
-        if self.mfsr().txcount() == 0 && self.msr().mbf() == Mbf::Idle {
-            return Some(Ok(()));
+        if self.mfsr().txcount() == 0 && msr.mbf() == Mbf::Idle {
+            return Some(Ok(StopCompleted(self.register_address())));
         }
         None
+    }
+
+    /// Classify and clear the terminal status snapshot after a
+    /// physically completed STOP.
+    ///
+    /// [`StopCompleted`] is intentionally consumed here, so terminal
+    /// status is cleared only after the physical STOP proof. A fault that
+    /// races in after the final `stop_step` is still returned through the
+    /// same typed path, rather than being erased by terminal cleanup.
+    pub(in crate::i2c) fn finish_stop(&self, completed: StopCompleted) -> Result<(), TransferFault> {
+        assert!(
+            self.register_address() == completed.0,
+            "i2c: a completed-STOP proof was finalized through a different controller"
+        );
+        let msr = self.msr();
+        if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
+            return Err(fault);
+        }
+        self.write_msr(msr);
+        Ok(())
     }
 
     /// Recovery helper: discard everything currently in the RX FIFO.
@@ -431,7 +789,7 @@ impl ControllerRegisters {
     /// forever, rxcount pinned at the FIFO depth, zero faults). The
     /// recovery drain must keep popping to let it run to its
     /// auto-NACKed end.
-    pub(super) fn discard_rx(&self) {
+    pub(in crate::i2c) fn discard_rx(&self) {
         while self.mfsr().rxcount() != 0 {
             let _ = self.regs.mrdr.get();
         }
@@ -451,16 +809,21 @@ impl ControllerRegisters {
     /// RX FIFO permanently lagging by its own depth). The graceful
     /// recovery STOP stays the first choice — this runs only when
     /// that provably cannot drain.
-    pub(super) fn reset_engine(&self) {
+    /// Escalate a recovery drain that exceeded its bounded deadline.
+    pub(in crate::i2c) fn reset_after_recovery_timeout(&self) {
+        self.reset_engine();
+    }
+
+    fn reset_engine(&self) {
         self.modify_mcr(|w| w.set_men(false));
         self.modify_mcr(|w| w.set_men(true));
     }
 
     /// One step of transmit-space progress: room in the command FIFO, a
     /// fault that means the transfer is dead, or `None` to keep waiting.
-    pub(super) fn tx_room_step(&self) -> Option<TxStep> {
-        if let Some(e) = self.read_status().error() {
-            return Some(TxStep::Fault(e));
+    pub(in crate::i2c) fn tx_room_step(&self) -> Option<TxStep> {
+        if let Some(fault) = self.take_active_fault() {
+            return Some(TxStep::Fault(fault));
         }
         if (self.mfsr().txcount() as usize) < self.tx_fifo_capacity() {
             return Some(TxStep::Room);
@@ -469,7 +832,7 @@ impl ControllerRegisters {
     }
 
     /// Push a typed controller command into the transmit FIFO.
-    pub(super) fn write_command(&self, command: ControllerCommand, data: u8) {
+    pub(in crate::i2c) fn write_command(&self, command: ControllerCommand, data: u8) {
         #[cfg(feature = "defmt")]
         defmt::trace!(
             "Sending cmd '{}' ({}) with data '{:02x}' MSR: {:08x}",
@@ -488,19 +851,19 @@ impl ControllerRegisters {
     // DMA plumbing: request enables and the FIFO data addresses the DMA
     // engine reads/writes directly.
 
-    pub(super) fn set_rx_dma(&self, enable: bool) {
+    pub(in crate::i2c) fn set_rx_dma(&self, enable: bool) {
         self.modify_mder(|w| w.set_rdde(enable));
     }
 
-    pub(super) fn set_tx_dma(&self, enable: bool) {
+    pub(in crate::i2c) fn set_tx_dma(&self, enable: bool) {
         self.modify_mder(|w| w.set_tdde(enable));
     }
 
-    pub(super) fn rx_data_ptr(&self) -> *const u8 {
+    pub(in crate::i2c) fn rx_data_ptr(&self) -> *const u8 {
         &self.regs.mrdr as *const _ as *const u8
     }
 
-    pub(super) fn tx_data_ptr(&self) -> *mut u8 {
+    pub(in crate::i2c) fn tx_data_ptr(&self) -> *mut u8 {
         &self.regs.mtdr as *const _ as *mut u8
     }
 }

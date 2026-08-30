@@ -39,7 +39,7 @@ use crate::pac::lpi2c::{Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
 /// readiness/event check: a fault that wakes the waiter without
 /// surfacing as an event would re-arm and wake forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TargetFault {
+pub(in crate::i2c) enum TargetFault {
     /// Bit error: the target saw a bus level conflicting with what it
     /// was driving.
     Bit,
@@ -50,7 +50,7 @@ pub(super) enum TargetFault {
 /// One step of target receive progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum TargetRxEvent {
+pub(in crate::i2c) enum TargetRxEvent {
     /// A byte the controller wrote, popped from the RX FIFO.
     Byte(u8),
     /// A fault; bytes already drained are valid, nothing further is.
@@ -64,7 +64,7 @@ pub(super) enum TargetRxEvent {
 /// One step of target transmit progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum TargetTxStep {
+pub(in crate::i2c) enum TargetTxStep {
     /// The transmit register has room for the next byte.
     Room,
     /// A fault; the transfer is compromised, push nothing more.
@@ -77,7 +77,7 @@ pub(super) enum TargetTxStep {
 /// [`TargetRegisters::take_listen_event`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum ListenEvent {
+pub(in crate::i2c) enum ListenEvent {
     /// A fault surfaced while listening.
     Fault(TargetFault),
     /// Address match for one of the configured addresses.
@@ -97,15 +97,22 @@ pub(super) enum ListenEvent {
 }
 
 /// Safe target-specific operations over the LPI2C register block.
-pub(super) struct TargetRegisters {
+pub(in crate::i2c) struct TargetRegisters {
     regs: &'static LpI2cRegisters,
 }
 
 impl TargetRegisters {
-    pub(super) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    pub(in crate::i2c) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
             regs: lpi2c_regs::from_pac(regs),
         }
+    }
+
+    /// Cross-check the hidden raw layout against the linked PAC before
+    /// a target is configured. Driver code only receives this facade,
+    /// never the cells themselves.
+    pub(in crate::i2c) fn check_layout(regs: pac::lpi2c::Lpi2c) {
+        lpi2c_regs::check_layout(regs);
     }
 
     fn ssr(&self) -> Ssr {
@@ -133,7 +140,7 @@ impl TargetRegisters {
     /// Disable the target interrupt mask if any source is enabled.
     ///
     /// Returns whether the driver should wake its waiter.
-    pub(super) fn disable_interrupts_if_enabled(&self) -> bool {
+    pub(in crate::i2c) fn disable_interrupts_if_enabled(&self) -> bool {
         if self.regs.sier.get() == 0 {
             return false;
         }
@@ -143,7 +150,7 @@ impl TargetRegisters {
     }
 
     /// Interrupts relevant while receiving data (respond_to_write).
-    pub(super) fn enable_receive_interrupts(&self) {
+    pub(in crate::i2c) fn enable_receive_interrupts(&self) {
         self.write_sier(|w| {
             w.set_feie(true);
             w.set_beie(true);
@@ -154,7 +161,7 @@ impl TargetRegisters {
     }
 
     /// Interrupts relevant while transmitting data (respond_to_read).
-    pub(super) fn enable_transmit_interrupts(&self) {
+    pub(in crate::i2c) fn enable_transmit_interrupts(&self) {
         self.write_sier(|w| {
             w.set_feie(true);
             w.set_beie(true);
@@ -169,35 +176,35 @@ impl TargetRegisters {
     /// together so they cannot drift apart (an armed source outside
     /// the wake set re-arms and interrupts forever — the listen-side
     /// RSIE mismatch was exactly this class).
-    pub(super) fn rx_wake(&self) -> bool {
+    pub(in crate::i2c) fn rx_wake(&self) -> bool {
         self.enable_receive_interrupts();
         self.rx_ready()
     }
 
     /// Arm the transmit interrupt set and evaluate its wake condition,
     /// as one operation — see [`Self::rx_wake`].
-    pub(super) fn tx_wake(&self) -> bool {
+    pub(in crate::i2c) fn tx_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_ready()
     }
 
     /// Enable or disable the RX DMA request path (SDER[RDDE]).
-    pub(super) fn set_rx_dma(&self, enable: bool) {
+    pub(in crate::i2c) fn set_rx_dma(&self, enable: bool) {
         self.modify_sder(|w| w.set_rdde(enable));
     }
 
     /// Enable or disable the TX DMA request path (SDER[TDDE]).
-    pub(super) fn set_tx_dma(&self, enable: bool) {
+    pub(in crate::i2c) fn set_tx_dma(&self, enable: bool) {
         self.modify_sder(|w| w.set_tdde(enable));
     }
 
     /// Address of the RX data register, for DMA descriptors.
-    pub(super) fn rx_data_ptr(&self) -> *const u8 {
+    pub(in crate::i2c) fn rx_data_ptr(&self) -> *const u8 {
         &self.regs.srdr as *const _ as *const u8
     }
 
     /// Address of the TX data register, for DMA descriptors.
-    pub(super) fn tx_data_ptr(&self) -> *mut u8 {
+    pub(in crate::i2c) fn tx_data_ptr(&self) -> *mut u8 {
         &self.regs.stdr as *const _ as *mut u8
     }
 
@@ -209,7 +216,7 @@ impl TargetRegisters {
     /// (armed), which is what classification keys on; an RSF-only wake
     /// would classify against a stale SASR. The general-call and
     /// SMBus-alert sources are driver configuration, passed in.
-    pub(super) fn enable_listen_interrupts(&self, general_call: bool, smbus_alert: bool) {
+    pub(in crate::i2c) fn enable_listen_interrupts(&self, general_call: bool, smbus_alert: bool) {
         self.write_sier(|w| {
             w.set_sarie(smbus_alert);
             w.set_gcie(general_call);
@@ -228,7 +235,7 @@ impl TargetRegisters {
     /// Anywhere a snapshot is being classified,
     /// [`Self::take_listen_event`]'s same-snapshot clear is the API —
     /// there is deliberately no generic clear.
-    pub(super) fn clear_stale_events(&self) {
+    pub(in crate::i2c) fn clear_stale_events(&self) {
         let mut v = Ssr(0);
         v.set_rsf(true);
         v.set_sdf(true);
@@ -245,7 +252,7 @@ impl TargetRegisters {
     /// single priority order: faults, then the address family (GCF and
     /// SARF are classification tags on address-valid), then transmit-
     /// ACK, repeated START, STOP.
-    pub(super) fn take_listen_event(&self) -> ListenEvent {
+    pub(in crate::i2c) fn take_listen_event(&self) -> ListenEvent {
         let ssr = self.ssr();
         let mut w = Ssr(0);
         w.set_rsf(ssr.rsf());
@@ -280,7 +287,7 @@ impl TargetRegisters {
         }
     }
 
-    pub(super) fn reset_fifos(&self) {
+    pub(in crate::i2c) fn reset_fifos(&self) {
         critical_section::with(|_| {
             self.modify_scr(|w| {
                 w.set_rtf(ScrRtf::NowEmpty);
@@ -294,7 +301,7 @@ impl TargetRegisters {
     /// valid), then faults, then termination flags. Returns `None` to
     /// keep waiting. SDF/RSF/BEF/FEF are not consumed here; the respond
     /// flow's status lifecycle owns their clearing.
-    pub(super) fn rx_event(&self) -> Option<TargetRxEvent> {
+    pub(in crate::i2c) fn rx_event(&self) -> Option<TargetRxEvent> {
         let ssr = self.ssr();
         if ssr.rdf() {
             return Some(TargetRxEvent::Byte(Srdr(self.regs.srdr.get()).data()));
@@ -316,14 +323,14 @@ impl TargetRegisters {
 
     /// Non-consuming readiness check for [`Self::rx_event`], for use in
     /// wake conditions.
-    pub(super) fn rx_ready(&self) -> bool {
+    pub(in crate::i2c) fn rx_ready(&self) -> bool {
         let ssr = self.ssr();
         ssr.rdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
     }
 
     /// One step of transmit progress: faults first (the transfer is
     /// compromised), then termination, then room.
-    pub(super) fn tx_step(&self) -> Option<TargetTxStep> {
+    pub(in crate::i2c) fn tx_step(&self) -> Option<TargetTxStep> {
         let ssr = self.ssr();
         if ssr.bef() {
             return Some(TargetTxStep::Fault(TargetFault::Bit));
@@ -342,7 +349,7 @@ impl TargetRegisters {
 
     /// Non-consuming readiness check for [`Self::tx_step`], for use in
     /// wake conditions.
-    pub(super) fn tx_ready(&self) -> bool {
+    pub(in crate::i2c) fn tx_ready(&self) -> bool {
         let ssr = self.ssr();
         ssr.tdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
     }
@@ -356,13 +363,13 @@ impl TargetRegisters {
     /// leaves the waiter re-arming a still-latched, level-triggered
     /// source forever. The caller's status read classifies and clears
     /// them.
-    pub(super) fn listen_ready(&self) -> bool {
+    pub(in crate::i2c) fn listen_ready(&self) -> bool {
         let ssr = self.ssr();
         ssr.avf() || ssr.sarf() || ssr.gcf() || ssr.sdf() || ssr.bef() || ssr.fef()
     }
 
     /// Push one byte into the target transmit register.
-    pub(super) fn push_tx(&self, byte: u8) {
+    pub(in crate::i2c) fn push_tx(&self, byte: u8) {
         let mut v = Stdr(0);
         v.set_data(byte);
         self.regs.stdr.set(v.0);
@@ -383,7 +390,7 @@ impl TargetRegisters {
     /// other `*_wake` pairs. The DMA-completion disjunct is the
     /// channel's own wait cell and is OR'd in by the caller — it is
     /// not an SIER source and cannot drift from this set.
-    pub(super) fn dma_transfer_wake(&self) -> bool {
+    pub(in crate::i2c) fn dma_transfer_wake(&self) -> bool {
         self.enable_dma_transfer_interrupts();
         self.dma_transfer_event()
     }
@@ -413,7 +420,7 @@ impl TargetRegisters {
     /// loop ends at buffer capacity or on the first non-data event —
     /// which is NOT consumed, so the caller's classification still
     /// sees it.
-    pub(super) fn drain_rx(&self, data: &mut [u8], mut from: usize) -> usize {
+    pub(in crate::i2c) fn drain_rx(&self, data: &mut [u8], mut from: usize) -> usize {
         while from < data.len() {
             match self.rx_event() {
                 Some(TargetRxEvent::Byte(b)) => {
@@ -431,7 +438,7 @@ impl TargetRegisters {
     /// residue with no room left outranks termination (the caller must
     /// defer, or the residue is marooned into the next transaction),
     /// after faults, before STOP/repeated-START. Consumes nothing.
-    pub(super) fn rx_chunk_end(&self, chunk_full: bool) -> RxChunkEnd {
+    pub(in crate::i2c) fn rx_chunk_end(&self, chunk_full: bool) -> RxChunkEnd {
         let ssr = self.ssr();
         if ssr.bef() {
             RxChunkEnd::Fault(TargetFault::Bit)
@@ -452,7 +459,7 @@ impl TargetRegisters {
     /// single flag-priority order: bit error before FIFO error
     /// (matching [`Self::rx_event`]/[`Self::tx_step`]), faults before
     /// termination. Consumes nothing.
-    pub(super) fn chunk_end(&self) -> ChunkEnd {
+    pub(in crate::i2c) fn chunk_end(&self) -> ChunkEnd {
         let ssr = self.ssr();
         if ssr.bef() {
             ChunkEnd::Fault(TargetFault::Bit)
@@ -472,7 +479,7 @@ impl TargetRegisters {
 /// [`TargetRegisters::rx_chunk_end`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum RxChunkEnd {
+pub(in crate::i2c) enum RxChunkEnd {
     /// A fault; the transfer is compromised.
     Fault(TargetFault),
     /// Data is still pending with no room left in the chunk — defer
@@ -491,7 +498,7 @@ pub(super) enum RxChunkEnd {
 /// [`TargetRegisters::chunk_end`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum ChunkEnd {
+pub(in crate::i2c) enum ChunkEnd {
     /// A fault; the transfer is compromised.
     Fault(TargetFault),
     /// The controller issued a STOP.

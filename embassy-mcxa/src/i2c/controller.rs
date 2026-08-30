@@ -68,7 +68,7 @@ use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
 use super::controller_registers::{
-    ControllerCommand, ControllerRegisters, ControllerStatus, ControllerStatusError, RxStep, TxStep,
+    ControllerCommand, ControllerRegisters, ControllerStatusError, HaltSlot, HaltedFault, RxStep, TransferFault, TxStep,
 };
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -335,13 +335,28 @@ struct Session {
     /// before the STOP (see `remediate`), and the wire direction is
     /// not observable from the registers.
     read: bool,
+    /// A transfer-time NDF/FEF observation that must be resolved by
+    /// this session's cleanup, rather than rediscovered from a later
+    /// status read. It is populated immediately before the error path
+    /// drops the session.
+    halt: HaltSlot,
 }
 
 impl Session {
+    /// Convert a classified fault to the public error only after a
+    /// halting observation has been made this session's cleanup proof.
+    fn bind_fault(&mut self, fault: TransferFault) -> IOError {
+        self.halt.capture(fault).into()
+    }
+
     /// Consume without recovery: the transaction reached its defined
     /// end (a STOP physically completed, or a successor START took it
     /// over on the wire).
     fn defuse(self) {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was marked complete"
+        );
         self.info
             .session_open
             .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -365,7 +380,12 @@ impl Drop for Session {
         } else {
             Abort::General
         };
-        remediate(&ControllerRegisters::new(self.info.regs()), self.timeout, abort);
+        let regs = ControllerRegisters::new(self.info.regs());
+        if let Some(halt) = self.halt.take() {
+            remediate_halted(&regs, self.timeout, abort, halt);
+        } else {
+            remediate(&regs, self.timeout, abort);
+        }
         self.info
             .session_open
             .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -399,76 +419,95 @@ enum Abort {
     ReadStreaming,
 }
 
-/// Self-contained bus recovery: reset the FIFOs, clear the latched
-/// faults, push a recovery STOP, wait (bounded) for it to drain, and
-/// leave a clean slate. Free-standing so [`Session`]'s drop can run it
-/// without borrowing the controller; `I2c::remediation` is the same
-/// code.
-/// A halting fault (NDF/FEF) latched on a busy engine. Whether the
-/// hardware auto-STOP ends the transaction was decided AT THE FAULT
-/// INSTANT (RM 40.7.1.5: NACK with a non-empty command FIFO), and
-/// TXCOUNT read now says nothing about it — recovery's own queued
-/// close, or a suffix byte queued after the fault, both make it
-/// nonzero — so the sub-case is resolved by OBSERVATION, never by
-/// inspecting the FIFO:
+/// A failure detected while waiting for command-FIFO space.
 ///
-/// * a fired auto-STOP idles the engine on its own within a short
-///   grace (a STOP is a bit-time; the grace covers scheduling and
-///   moderate stretch) — the abort is then fully resolved and the
-///   trailing cleanup discards whatever is left queued;
-/// * no idle within the grace means no auto-STOP is coming (the FIFO
-///   was empty at the fault): the bus is held mid-transaction and
-///   the engine is HALTED over its frozen pipeline. NDF/FEF genuinely
-///   halt (the spurious-latch families on this silicon are
-///   ALF/SDF/EPF), and a FIFO reset on a *halted* engine is safe — it
-///   is the actively-running case that corrupts — so the frozen
-///   pipeline (any suffix included) is discarded FIRST, then the halt
-///   cleared over the empty FIFO, and the caller's drain runs the
-///   manual close. Nothing stale can replay, and no deadline is
-///   burned waiting for a STOP that cannot arrive. (Residual trade: a
-///   target stretching a fired auto-STOP past the grace lands in the
-///   reset-while-executing hazard; that ends bounded in the drain's
-///   deadline escalation, and beats delivering stale bytes.)
-///
-/// Returns whether the abort is fully resolved.
-fn wait_out_halting_fault(
-    regs: &ControllerRegisters,
-    timeout: embassy_time::Duration,
-    deadline: embassy_time::Instant,
-) -> bool {
-    // Fast path — and the one place TXCOUNT is sound: EMPTY now means
-    // nothing is queued, so there is nothing a clear could replay,
-    // whatever the auto-STOP history. Clear the halt and let the
-    // drain close manually (a stretch-executing auto-STOP just
-    // finishes underneath; a close it obsoletes ends in the drain's
-    // bogus-close break).
-    if regs.tx_pending() == 0 {
-        regs.clear_all_status();
-        return false;
-    }
-    // The observation window scales with the configured timeout:
-    // heavy stretchers are configured with a larger transfer_timeout
-    // (its own doc says to raise it), and a LEGALLY stretched
-    // auto-STOP must not be reset mid-execution just because it
-    // outlived a fixed window. Floored for scheduling margin, clamped
-    // to the caller's remaining budget (a caller already past its
-    // deadline gets the bounded ending immediately — no fresh
-    // window).
-    let grace_len = core::cmp::max(embassy_time::Duration::from_millis(2), timeout / 8);
-    let now = embassy_time::Instant::now();
-    let grace_end = core::cmp::min(now + grace_len, deadline);
-    while regs.master_busy() {
-        regs.discard_rx();
-        if embassy_time::Instant::now() > grace_end {
-            regs.reset_fifos();
-            regs.clear_all_status();
-            return false;
+/// Timeout is not a hardware status proof. Every status-derived arm is a
+/// [`TransferFault`], which remains opaque until it reaches the
+/// start-recovery owner or the live [`Session`].
+#[must_use]
+enum TxRoomFailure {
+    Timeout,
+    Fault(TransferFault),
+}
+
+/// A DMA wait can end because the controller stopped without a status
+/// fault, or because it produced a typed hardware fault. Keep those two
+/// cases distinct until the live session has consumed any halt proof.
+#[must_use]
+enum DmaWaitError {
+    Fault(TransferFault),
+    UnexpectedStop,
+}
+
+impl TxRoomFailure {
+    /// Resolve a failure before any session has been minted.
+    fn recover_before_start(self, regs: &ControllerRegisters, timeout: embassy_time::Duration) -> IOError {
+        match self {
+            Self::Timeout => {
+                remediate(regs, timeout, Abort::General);
+                IOError::Timeout
+            }
+            Self::Fault(fault) => recover_transfer_fault(regs, timeout, Abort::General, fault),
         }
     }
-    true
+
+    /// Transfer a halt proof into the session that owns recovery.
+    fn bind_session(self, session: &mut Session) -> IOError {
+        match self {
+            Self::Timeout => IOError::Timeout,
+            Self::Fault(fault) => session.bind_fault(fault),
+        }
+    }
+}
+
+/// Select the recovery shape for a transfer fault. An address NACK has
+/// no ACKing target, so its manual close is always the general form;
+/// every other class retains the caller's known wire direction.
+fn recovery_abort_for(error: ControllerStatusError, abort: Abort) -> Abort {
+    match error {
+        ControllerStatusError::AddressNack => Abort::General,
+        ControllerStatusError::ArbitrationLoss | ControllerStatusError::Fifo | ControllerStatusError::PinLowTimeout => {
+            abort
+        }
+    }
+}
+
+/// Resolve a classified fault before a live session exists. Once a
+/// session has been minted, use [`Session::bind_fault`] instead so its
+/// drop path remains the single recovery owner.
+fn recover_transfer_fault(
+    regs: &ControllerRegisters,
+    timeout: embassy_time::Duration,
+    abort: Abort,
+    fault: TransferFault,
+) -> IOError {
+    let mut halt = HaltSlot::empty();
+    let error = halt.capture(fault);
+    let abort = recovery_abort_for(error, abort);
+    match halt.take() {
+        Some(halt) => remediate_halted(regs, timeout, abort, halt),
+        None => remediate(regs, timeout, abort),
+    }
+    error.into()
 }
 
 fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort) {
+    remediate_inner(regs, timeout, abort, None);
+}
+
+/// Recover using a halt proof retained by the transaction that observed
+/// it. This avoids a second status observation between the API error and
+/// the session's cleanup.
+fn remediate_halted(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort, halt: HaltedFault) {
+    remediate_inner(regs, timeout, abort, Some(halt));
+}
+
+fn remediate_inner(
+    regs: &ControllerRegisters,
+    timeout: embassy_time::Duration,
+    abort: Abort,
+    known_halt: Option<HaltedFault>,
+) {
     #[cfg(feature = "defmt")]
     defmt::trace!("Recovering controller",);
 
@@ -492,7 +531,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     //
     // The busy entry must ALSO not clear flags blindly: a latched
     // NDF/FEF is what holds a halted engine off its stale pipeline
-    // (see `take_status_preserving_halts`), so the halting classes
+    // (see `take_active_fault`), so the halting classes
     // are recognized FIRST — the auto-STOP is waited out and the
     // pipeline discarded, or (empty FIFO: nothing to replay, no
     // auto-STOP coming) the halt is cleared for the drain's manual
@@ -501,17 +540,18 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     let deadline = embassy_time::Instant::now() + timeout;
     let busy = regs.master_busy();
     let mut resolved = false;
-    if !busy {
+    if let Some(halt) = known_halt {
+        // The transaction owner observed this exact NDF/FEF before
+        // returning its error. Resolve that proof directly instead of
+        // relying on the drop path to rediscover a latched bit.
+        resolved = regs.resolve_owned_halt(halt, timeout, deadline);
+    } else if !busy {
         // Idle entry: nothing is running — dropping the stale
         // pipeline and clearing everything is unconditionally safe.
-        regs.reset_fifos();
-        regs.clear_all_status();
+        regs.discard_idle_recovery_state();
     } else {
-        match regs.recovery_fault_step() {
-            Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
-                resolved = wait_out_halting_fault(regs, timeout, deadline);
-            }
-            _ => {}
+        if let Some(halt) = regs.observe_recovery_halt() {
+            resolved = regs.resolve_halted_fault(halt, timeout, deadline);
         }
     }
 
@@ -592,7 +632,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
             // is CLASS-specific (recovery has no caller to classify
             // for, but it must still read the flags honestly — one
             // snapshot, clearing only what that snapshot's class
-            // permits; see `recovery_fault_step`):
+            // permits; see `observe_recovery_halt`):
             //
             // * ALF/PLTF may be SPURIOUS on this silicon — latched on
             //   a transfer that is still running — so the step scrubs
@@ -604,27 +644,24 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
             //   then ends.
             // * NDF/FEF are real sequencing verdicts, and the latched
             //   flag is what keeps the stale pipeline frozen —
-            //   `wait_out_halting_fault` waits out the hardware
+            //   `resolve_halted_fault` waits out the hardware
             //   auto-STOP and the abort is done (trailing reset
             //   discards everything, the close included), or, with an
             //   empty FIFO, clears the halt and the drain runs the
             //   manual close.
-            match regs.recovery_fault_step() {
-                Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
-                    if wait_out_halting_fault(regs, timeout, deadline) {
-                        break;
-                    }
-                    // Unresolved: the no-auto-STOP path just discarded
-                    // the frozen pipeline — the drain's own queued
-                    // close included. Re-queue it, or every exit
-                    // condition goes dead (settled needs the close to
-                    // run; the idle-pending break needs something
-                    // pending) and the loop would burn the deadline
-                    // into the engine reset.
-                    queued = false;
-                    idle_since = None;
+            if let Some(halt) = regs.observe_recovery_halt() {
+                if regs.resolve_halted_fault(halt, timeout, deadline) {
+                    break;
                 }
-                _ => {}
+                // Unresolved: the no-auto-STOP path just discarded
+                // the frozen pipeline — the drain's own queued
+                // close included. Re-queue it, or every exit
+                // condition goes dead (settled needs the close to
+                // run; the idle-pending break needs something
+                // pending) and the loop would burn the deadline
+                // into the engine reset.
+                queued = false;
+                idle_since = None;
             }
 
             // A target holding SCL low satisfies no exit condition,
@@ -635,7 +672,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
             if embassy_time::Instant::now() > deadline {
                 #[cfg(feature = "defmt")]
                 defmt::warn!("recovery close did not settle within the transfer timeout; resetting the engine");
-                regs.reset_engine();
+                regs.reset_after_recovery_timeout();
                 break;
             }
         }
@@ -644,11 +681,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     // Now provably past the active abort (or hard-reset): drop
     // whatever remains queued or received so the next transaction
     // starts from a clean slate.
-    regs.reset_fifos();
-
-    // Clear any residual MSR flags raised by the recovery close
-    // (FEF in particular) so the next transaction starts clean.
-    regs.clear_current_status();
+    regs.finish_recovery();
 }
 
 /// I2C controller configuration
@@ -845,13 +878,13 @@ impl<'d, M: Mode> I2c<'d, M> {
     fn set_configuration(&self, config: &Config) {
         // One-time cross-check of the Tock register map against the
         // PAC's generated accessors (catches layout drift in either).
-        super::lpi2c_regs::check_layout(self.info.regs());
+        ControllerRegisters::check_layout(self.info.regs());
 
         // Disable the controller.
         critical_section::with(|_| self.info.regs().mcr().modify(|w| w.set_men(false)));
 
         // Soft-reset the controller, read and write FIFOs.
-        self.reset_fifos();
+        self.registers().reset_while_disabled();
         critical_section::with(|_| {
             self.info.regs().mcr().modify(|w| w.set_rst(true));
             // According to Reference Manual section 40.7.1.4, "There
@@ -888,16 +921,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         });
 
         // Clear all flags.
-        self.registers().clear_all_status();
-    }
-
-    /// Recovery for non-read-abort contexts: START failures before the
-    /// address went out, STOP failures (data phase already complete),
-    /// and fault-halted engines (`take_status_and_recover`), where a
-    /// bare recovery STOP always forms. Read-abort contexts carry
-    /// their direction instead — see [`Session`] and the start guards.
-    fn remediation(&self) {
-        remediate(&self.registers(), self.timeout, Abort::General);
+        self.registers().clear_after_init();
     }
 
     /// Consume a session at its defined end, asserting it belongs to
@@ -946,12 +970,8 @@ impl<'d, M: Mode> I2c<'d, M> {
             info: self.info,
             timeout: self.timeout,
             read,
+            halt: HaltSlot::empty(),
         }
-    }
-
-    /// Resets both TX and RX FIFOs dropping their contents.
-    fn reset_fifos(&self) {
-        self.registers().reset_fifos();
     }
 
     /// Blocking wait for the command FIFO to drain (or a fault to
@@ -974,34 +994,17 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// caller's context: `start`/`stop` recover directly (no session
     /// exists there), everywhere else the live [`Session`]'s drop is
     /// the single recoverer.
-    fn wait_tx_room(&self) -> Result<(), IOError> {
+    fn wait_tx_room(&self) -> Result<(), TxRoomFailure> {
         let deadline = embassy_time::Instant::now() + self.timeout;
         loop {
             if embassy_time::Instant::now() > deadline {
-                return Err(IOError::Timeout);
+                return Err(TxRoomFailure::Timeout);
             }
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => return Ok(()),
-                Some(TxStep::Fault(_)) => {
-                    // Halt-preserving: a latched NDF/FEF keeps the
-                    // engine frozen off any queued commands until the
-                    // recovery owner (the caller's context) acts.
-                    if let Err(e) = self.parse_status(self.registers().take_status_preserving_halts()) {
-                        return Err(e);
-                    }
-                    // The flag cleared concurrently; keep waiting.
-                }
+                Some(TxStep::Fault(fault)) => return Err(TxRoomFailure::Fault(fault)),
                 None => {}
             }
-        }
-    }
-
-    /// Parses the controller status producing an
-    /// appropriate `Result<(), Error>` variant.
-    fn parse_status(&self, status: ControllerStatus) -> Result<(), IOError> {
-        match status.error() {
-            Some(e) => Err(e.into()),
-            None => Ok(()),
         }
     }
 
@@ -1024,30 +1027,16 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// sitting on exactly the target-drives-SDA wire state whose bare
     /// STOP wedges the engine (see [`Abort::ReadAddressed`]).
     fn take_status_and_recover(&self, abort: Abort) -> Result<(), IOError> {
-        // Halt-preserving take: a latched NDF/FEF keeps the engine
+        // Halt-preserving observation: a latched NDF/FEF keeps the engine
         // frozen off whatever is still queued until `remediate` — the
         // continue shape queues its repeated START while the write
         // half is still draining, and a plain take's clear would let
         // that stale START fetch and replay on the wire in the gap.
-        let status = self.parse_status(self.registers().take_status_preserving_halts());
-        match status {
-            Err(IOError::AddressNack) => {
-                // Either the bus is still held (the RM 40.7.1.5
-                // manual STOP is due) or the hardware auto-STOPped
-                // with the aborted commands still queued (where doing
-                // nothing lets a stale command replay later).
-                // `remediate` resolves both: a held bus gets the
-                // close, a stale pipeline gets discarded. A NACK
-                // means nobody ACKed — nothing drives SDA — so the
-                // General close always forms.
-                remediate(&self.registers(), self.timeout, Abort::General);
-            }
-            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout) => {
-                remediate(&self.registers(), self.timeout, abort);
-            }
-            _ => {}
+        let regs = self.registers();
+        match regs.take_start_status() {
+            Ok(()) => Ok(()),
+            Err(fault) => Err(recover_transfer_fault(&regs, self.timeout, abort, fault)),
         }
-        status
     }
 
     /// Inserts the given command into the outgoing FIFO.
@@ -1098,10 +1087,10 @@ impl<'d, M: Mode> I2c<'d, M> {
         // yet, so every failure class recovers HERE (`wait_tx_room` is
         // classification-only). The START is not on the wire yet, so
         // this is not a read abort.
-        if let Err(e) = self.wait_tx_room() {
-            self.remediation();
+        if let Err(failure) = self.wait_tx_room() {
+            let error = failure.recover_before_start(&self.registers(), self.timeout);
             self.unreserve_session();
-            return Err(e);
+            return Err(error);
         }
 
         let addr_rw = address << 1 | if read { 1 } else { 0 };
@@ -1144,26 +1133,30 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// stretched STOP that never completed within the timeout — drops
     /// the session, whose recovery closes the transaction. Nothing
     /// here recovers explicitly, so recovery stays exactly-once.
-    fn stop(&self, open: Session) -> Result<(), IOError> {
-        self.wait_tx_room()?;
+    fn stop(&self, mut open: Session) -> Result<(), IOError> {
+        if let Err(failure) = self.wait_tx_room() {
+            return Err(failure.bind_session(&mut open));
+        }
 
         self.send_cmd(ControllerCommand::STOP, 0);
 
         let deadline = embassy_time::Instant::now() + self.timeout;
-        loop {
+        let completed = loop {
             match self.registers().stop_step() {
-                Some(Ok(())) => break,
-                Some(Err(e)) => return Err(e.into()),
+                Some(Ok(completed)) => break completed,
+                Some(Err(fault)) => return Err(open.bind_fault(fault)),
                 None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
                 None => {}
             }
-        }
+        };
 
         // Completion is not a status read: one final snapshot both
         // classifies a fault that latched in the last poll gap as this
         // transaction's own, and clears the STOP's residual flags so
         // the next START does not misattribute them.
-        self.parse_status(self.registers().take_status())?;
+        if let Err(fault) = self.registers().finish_stop(completed) {
+            return Err(open.bind_fault(fault));
+        }
         self.consume_session(open);
         Ok(())
     }
@@ -1223,7 +1216,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// trailing STOP. Every error return drops `open` — the session's
     /// drop is the single recovery for any abort past the address
     /// phase.
-    fn blocking_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+    fn blocking_read_chained(&self, read: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         let total = read.len();
         // Chain RECEIVE commands under the single address phase: the
         // controller ACKs across a command boundary only when the next
@@ -1253,7 +1246,7 @@ impl<'d, M: Mode> I2c<'d, M> {
                         self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                         queued += chunk;
                     }
-                    Some(TxStep::Fault(e)) => return Err(e.into()),
+                    Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     // Command FIFO full: plenty is queued ahead of
                     // the data; go drain some of it.
                     None => break,
@@ -1269,7 +1262,7 @@ impl<'d, M: Mode> I2c<'d, M> {
                     drained += 1;
                     deadline = embassy_time::Instant::now() + self.timeout;
                 }
-                Some(RxStep::Fault(e)) => return Err(e.into()),
+                Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                 Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // No progress for a full timeout window: the
                 // transfer died without a flag.
@@ -1310,7 +1303,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Drain ONE seam chunk (at most 256 bytes, one RECEIVE command)
     /// on the open transaction. Error returns drop the session, whose
     /// recovery closes the transaction.
-    fn blocking_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+    fn blocking_read_seam_chunk(&self, chunk: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         // No wait for room: the start transition returned only after
         // the command FIFO drained, so one command always fits — and
         // like the async/DMA seam chunks, the RECEIVE must be the
@@ -1326,7 +1319,7 @@ impl<'d, M: Mode> I2c<'d, M> {
                         deadline = embassy_time::Instant::now() + self.timeout;
                         break b;
                     }
-                    Some(RxStep::Fault(e)) => return Err(e.into()),
+                    Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                     // No progress for a full timeout window: Timeout,
                     // like the chained and async paths —
@@ -1361,7 +1354,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// aborts the transaction with TRANSMIT commands still queued and
     /// the bus held; the error returns drop `open`, whose recovery
     /// cleans both up.
-    fn blocking_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
+    fn blocking_write_body(&self, write: &[u8], mut open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -1380,7 +1373,9 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         for byte in write {
             // Wait until we have space in the TxFIFO
-            self.wait_tx_room()?;
+            if let Err(failure) = self.wait_tx_room() {
+                return Err(failure.bind_session(&mut open));
+            }
 
             self.send_cmd(ControllerCommand::TRANSMIT, *byte);
         }
@@ -1610,7 +1605,7 @@ where
     /// pollution, see `enable_error_interrupts`), so the tail from
     /// "pulled" to "bus idle" is a bounded poll: a bit-time normally,
     /// a clock stretch capped by the deadline pathologically.
-    async fn async_stop(&self, open: Session) -> Result<(), IOError> {
+    async fn async_stop(&self, mut open: Session) -> Result<(), IOError> {
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
@@ -1628,10 +1623,10 @@ where
         }
 
         let mut spins = 0u32;
-        loop {
+        let completed = loop {
             match self.registers().stop_step() {
-                Some(Ok(())) => break,
-                Some(Err(e)) => return Err(e.into()),
+                Some(Ok(completed)) => break completed,
+                Some(Err(fault)) => return Err(open.bind_fault(fault)),
                 None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
                 // Cooperative AND cancellable: the tail from "pulled"
                 // to "bus idle" has no interrupt to sleep on, and with
@@ -1659,10 +1654,12 @@ where
                     embassy_time::Timer::after(step).await;
                 }
             }
-        }
+        };
 
         // See `stop`: classify-and-clear as this transaction's own.
-        self.parse_status(self.registers().take_status())?;
+        if let Err(fault) = self.registers().finish_stop(completed) {
+            return Err(open.bind_fault(fault));
+        }
         self.consume_session(open);
         Ok(())
     }
@@ -1901,7 +1898,7 @@ impl<'d> I2c<'d, Async> {
     /// return or this future dropped mid-await — drops `open`, whose
     /// recovery closes the transaction; no separate guard exists to
     /// stack a second recovery on top.
-    async fn async_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+    async fn async_read_chained(&self, read: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         let total = read.len();
         // First command unconditionally — see `blocking_read_chained`.
         let first = total.min(256);
@@ -1925,7 +1922,7 @@ impl<'d> I2c<'d, Async> {
                         self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                         queued += chunk;
                     }
-                    Some(TxStep::Fault(e)) => return Err(e.into()),
+                    Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     // Command FIFO full: plenty is queued ahead of the
                     // data; go drain some of it.
                     None => break,
@@ -1950,7 +1947,7 @@ impl<'d> I2c<'d, Async> {
                 }
                 // Surface the fault that woke us. If the flag cleared
                 // in between, loop back and wait again.
-                Some(RxStep::Fault(e)) => return Err(e.into()),
+                Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                 Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // Nothing pending after a full timeout window: the
                 // transfer stalled or died without a flag.
@@ -1990,7 +1987,7 @@ impl<'d> I2c<'d, Async> {
     /// on the open transaction. Aborts — error returns and
     /// drop-cancellation alike — drop the session, whose recovery
     /// closes the transaction.
-    async fn async_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+    async fn async_read_seam_chunk(&self, chunk: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
         for byte in chunk.iter_mut() {
@@ -2011,7 +2008,7 @@ impl<'d> I2c<'d, Async> {
                         *byte = b;
                         break;
                     }
-                    Some(RxStep::Fault(e)) => return Err(e.into()),
+                    Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
                     None if timed_out => return Err(IOError::Timeout),
                     None => {}
@@ -2025,7 +2022,7 @@ impl<'d> I2c<'d, Async> {
     /// The write engine past the address phase. Aborts — error returns
     /// and drop-cancellation alike — drop `open`, whose recovery
     /// closes the transaction.
-    async fn async_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
+    async fn async_write_body(&self, write: &[u8], mut open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -2073,7 +2070,9 @@ impl<'d> I2c<'d, Async> {
             // delivers the suffix to the target AFTER this call
             // returned failure. Preserved, the suffix stays frozen
             // until the session drop discards it.
-            self.parse_status(self.registers().take_status_preserving_halts())?;
+            if let Some(fault) = self.registers().take_active_fault() {
+                return Err(open.bind_fault(fault));
+            }
         }
 
         Ok(open)
@@ -2211,8 +2210,9 @@ impl<'d> I2c<'d, Dma<'d>> {
 
     /// Run one RX DMA transfer covering `buf`, waking on completion or on
     /// a bus fault (which would otherwise leave the DMA waiting forever).
-    /// The caller owns command queueing and recovery (OnDrop).
-    async fn dma_read_into(&self, buf: &mut [u8]) -> Result<(), IOError> {
+    /// The caller owns command queueing; this function binds any halting
+    /// fault to `open` before its public `IOError` can escape.
+    async fn dma_read_into(&self, buf: &mut [u8], open: &mut Session) -> Result<(), IOError> {
         let peri_addr = self.registers().rx_data_ptr();
 
         unsafe {
@@ -2257,24 +2257,33 @@ impl<'d> I2c<'d, Dma<'d>> {
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
             // The interrupt handler disables MIER on wake; re-arm the
             // error sources and check, as one operation.
-            if let Some(e) = self.registers().error_wake() {
-                return core::task::Poll::Ready(Err(IOError::from(e)));
+            if let Some(fault) = self.registers().error_wake() {
+                return core::task::Poll::Ready(Err(DmaWaitError::Fault(fault)));
             }
             // Early termination with the DMA incomplete: no more data
             // will arrive and the DMA would wait forever.
             if self.registers().transfer_ended() {
-                return core::task::Poll::Ready(Err(IOError::UnexpectedStop));
+                return core::task::Poll::Ready(Err(DmaWaitError::UnexpectedStop));
             }
             core::task::Poll::Pending
         });
         // ~1 ms/byte of margin on top of a generous floor.
         let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
         match embassy_time::with_timeout(bound, wait).await {
-            Ok(r) => r?,
+            Ok(Ok(())) => {}
+            Ok(Err(DmaWaitError::Fault(fault))) => return Err(open.bind_fault(fault)),
+            Ok(Err(DmaWaitError::UnexpectedStop)) => return Err(IOError::UnexpectedStop),
             Err(_) => return Err(IOError::Timeout),
         }
 
         self.finish_rx_dma();
+
+        // Completion and a bus error can race: the polling fast path sees
+        // the completed major loop first, so take one final typed status
+        // snapshot only after the channel is quiesced.
+        if let Some(fault) = self.registers().take_active_fault() {
+            return Err(open.bind_fault(fault));
+        }
 
         Ok(())
     }
@@ -2333,7 +2342,7 @@ impl<'d> I2c<'d, Dma<'d>> {
     /// and before `read`'s borrow ends (an in-flight minor loop would
     /// write into it after this future unwound; `disable_request`
     /// alone does not wait for that loop).
-    async fn dma_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+    async fn dma_read_chained(&self, read: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         let quiesce = OnDrop::new(|| {
             self.finish_rx_dma();
         });
@@ -2351,13 +2360,13 @@ impl<'d> I2c<'d, Dma<'d>> {
                     self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
                     queued += chunk;
                 }
-                Some(TxStep::Fault(e)) => return Err(e.into()),
+                Some(TxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                 // Transiently full while the START drains.
                 None => {}
             }
         }
 
-        self.dma_read_into(read).await?;
+        self.dma_read_into(read, &mut open).await?;
 
         // `dma_read_into`'s completion path already quiesced the
         // channel; nothing is in flight past this point.
@@ -2394,7 +2403,7 @@ impl<'d> I2c<'d, Dma<'d>> {
     /// one DMA transfer) on the open transaction. Abort ordering as in
     /// [`Self::dma_read_chained`]: the quiesce guard drops before the
     /// session's recovery.
-    async fn dma_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+    async fn dma_read_seam_chunk(&self, chunk: &mut [u8], mut open: Session) -> Result<Session, IOError> {
         let quiesce = OnDrop::new(|| {
             self.finish_rx_dma();
         });
@@ -2402,7 +2411,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // send receive command
         self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
-        self.dma_read_into(chunk).await?;
+        self.dma_read_into(chunk, &mut open).await?;
 
         // The chunk is drained and its channel quiesced by
         // `dma_read_into`'s completion path.
@@ -2414,7 +2423,7 @@ impl<'d> I2c<'d, Dma<'d>> {
     /// in [`Self::dma_read_chained`]: the quiesce guard drops before
     /// the session, so the channel is provably idle before recovery
     /// touches the FIFOs and before `write`'s borrow ends.
-    async fn dma_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
+    async fn dma_write_body(&self, write: &[u8], mut open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -2478,21 +2487,30 @@ impl<'d> I2c<'d, Dma<'d>> {
                 while self.info.wait_cell().poll_wait(cx).is_ready() {}
                 // The interrupt handler disables MIER on wake; re-arm the
                 // error sources and check, as one operation.
-                if let Some(e) = self.registers().error_wake() {
-                    return core::task::Poll::Ready(Err(IOError::from(e)));
+                if let Some(fault) = self.registers().error_wake() {
+                    return core::task::Poll::Ready(Err(DmaWaitError::Fault(fault)));
                 }
                 core::task::Poll::Pending
             });
             // ~1 ms/byte of margin on top of a generous floor.
             let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
             match embassy_time::with_timeout(bound, wait).await {
-                Ok(r) => r?,
+                Ok(Ok(())) => {}
+                Ok(Err(DmaWaitError::Fault(fault))) => return Err(open.bind_fault(fault)),
+                Ok(Err(DmaWaitError::UnexpectedStop)) => unreachable!("TX DMA does not wait for receive termination"),
                 // The quiesce guard and the session drop handle this
                 // return, in that order.
                 Err(_) => return Err(IOError::Timeout),
             }
 
             self.finish_tx_dma();
+
+            // As in RX, a major-loop completion can win the poll race
+            // against a simultaneous controller fault. The channel is
+            // quiesced before the proof is handed to the session.
+            if let Some(fault) = self.registers().take_active_fault() {
+                return Err(open.bind_fault(fault));
+            }
         }
 
         // Every chunk is drained and the channel quiesced; the close

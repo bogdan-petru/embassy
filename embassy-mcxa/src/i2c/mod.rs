@@ -10,10 +10,22 @@ use crate::gpio::GpioPin;
 use crate::{interrupt, pac};
 
 pub mod controller;
-mod controller_registers;
-mod lpi2c_regs;
 pub mod target;
-mod target_registers;
+
+// The raw Tock register map is intentionally nested beneath the two
+// protocol facades. Driver modules can name `controller_registers` or
+// `target_registers`, but they cannot obtain the raw cells or cast a PAC
+// handle into them and bypass phase/ownership checks.
+mod register_facades {
+    #[path = "../controller_registers.rs"]
+    pub(in crate::i2c) mod controller_registers;
+    #[path = "../lpi2c_regs.rs"]
+    mod lpi2c_regs;
+    #[path = "../target_registers.rs"]
+    pub(in crate::i2c) mod target_registers;
+}
+
+pub(in crate::i2c) use register_facades::{controller_registers, target_registers};
 
 pub(crate) mod sealed {
     /// Seal a trait
