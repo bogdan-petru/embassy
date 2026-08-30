@@ -109,13 +109,22 @@ const OVER_CAPACITY: usize = 1100;
 const MAX_READ: usize = OVER_CAPACITY;
 
 /// Control message: a write of exactly [`CTRL_LEN`] bytes whose first
-/// four match this magic toggles the target's stateless-read mode
-/// (last byte: 0 = persistent cursor, nonzero = stateless) instead of
-/// committing data. The magic is unreachable by every generated test
-/// pattern: those are all arithmetic sequences xor a constant, and
-/// these bytes xor any constant are not consecutive.
+/// four match this magic is a command, not data. The last byte selects:
+/// 0 = persistent-cursor mode, 1 = stateless-read mode, 2 = arm the
+/// one-shot overflow probe (serve the next write with a
+/// [`OVERFLOW_PROBE_LEN`]-byte buffer — see `t_overflow_write`). The
+/// magic is unreachable by every generated test pattern: those are all
+/// arithmetic sequences xor a constant, and these bytes xor any
+/// constant are not consecutive.
 const CTRL_MAGIC: [u8; 4] = [0x5C, 0xC5, 0x3A, 0xA3];
 const CTRL_LEN: usize = 5;
+const CTRL_STATELESS_OFF: u8 = 0;
+const CTRL_STATELESS_ON: u8 = 1;
+const CTRL_ARM_OVERFLOW_PROBE: u8 = 2;
+
+/// Buffer size the overflow probe serves the next write with — small
+/// enough that a probe-length-plus-one write overflows it.
+const OVERFLOW_PROBE_LEN: usize = 8;
 
 /// Per-phase driver capabilities the tests key their expectations on.
 /// Typed and passed from the binary, where the engine type is concrete
@@ -245,11 +254,52 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
     // Stateless-read mode (see the task docs): toggled by the control
     // write, off by default.
     let mut stateless = false;
+    // One-shot overflow probe (see `t_overflow_write`): armed by the
+    // control write, consumed by the next Write request.
+    let mut overflow_probe = false;
 
     loop {
         let request = tgt.listen().await.unwrap();
         defmt::trace!("[T] event {}", request);
         match request {
+            Request::Write(_) if overflow_probe => {
+                overflow_probe = false;
+                // Serve this write with a deliberately small buffer so
+                // the controller's probe-length-plus-one write
+                // overflows it. On the DMA target the first respond
+                // must take the full-chunk-with-RDF-pending branch
+                // (`BufferFull` with the termination still latched)
+                // and the follow-up respond must take the terminal
+                // drain branch — the two residue paths the normal
+                // oversized scratch can never reach; the interrupt
+                // target follows the same contract via `rx_event`.
+                // The concatenated stream commits like a normal
+                // write, so the controller's read-back verifies the
+                // residue byte end to end.
+                let mut small = [0u8; OVERFLOW_PROBE_LEN + 8];
+                let s1 = tgt.respond_write(&mut small[..OVERFLOW_PROBE_LEN]).await.unwrap();
+                let n1 = match s1 {
+                    WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
+                    _ => 0,
+                };
+                let mut total = n1.min(OVERFLOW_PROBE_LEN);
+                if matches!(s1, WriteStatus::BufferFull(_)) {
+                    let s2 = tgt.respond_write(&mut small[total..]).await.unwrap();
+                    let n2 = match s2 {
+                        WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
+                        _ => 0,
+                    };
+                    let n2 = n2.min(small.len() - total);
+                    defmt::info!("[T] overflow probe: BufferFull({}) + residue {}", total, n2);
+                    total += n2;
+                } else {
+                    defmt::info!("[T] overflow probe: no overflow ({})", total);
+                }
+                for chunk in small[..total].chunks(BUF_LEN) {
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                }
+                cursor = 0;
+            }
             Request::Read(_) => {
                 if stateless {
                     // Every read transaction starts at the front; the
@@ -308,8 +358,16 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 // by the next anchored write before anything is
                 // verified.)
                 if n == CTRL_LEN && scratch[..4] == CTRL_MAGIC {
-                    stateless = scratch[4] != 0;
-                    defmt::info!("[T] stateless-read mode: {}", stateless);
+                    match scratch[4] {
+                        CTRL_ARM_OVERFLOW_PROBE => {
+                            overflow_probe = true;
+                            defmt::info!("[T] overflow probe armed");
+                        }
+                        m => {
+                            stateless = m != CTRL_STATELESS_OFF;
+                            defmt::info!("[T] stateless-read mode: {}", stateless);
+                        }
+                    }
                     continue;
                 }
                 // Commit in `BUF_LEN`-byte chunks, mirroring `Model::write`,
@@ -523,6 +581,7 @@ pub mod harness {
             "over_capacity",
             tests::t_over_capacity(ctrl, &mut model, &mut stats, caps)
         );
+        run_test!("overflow_write", tests::t_overflow_write(ctrl, &mut model, &mut stats));
         run_test!(
             "chunked_optin",
             tests::t_chunked_optin(ctrl, &mut model, &mut stats, caps)
@@ -1131,8 +1190,59 @@ pub mod tests {
         stats: &mut RetryStats,
         on: bool,
     ) -> TestResult {
-        let msg = [CTRL_MAGIC[0], CTRL_MAGIC[1], CTRL_MAGIC[2], CTRL_MAGIC[3], on as u8];
+        let mode = if on { CTRL_STATELESS_ON } else { CTRL_STATELESS_OFF };
+        let msg = [CTRL_MAGIC[0], CTRL_MAGIC[1], CTRL_MAGIC[2], CTRL_MAGIC[3], mode];
         op_write(ctrl, &msg, model, stats).await
+    }
+
+    /// Overflow probe: arm the target to serve the next write with a
+    /// deliberately small buffer, then write one byte more than it
+    /// holds. Exercises the `BufferFull` follow-up contract — and on
+    /// the DMA target, deterministically executes BOTH residue
+    /// branches of the driver's chunk read: the first respond hits
+    /// full-chunk-with-RDF-pending (the extra byte's DMA request is
+    /// never granted, the major loop having completed) and must report
+    /// `BufferFull`, and the follow-up respond hits the terminal drain
+    /// (data collected through `rx_event` before the latched
+    /// termination is honored). Neither branch is reachable through
+    /// the normal oversized scratch. The read-back proves the residue
+    /// byte survived end to end; the target's log says which path ran.
+    ///
+    /// A bus-error retry of the data write consumes the one-shot probe
+    /// and lands on the normal oversized path — the data contract is
+    /// identical, so the test stays green (and writes are effectively
+    /// immune to the read-side ALF quirk, so the probe path is the
+    /// overwhelmingly common one).
+    pub async fn t_overflow_write<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        // Arm (one-shot). A command, not data — nothing to commit.
+        let arm = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_ARM_OVERFLOW_PROBE,
+        ];
+        op_write(ctrl, &arm, model, stats).await?;
+
+        // One byte more than the probe buffer holds; distinct values.
+        let mut w = [0u8; OVERFLOW_PROBE_LEN + 1];
+        for (i, b) in w.iter_mut().enumerate() {
+            *b = 0xA0 | i as u8;
+        }
+        op_write(ctrl, &w, model, stats).await?;
+        model.write(&w);
+
+        let mut r = [0u8; OVERFLOW_PROBE_LEN + 1];
+        op_read(ctrl, &mut r, model, stats).await?;
+        if !model.check_read(&r) {
+            defmt::error!("overflow write: read-back mismatch got={:02x}", r);
+            return Err("overflow_write: mismatch");
+        }
+        Ok(())
     }
 
     /// Exercise the opt-in non-atomic path: with

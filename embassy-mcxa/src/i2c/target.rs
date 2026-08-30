@@ -1022,8 +1022,14 @@ impl<'d> I2c<'d, Dma<'d>> {
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
+            // Parity with the interrupt paths' fault arms: the error
+            // discards this transfer's accounting, so whatever the
+            // FIFOs still hold must not survive into the next
+            // transaction as its first bytes.
+            self.reset_fifos();
             Err(IOError::FifoError)
         } else if ssr.bef() {
+            self.reset_fifos();
             Err(IOError::BitError)
         } else if ssr.rdf() && bytes == chunk_len {
             // Data is still pending with no room left in this chunk —
@@ -1131,8 +1137,12 @@ impl<'d> I2c<'d, Dma<'d>> {
         let ssr = self.info.regs().ssr().read();
 
         if ssr.fef() {
+            // Parity with the interrupt paths' fault arms — see
+            // `read_dma_chunk`.
+            self.reset_fifos();
             Err(IOError::FifoError)
         } else if ssr.bef() {
+            self.reset_fifos();
             Err(IOError::BitError)
         } else if ssr.sdf() {
             Ok(TxChunkOutcome::Stopped(bytes))
