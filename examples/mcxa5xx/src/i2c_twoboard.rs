@@ -694,7 +694,7 @@ pub mod harness {
         // armed probe would otherwise partially swallow the sync
         // payload (the probe path handles control writes as commands,
         // so this scrub gets through regardless of stale state).
-        if let Err(e) = tests::t_audit_reset(ctrl, &mut model, &mut stats).await {
+        if let Err(e) = tests::t_audit_reset(ctrl, &mut stats).await {
             defmt::error!("[{=str}] audit reset failed: {=str}", mode, e);
             panic!("audit reset failed");
         }
@@ -1704,7 +1704,7 @@ pub mod tests {
     /// across controller reruns, so an interrupted run must not
     /// contaminate the next one's audit or serve a stale stats
     /// payload to its first read.
-    pub async fn t_audit_reset<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+    pub async fn t_audit_reset<C: Controller>(ctrl: &mut C, stats: &mut RetryStats) -> TestResult {
         let msg = [
             CTRL_MAGIC[0],
             CTRL_MAGIC[1],
@@ -1712,7 +1712,26 @@ pub mod tests {
             CTRL_MAGIC[3],
             CTRL_RESET_STATS,
         ];
-        op_write(ctrl, &msg, model, stats).await
+        for attempt in 0..=MAX_RETRIES {
+            match ctrl.write(TARGET_ADDR, &msg).await {
+                Ok(()) => return Ok(()),
+                // The reset is idempotent (and may already have landed
+                // despite the reported error), so every recoverable
+                // class retries — counted in its own bucket.
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(e) => {
+                    defmt::error!("audit reset: write failed {}", e);
+                    return Err("audit_reset: write failed");
+                }
+            }
+            if attempt == MAX_RETRIES {
+                break;
+            }
+        }
+        Err("audit_reset: retries exhausted")
     }
 
     /// Blocking-phase variant of [`t_audit_reset`].
@@ -1725,10 +1744,19 @@ pub mod tests {
             CTRL_RESET_STATS,
         ];
         for attempt in 0..=MAX_RETRIES {
-            if ctrl.blocking_write(TARGET_ADDR, &msg).is_ok() {
-                return Ok(());
+            match ctrl.blocking_write(TARGET_ADDR, &msg) {
+                Ok(()) => return Ok(()),
+                // Same classification as `t_audit_reset`: idempotent,
+                // so recoverable classes retry in their own buckets.
+                Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                    stats.end_retries += 1;
+                }
+                Err(e) => {
+                    defmt::error!("audit reset (blocking): write failed {}", e);
+                    return Err("audit_reset(b): write failed");
+                }
             }
-            stats.alf_retries += 1;
             if attempt == MAX_RETRIES {
                 break;
             }
