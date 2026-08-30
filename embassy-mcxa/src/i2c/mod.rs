@@ -52,8 +52,8 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 }
 
 pub(crate) struct Info {
-    pub(crate) regs: pac::lpi2c::Lpi2c,
-    pub(crate) wait_cell: WaitCell,
+    regs: pac::lpi2c::Lpi2c,
+    wait_cell: WaitCell,
     /// Whether a controller transaction session is currently live on
     /// this peripheral. The session type is linear on every public
     /// path by construction, but nothing at compile time stops a
@@ -62,10 +62,22 @@ pub(crate) struct Info {
     /// panic at the mint (set there, cleared on defuse and on the
     /// drop-recovery path). Lives here rather than on the driver so
     /// `Session`'s drop can clear it without borrowing the driver.
-    pub(crate) session_open: core::sync::atomic::AtomicBool,
+    session_open: core::sync::atomic::AtomicBool,
 }
 
 impl Info {
+    /// Create one instance-owned I2C state block. This is crate-visible only
+    /// because the generated peripheral-instance macro expands outside this
+    /// module; all fields remain private to the I2C subtree.
+    #[doc(hidden)]
+    pub(crate) const fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+        Self {
+            regs,
+            wait_cell: WaitCell::new(),
+            session_open: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     #[inline(always)]
     fn regs(&self) -> pac::lpi2c::Lpi2c {
         self.regs
@@ -86,11 +98,7 @@ macro_rules! impl_lpi2c_instance {
         paste::paste! {
             impl crate::i2c::SealedInstance for crate::peripherals::[<LPI2C $n>] {
                 fn info() -> &'static crate::i2c::Info {
-                    static INFO: crate::i2c::Info = crate::i2c::Info {
-                        regs: crate::pac::[<LPI2C $n>],
-                        wait_cell: maitake_sync::WaitCell::new(),
-                        session_open: core::sync::atomic::AtomicBool::new(false),
-                    };
+                    static INFO: crate::i2c::Info = crate::i2c::Info::new(crate::pac::[<LPI2C $n>]);
                     &INFO
                 }
 
