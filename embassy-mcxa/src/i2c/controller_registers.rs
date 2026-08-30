@@ -25,10 +25,10 @@
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
-use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest, InvalidParameters, TransferOptions};
+use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
 use crate::i2c::controller::{
-    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, RxDmaPermit, StartTransitionPermit,
-    TxDmaPermit,
+    CommandPermit, ControllerRxDma, ControllerTxDma, FirstReceivePermit, ReadReceivePermit, RecoveryPermit,
+    RxDmaPermit, StartTransitionPermit, TxDmaPermit,
 };
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
@@ -465,6 +465,14 @@ pub(in crate::i2c) struct RxDmaLease<'s, 'channel, 'dma, 'buf> {
 }
 
 impl RxDmaLease<'_, '_, '_, '_> {
+    /// Register for this lease's own completion event and report the
+    /// level-latched DONE state. The caller cannot accidentally wait on a
+    /// different controller DMA channel after it has armed this lease.
+    pub(in crate::i2c) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.channel.wait_cell().poll_wait(cx).is_ready() {}
+        self.channel.is_done()
+    }
+
     /// Quiesce the exact request path this lease armed and retain a
     /// first-read proof if DMA moved a byte or a byte remains in MRDR.
     fn quiesce_and_note(&mut self) -> bool {
@@ -511,6 +519,13 @@ pub(in crate::i2c) struct TxDmaLease<'s, 'channel, 'dma, 'buf> {
 }
 
 impl TxDmaLease<'_, '_, '_, '_> {
+    /// Register for this lease's own completion event; see
+    /// [`RxDmaLease::poll_complete`].
+    pub(in crate::i2c) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.channel.wait_cell().poll_wait(cx).is_ready() {}
+        self.channel.is_done()
+    }
+
     fn quiesce(&mut self) -> bool {
         cortex_m::asm::dsb();
         self.regs.set_tx_dma(false);
@@ -1364,18 +1379,23 @@ impl ControllerRegisters {
     pub(in crate::i2c) fn arm_rx_dma<'s, 'channel, 'dma, 'buf>(
         &self,
         permit: RxDmaPermit<'s>,
-        channel: &'channel DmaChannel<'dma>,
-        request: DmaRequest,
+        port: ControllerRxDma<'channel, 'dma>,
         buffer: &'buf mut [u8],
     ) -> Result<RxDmaLease<'s, 'channel, 'dma, 'buf>, InvalidParameters> {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: an RX DMA permit was used through a different controller"
         );
+        assert!(
+            self.register_address() == port.owner(),
+            "i2c: an RX DMA port was used through a different controller"
+        );
         if !dma_buffer_fits(buffer.len()) {
             return Err(InvalidParameters);
         }
         let total = buffer.len();
+        let channel = port.channel();
+        let request = port.request();
 
         // SAFETY: the capability proves this controller has a live read
         // session, MRDR is the Tock-typed read-only FIFO port, and the
@@ -1414,17 +1434,22 @@ impl ControllerRegisters {
     pub(in crate::i2c) fn arm_tx_dma<'s, 'channel, 'dma, 'buf>(
         &self,
         permit: TxDmaPermit<'s>,
-        channel: &'channel DmaChannel<'dma>,
-        request: DmaRequest,
+        port: ControllerTxDma<'channel, 'dma>,
         buffer: &'buf [u8],
     ) -> Result<TxDmaLease<'s, 'channel, 'dma, 'buf>, InvalidParameters> {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a TX DMA permit was used through a different controller"
         );
+        assert!(
+            self.register_address() == port.owner(),
+            "i2c: a TX DMA port was used through a different controller"
+        );
         if !dma_buffer_fits(buffer.len()) {
             return Err(InvalidParameters);
         }
+        let channel = port.channel();
+        let request = port.request();
 
         // SAFETY: the capability proves this controller has a live write
         // session, MTDR is the Tock-typed write-only FIFO port, and the

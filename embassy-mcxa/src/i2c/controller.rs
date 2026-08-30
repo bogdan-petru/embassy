@@ -74,7 +74,7 @@ use super::controller_registers::{
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
-use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel};
+use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
@@ -955,6 +955,74 @@ impl<'a> TxDmaPermit<'a> {
 
     pub(in crate::i2c) fn owner(&self) -> usize {
         self.owner
+    }
+}
+
+/// The fixed RX channel/request pair for this controller instance.
+///
+/// Its constructor is private to this driver: only the controller's one
+/// wiring point may associate the instance's RX request with a channel.
+/// The register facade accepts this distinct type rather than loose channel
+/// and request arguments, so an RX arm cannot accidentally receive TX
+/// plumbing at an ordinary call site.
+#[must_use]
+pub(in crate::i2c) struct ControllerRxDma<'a, 'd> {
+    owner: usize,
+    channel: &'a DmaChannel<'d>,
+    request: DmaRequest,
+}
+
+impl<'a, 'd> ControllerRxDma<'a, 'd> {
+    fn new(owner: usize, channel: &'a DmaChannel<'d>, request: DmaRequest) -> Self {
+        Self {
+            owner,
+            channel,
+            request,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+        self.channel
+    }
+
+    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+        self.request
+    }
+}
+
+/// The fixed TX channel/request pair for this controller instance. See
+/// [`ControllerRxDma`] for why this is not a generic `(channel, request)`
+/// tuple.
+#[must_use]
+pub(in crate::i2c) struct ControllerTxDma<'a, 'd> {
+    owner: usize,
+    channel: &'a DmaChannel<'d>,
+    request: DmaRequest,
+}
+
+impl<'a, 'd> ControllerTxDma<'a, 'd> {
+    fn new(owner: usize, channel: &'a DmaChannel<'d>, request: DmaRequest) -> Self {
+        Self {
+            owner,
+            channel,
+            request,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+        self.channel
+    }
+
+    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+        self.request
     }
 }
 
@@ -2824,6 +2892,19 @@ impl<'d> I2c<'d, Dma<'d>> {
 }
 
 impl<'d> I2c<'d, Dma<'d>> {
+    /// Brand the instance's configured RX channel/request pair for the
+    /// controller facade. This is the one wiring point for RX DMA; callers
+    /// cannot substitute the TX pair at the arm site.
+    fn controller_rx_dma(&self) -> ControllerRxDma<'_, 'd> {
+        ControllerRxDma::new(self.registers().identity(), &self.mode.rx_dma, self.mode.rx_request)
+    }
+
+    /// Brand the instance's configured TX channel/request pair. See
+    /// [`Self::controller_rx_dma`] for the pairing guarantee.
+    fn controller_tx_dma(&self) -> ControllerTxDma<'_, 'd> {
+        ControllerTxDma::new(self.registers().identity(), &self.mode.tx_dma, self.mode.tx_request)
+    }
+
     /// Run one RX DMA transfer covering `buf`, waking on completion or on
     /// a bus fault (which would otherwise leave the DMA waiting forever).
     /// The returned lease owns the raw FIFO endpoint, the MDER/ERQ sequence,
@@ -2835,7 +2916,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
         let lease = self
             .registers()
-            .arm_rx_dma(open.rx_dma_permit(), &self.mode.rx_dma, self.mode.rx_request, buf)?;
+            .arm_rx_dma(open.rx_dma_permit(), self.controller_rx_dma(), buf)?;
 
         // Wait for completion asynchronously — or for a bus error
         // (NACK, arbitration loss, FIFO error) that stops the
@@ -2851,8 +2932,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             // remove) would park this task with no waker on the cell,
             // and the real completion would then wake nobody. Same
             // pattern as `Transfer::poll`.
-            while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
-            if self.mode.rx_dma.is_done() {
+            if lease.poll_complete(cx) {
                 return core::task::Poll::Ready(Ok(()));
             }
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
@@ -3027,9 +3107,9 @@ impl<'d> I2c<'d, Dma<'d>> {
             // Compute the deadline before the TX lease retains the source
             // borrow. It will not release that borrow until eDMA is idle.
             let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
-            let lease =
-                self.registers()
-                    .arm_tx_dma(open.tx_dma_permit(), &self.mode.tx_dma, self.mode.tx_request, chunk)?;
+            let lease = self
+                .registers()
+                .arm_tx_dma(open.tx_dma_permit(), self.controller_tx_dma(), chunk)?;
 
             // Wait for completion asynchronously — or for a bus error
             // (NACK, arbitration loss, FIFO error) that stops the
@@ -3040,8 +3120,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             let wait = core::future::poll_fn(|cx| {
                 // Drain stale tokens and finish registered — see
                 // `dma_read_into`.
-                while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
-                if self.mode.tx_dma.is_done() {
+                if lease.poll_complete(cx) {
                     return core::task::Poll::Ready(Ok(()));
                 }
                 while self.info.wait_cell().poll_wait(cx).is_ready() {}
