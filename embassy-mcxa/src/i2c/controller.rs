@@ -501,9 +501,7 @@ impl Session {
             self.phase == SessionPhase::StopFinalized,
             "i2c: a session was marked complete without a finalized STOP"
         );
-        self.info
-            .session_open
-            .store(false, core::sync::atomic::Ordering::Relaxed);
+        self.info.release_session();
         core::mem::forget(self);
     }
 }
@@ -530,9 +528,7 @@ impl Drop for Session {
             // cancellation/successor shape.
             remediate_pending(&regs, self.timeout, self.phase);
         }
-        self.info
-            .session_open
-            .store(false, core::sync::atomic::Ordering::Relaxed);
+        self.info.release_session();
     }
 }
 
@@ -1162,10 +1158,7 @@ struct StartReservation {
 
 impl StartReservation {
     fn acquire(info: &'static Info) -> Self {
-        assert!(
-            !info.session_open.swap(true, core::sync::atomic::Ordering::Relaxed),
-            "i2c: a transaction started while another session is live"
-        );
+        info.reserve_session();
         Self {
             info,
             armed: true,
@@ -1201,9 +1194,7 @@ impl StartReservation {
 impl Drop for StartReservation {
     fn drop(&mut self) {
         if self.armed {
-            self.info
-                .session_open
-                .store(false, core::sync::atomic::Ordering::Relaxed);
+            self.info.release_session();
         }
     }
 }

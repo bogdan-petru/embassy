@@ -1,16 +1,18 @@
 //! I2C Support
 
 use embassy_hal_internal::PeripheralType;
-use maitake_sync::WaitCell;
 
 use crate::clocks::Gate;
 use crate::clocks::periph_helpers::Lpi2cConfig;
 use crate::dma::{DmaChannel, DmaRequest};
 use crate::gpio::GpioPin;
-use crate::{interrupt, pac};
+use crate::interrupt;
 
 pub mod controller;
 pub mod target;
+
+mod instance_info;
+pub(crate) use instance_info::Info;
 
 // The raw Tock register map is intentionally nested beneath the two
 // protocol facades. Driver modules can name `controller_registers` or
@@ -50,46 +52,6 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
     /// Interrupt for this I2C instance.
     type Interrupt: interrupt::typelevel::Interrupt;
 }
-
-pub(crate) struct Info {
-    regs: pac::lpi2c::Lpi2c,
-    wait_cell: WaitCell,
-    /// Whether a controller transaction session is currently live on
-    /// this peripheral. The session type is linear on every public
-    /// path by construction, but nothing at compile time stops a
-    /// module-internal caller from minting a second session while one
-    /// exists — this flag turns that mistake into a deterministic
-    /// panic at the mint (set there, cleared on defuse and on the
-    /// drop-recovery path). Lives here rather than on the driver so
-    /// `Session`'s drop can clear it without borrowing the driver.
-    session_open: core::sync::atomic::AtomicBool,
-}
-
-impl Info {
-    /// Create one instance-owned I2C state block. This is crate-visible only
-    /// because the generated peripheral-instance macro expands outside this
-    /// module; all fields remain private to the I2C subtree.
-    #[doc(hidden)]
-    pub(crate) const fn new(regs: pac::lpi2c::Lpi2c) -> Self {
-        Self {
-            regs,
-            wait_cell: WaitCell::new(),
-            session_open: core::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    #[inline(always)]
-    fn regs(&self) -> pac::lpi2c::Lpi2c {
-        self.regs
-    }
-
-    #[inline(always)]
-    fn wait_cell(&self) -> &WaitCell {
-        &self.wait_cell
-    }
-}
-
-unsafe impl Sync for Info {}
 
 #[doc(hidden)]
 #[macro_export]

@@ -590,13 +590,19 @@ show up in casual testing.
 
 #### The interrupt handler masks and wakes; the future re-arms and re-checks
 
-Per-instance async state lives in the `Info` struct, alongside the registers, as
-a waker. We use `maitake_sync::WaitCell`:
+Per-instance async state lives in a private `Info` struct, alongside the
+registers, as a waker. We use `maitake_sync::WaitCell`; the fields stay private
+and the driver receives narrow accessors rather than a public state bag:
 
 ```rust
 pub(crate) struct Info {
-    pub(crate) regs: pac::lpi2c::Lpi2c,
-    pub(crate) wait_cell: WaitCell,
+    regs: pac::lpi2c::Lpi2c,
+    wait_cell: WaitCell,
+}
+
+impl Info {
+    pub(crate) const fn new(regs: pac::lpi2c::Lpi2c) -> Self { /* ... */ }
+    pub(in crate::i2c) fn wait_cell(&self) -> &WaitCell { /* ... */ }
 }
 unsafe impl Sync for Info {}
 ```
@@ -710,10 +716,7 @@ creates exactly one per peripheral instance:
 
 ```rust
 fn info() -> &'static crate::i2c::Info {
-    static INFO: crate::i2c::Info = crate::i2c::Info {
-        regs: crate::pac::LPI2C0,
-        wait_cell: maitake_sync::WaitCell::new(),
-    };
+    static INFO: crate::i2c::Info = crate::i2c::Info::new(crate::pac::LPI2C0);
     &INFO
 }
 ```
