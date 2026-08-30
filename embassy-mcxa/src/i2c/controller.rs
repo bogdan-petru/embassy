@@ -68,8 +68,8 @@ use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
 use super::controller_registers::{
-    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, HaltSlot, HaltedFault, RecoveryClose,
-    RxStep, StartAction, TransferFault,
+    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, HaltedFault,
+    RecoveryClose, RxStep, StartAction, StartDrainStep, StopAction, StopStep, TransferFault,
 };
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -356,10 +356,19 @@ impl Session {
         FirstReceivePermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
     }
 
-    /// Mint the opaque permit required for an ordinary CPU command. Its
-    /// borrow ties the facade call to this live recovery owner; sibling I2C
-    /// modules can name the type but cannot construct one.
+    /// Mint the opaque permit required for an ordinary CPU TRANSMIT. START,
+    /// first/later RECEIVE, and STOP have stronger phase-specific permits;
+    /// keeping this one write-stable prevents a future internal call from
+    /// appending data while a START or STOP still owns the command pipeline.
     fn command_permit(&mut self) -> CommandPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was handed a transmit permit"
+        );
+        assert!(
+            self.phase.permits_transmit(),
+            "i2c: a transmit was requested outside a stable write transaction"
+        );
         let owner = ControllerRegisters::new(self.info.regs()).identity();
         CommandPermit::from_session(owner, self)
     }
@@ -424,17 +433,36 @@ impl Session {
         StartTransitionPermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
     }
 
-    /// Make a drained repeated START's successor phase stable. This is
-    /// called only after `tx_settled` completed without a fault; error and
-    /// cancellation paths instead consult the pending phase's explicit
-    /// recovery policy.
-    fn finish_start_transition(&mut self) {
-        self.phase = match self.phase {
-            SessionPhase::StartPending { after, .. } => SessionPhase::Stable(after),
-            SessionPhase::Stable(_) | SessionPhase::FirstReceivePending => {
-                panic!("i2c: a repeated START completed without a pending transition")
-            }
-        };
+    /// Mint the only capability that may observe a queued START's terminal
+    /// drain/status sequence. Its mutable session borrow survives until the
+    /// facade either returns a fault or commits the successor phase, so a
+    /// drain witness cannot be replayed against a later transaction.
+    fn start_status_permit(&mut self) -> StartStatusPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was settled as a START"
+        );
+        StartStatusPermit::new(ControllerRegisters::new(self.info.regs()).identity(), self)
+    }
+
+    /// Mint the only capability that may enqueue a normal trailing STOP.
+    /// STOP gets its own action/phase because physical bus-idle is meaningful
+    /// only after this session actually queued one.
+    fn stop_transition_permit(&mut self) -> StopTransitionPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was closed normally"
+        );
+        StopTransitionPermit::new(ControllerRegisters::new(self.info.regs()).identity(), &mut self.phase)
+    }
+
+    /// Turn the moved, STOP-pending session into the owner that is threaded
+    /// through every terminal poll. `StopWait` owns the session rather than
+    /// borrowing it, so cancellation still runs the ordinary session Drop
+    /// recovery and no completion proof can be replayed against another
+    /// transaction.
+    fn into_stop_wait(self) -> StopWait {
+        StopWait::new(self)
     }
 
     /// Convert a classified fault to the public error only after a
@@ -460,13 +488,18 @@ impl Session {
         error.into()
     }
 
-    /// Consume without recovery: the transaction reached its defined
-    /// end (a STOP physically completed, or a successor START took it
-    /// over on the wire).
-    fn defuse(self) {
+    /// Consume without recovery only after a physical STOP has had its
+    /// terminal status classified and cleared. The ownership-carrying
+    /// [`StopFinalized`] path is the sole caller, after it moved this session
+    /// through `StopPending -> StopFinalized`.
+    fn defuse_after_stop(self) {
         assert!(
             self.halt.is_empty(),
             "i2c: a session with an unresolved halt was marked complete"
+        );
+        assert!(
+            self.phase == SessionPhase::StopFinalized,
+            "i2c: a session was marked complete without a finalized STOP"
         );
         self.info
             .session_open
@@ -536,11 +569,29 @@ enum Abort {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionPhase {
     Stable(Abort),
-    StartPending { before: Abort, after: Abort },
+    StartPending {
+        before: Abort,
+        after: Abort,
+    },
     FirstReceivePending,
+    /// A normal trailing STOP entered MTDR. The moved [`StopWait`] owns the
+    /// corresponding session until terminal status is classified.
+    StopPending {
+        before: Abort,
+    },
+    /// Terminal status was cleanly classified after the physical STOP. This
+    /// is deliberately a transient state: only `StopFinalized::defuse` may
+    /// consume it without recovery.
+    StopFinalized,
 }
 
 impl SessionPhase {
+    /// Ordinary CPU transmit data is valid only after a write START fully
+    /// settled. Every other phase has a more specific command owner.
+    const fn permits_transmit(self) -> bool {
+        matches!(self, Self::Stable(Abort::General))
+    }
+
     /// Fold a non-consuming RX FIFO observation into the first-read phase.
     /// This is safe to call repeatedly. A resident byte proves the first
     /// RECEIVE executed even if a later fault is observed by a command or
@@ -559,7 +610,7 @@ impl SessionPhase {
     const fn after_read_progress(self) -> Self {
         match self {
             Self::FirstReceivePending => Self::Stable(Abort::ReadStreaming),
-            Self::Stable(_) | Self::StartPending { .. } => self,
+            Self::Stable(_) | Self::StartPending { .. } | Self::StopPending { .. } | Self::StopFinalized => self,
         }
     }
 
@@ -578,7 +629,9 @@ impl SessionPhase {
             Self::Stable(Abort::General)
             | Self::Stable(Abort::ReadStreaming)
             | Self::StartPending { .. }
-            | Self::FirstReceivePending => None,
+            | Self::FirstReceivePending
+            | Self::StopPending { .. }
+            | Self::StopFinalized => None,
         }
     }
 
@@ -598,7 +651,41 @@ impl SessionPhase {
                     Some(Self::Stable(before))
                 }
             }
-            Self::StartPending { .. } | Self::FirstReceivePending => None,
+            Self::StartPending { .. } | Self::FirstReceivePending | Self::StopPending { .. } | Self::StopFinalized => {
+                None
+            }
+        }
+    }
+
+    /// Commit the terminal clean-status proof of a queued START. This is
+    /// intentionally separate from enqueue: the `StartDrained` witness
+    /// provides the hardware condition that makes this semantic transition
+    /// legal.
+    const fn after_start_settled(self) -> Option<Self> {
+        match self {
+            Self::StartPending { after, .. } => Some(Self::Stable(after)),
+            Self::Stable(_) | Self::FirstReceivePending | Self::StopPending { .. } | Self::StopFinalized => None,
+        }
+    }
+
+    /// Commit a normal trailing STOP gate outcome. Normal closes are legal
+    /// only after a write START settled or after at least one read command
+    /// made the stream self-releasing. A full/fault gate leaves the exact
+    /// predecessor recovery shape intact.
+    const fn after_stop_enqueue(self, queued: bool) -> Option<Self> {
+        match self {
+            Self::Stable(before @ (Abort::General | Abort::ReadStreaming)) => {
+                if queued {
+                    Some(Self::StopPending { before })
+                } else {
+                    Some(Self::Stable(before))
+                }
+            }
+            Self::Stable(Abort::ReadAddressed)
+            | Self::StartPending { .. }
+            | Self::FirstReceivePending
+            | Self::StopPending { .. }
+            | Self::StopFinalized => None,
         }
     }
 
@@ -612,6 +699,8 @@ impl SessionPhase {
             Self::Stable(abort) => abort,
             Self::StartPending { after, .. } => after,
             Self::FirstReceivePending => Abort::ReadStreaming,
+            Self::StopPending { before } => before,
+            Self::StopFinalized => Abort::General,
         }
     }
 
@@ -622,6 +711,8 @@ impl SessionPhase {
             Self::StartPending { before, .. } => before,
             Self::FirstReceivePending => Abort::ReadAddressed,
             Self::Stable(abort) => abort,
+            Self::StopPending { before } => before,
+            Self::StopFinalized => Abort::General,
         }
     }
 }
@@ -675,6 +766,107 @@ const _: () = {
         SessionPhase::FirstReceivePending.after_start_enqueue(true, true),
         None
     ));
+    assert!(SessionPhase::Stable(Abort::General).permits_transmit());
+    assert!(!SessionPhase::Stable(Abort::ReadAddressed).permits_transmit());
+    assert!(
+        !SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::General,
+        }
+        .permits_transmit()
+    );
+    assert!(!SessionPhase::StopPending { before: Abort::General }.permits_transmit());
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::General,
+        }
+        .after_start_settled(),
+        Some(SessionPhase::Stable(Abort::General))
+    ));
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::ReadAddressed,
+        }
+        .after_start_settled(),
+        Some(SessionPhase::Stable(Abort::ReadAddressed))
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::General).after_start_settled(),
+        None
+    ));
+    assert!(matches!(SessionPhase::FirstReceivePending.after_start_settled(), None));
+    assert!(matches!(
+        SessionPhase::StopPending { before: Abort::General }.after_start_settled(),
+        None
+    ));
+    assert!(matches!(SessionPhase::StopFinalized.after_start_settled(), None));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::General).after_stop_enqueue(true),
+        Some(SessionPhase::StopPending { before: Abort::General })
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadStreaming).after_stop_enqueue(true),
+        Some(SessionPhase::StopPending {
+            before: Abort::ReadStreaming
+        })
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::General).after_stop_enqueue(false),
+        Some(SessionPhase::Stable(Abort::General))
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadStreaming).after_stop_enqueue(false),
+        Some(SessionPhase::Stable(Abort::ReadStreaming))
+    ));
+    assert!(matches!(
+        SessionPhase::Stable(Abort::ReadAddressed).after_stop_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::StartPending {
+            before: Abort::General,
+            after: Abort::General,
+        }
+        .after_stop_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::FirstReceivePending.after_stop_enqueue(true),
+        None
+    ));
+    assert!(matches!(
+        SessionPhase::StopPending { before: Abort::General }.after_stop_enqueue(true),
+        None
+    ));
+    assert!(matches!(SessionPhase::StopFinalized.after_stop_enqueue(true), None));
+    assert!(matches!(
+        SessionPhase::StopPending { before: Abort::General }.abort_for_cancellation(),
+        Abort::General
+    ));
+    assert!(matches!(
+        SessionPhase::StopPending {
+            before: Abort::ReadStreaming
+        }
+        .abort_for_halted_fault(),
+        Abort::ReadStreaming
+    ));
+    assert!(matches!(
+        SessionPhase::StopPending {
+            before: Abort::ReadStreaming
+        }
+        .abort_for_cancellation(),
+        Abort::ReadStreaming
+    ));
+    assert!(matches!(
+        SessionPhase::StopPending { before: Abort::General }.abort_for_halted_fault(),
+        Abort::General
+    ));
+    assert!(matches!(
+        SessionPhase::StopFinalized.abort_for_cancellation(),
+        Abort::General
+    ));
     assert!(matches!(
         SessionPhase::FirstReceivePending.after_read_progress(),
         SessionPhase::Stable(Abort::ReadStreaming)
@@ -718,8 +910,9 @@ const _: () = {
 /// This is deliberately non-constructible outside `controller.rs`. A
 /// permit is minted only from a live [`Session`], then immediately consumed
 /// by the MMIO facade. START has its own stronger
-/// [`StartTransitionPermit`], so a future sibling-module edit cannot enqueue
-/// a START, TRANSMIT, or STOP without choosing its matching ownership path.
+/// [`StartTransitionPermit`] and STOP has [`StopTransitionPermit`], so a
+/// future sibling-module edit cannot enqueue a START, TRANSMIT, or STOP
+/// without choosing its matching ownership path.
 #[must_use]
 pub(in crate::i2c) struct CommandPermit<'a> {
     owner: usize,
@@ -760,10 +953,180 @@ impl<'a> StartTransitionPermit<'a> {
         self.owner
     }
 
-    pub(in crate::i2c) fn finish_enqueue(self, action: StartAction, queued: bool) {
+    pub(in crate::i2c) fn finish_enqueue(self, action: StartAction, queued: bool, _seal: FacadeSeal) {
         *self.phase = (*self.phase)
             .after_start_enqueue(action.is_read(), queued)
             .expect("i2c: a START was committed from the wrong phase");
+    }
+}
+
+/// Capability consumed by the typed drain/status sequence of a queued START.
+///
+/// This owns the mutable session borrow through every pending poll, so no
+/// clean status witness can outlive its specific `StartPending` phase or be
+/// replayed into a later same-controller transaction.
+#[must_use]
+pub(in crate::i2c) struct StartStatusPermit<'a> {
+    owner: usize,
+    session: &'a mut Session,
+}
+
+impl<'a> StartStatusPermit<'a> {
+    fn new(owner: usize, session: &'a mut Session) -> Self {
+        assert!(
+            matches!(session.phase, SessionPhase::StartPending { .. }),
+            "i2c: a START status was consumed outside a pending START phase"
+        );
+        Self { owner, session }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn commit_settled(self, _seal: FacadeSeal) {
+        self.session.phase = self
+            .session
+            .phase
+            .after_start_settled()
+            .expect("i2c: a START drained outside the pending transition phase");
+    }
+}
+
+/// Capability consumed by a normal trailing STOP action. It records the
+/// exact recovery predecessor when MTDR accepts STOP, so neither an
+/// addressed-only read nor an already-pending command can be closed through
+/// the regular terminal path.
+#[must_use]
+pub(in crate::i2c) struct StopTransitionPermit<'a> {
+    owner: usize,
+    phase: &'a mut SessionPhase,
+}
+
+impl<'a> StopTransitionPermit<'a> {
+    fn new(owner: usize, phase: &'a mut SessionPhase) -> Self {
+        assert!(
+            matches!(*phase, SessionPhase::Stable(Abort::General | Abort::ReadStreaming)),
+            "i2c: a normal STOP was requested outside a settled transaction phase"
+        );
+        Self { owner, phase }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
+        *self.phase = (*self.phase)
+            .after_stop_enqueue(queued)
+            .expect("i2c: a normal STOP was committed from the wrong phase");
+    }
+}
+
+/// Owns a STOP-pending session through all completion polls. This is not a
+/// borrow-based permit: moving the session into this value makes a completed
+/// or finalized STOP proof linear, while dropping it keeps the ordinary
+/// session recovery behavior intact on cancellation/error paths.
+#[must_use]
+pub(in crate::i2c) struct StopWait {
+    session: Session,
+}
+
+impl StopWait {
+    fn new(session: Session) -> Self {
+        assert!(
+            matches!(session.phase, SessionPhase::StopPending { .. }),
+            "i2c: STOP completion began without a queued normal STOP"
+        );
+        Self { session }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        ControllerRegisters::new(self.session.info.regs()).identity()
+    }
+
+    pub(in crate::i2c) fn into_completed(self, _seal: FacadeSeal) -> StopCompleted {
+        StopCompleted { stop: self }
+    }
+
+    fn bind_fault(mut self, fault: TransferFault) -> IOError {
+        self.session.bind_fault(fault)
+    }
+}
+
+/// A fault observed while an ownership-carrying STOP wait was live.
+/// Returning this rather than a bare [`TransferFault`] keeps the session
+/// attached until the caller binds the halt proof and lets Drop recover.
+#[must_use]
+pub(in crate::i2c) struct StopFault {
+    stop: StopWait,
+    fault: TransferFault,
+}
+
+impl StopFault {
+    pub(in crate::i2c) fn new(stop: StopWait, fault: TransferFault) -> Self {
+        Self { stop, fault }
+    }
+
+    pub(in crate::i2c) fn into_error(self) -> IOError {
+        self.stop.bind_fault(self.fault)
+    }
+}
+
+/// Proof that the normal STOP this session queued has physically completed.
+/// It owns the same `StopWait`, so an idle snapshot cannot be transplanted
+/// into a second session or a second controller.
+#[must_use]
+pub(in crate::i2c) struct StopCompleted {
+    stop: StopWait,
+}
+
+impl StopCompleted {
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.stop.owner()
+    }
+
+    pub(in crate::i2c) fn into_wait(self) -> StopWait {
+        self.stop
+    }
+
+    pub(in crate::i2c) fn commit_finalized(mut self, _seal: FacadeSeal) -> StopFinalized {
+        self.stop.session.phase = SessionPhase::StopFinalized;
+        StopFinalized {
+            session: self.stop.session,
+        }
+    }
+}
+
+/// A clean terminal-status proof carrying the actual completed session. Its
+/// sole terminal operation consumes that session without recovery.
+#[must_use]
+pub(in crate::i2c) struct StopFinalized {
+    session: Session,
+}
+
+impl StopFinalized {
+    pub(in crate::i2c) fn defuse(self) {
+        self.session.defuse_after_stop();
+    }
+}
+
+/// A fault in the final snapshot after physical STOP completion. The
+/// completed session stays attached so error conversion cannot discard the
+/// recovery owner in the stop-step/finish-stop polling gap.
+#[must_use]
+pub(in crate::i2c) struct StopFinalizeFault {
+    stop: StopWait,
+    fault: TransferFault,
+}
+
+impl StopFinalizeFault {
+    pub(in crate::i2c) fn new(stop: StopWait, fault: TransferFault) -> Self {
+        Self { stop, fault }
+    }
+
+    pub(in crate::i2c) fn into_error(self) -> IOError {
+        self.stop.bind_fault(self.fault)
     }
 }
 
@@ -873,7 +1236,7 @@ impl<'a> FirstReceivePermit<'a> {
     /// Consume this permit with the single gate outcome. Both success and
     /// failure assign through the same transition table, making the
     /// addressed-state preservation on Full/fault an explicit invariant.
-    pub(in crate::i2c) fn finish_enqueue(self, queued: bool) {
+    pub(in crate::i2c) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
         *self.phase = (*self.phase)
             .after_first_receive_enqueue(queued)
             .expect("i2c: a first read command was committed from the wrong phase");
@@ -1537,11 +1900,6 @@ impl<'d, M: Mode> I2c<'d, M> {
         );
     }
 
-    fn consume_session(&self, open: Session) {
-        self.assert_session_owner(&open);
-        open.defuse();
-    }
-
     /// Reserve the single-session slot BEFORE any wire traffic.
     ///
     /// Runtime linearity backstop: the session type is threaded
@@ -1558,18 +1916,30 @@ impl<'d, M: Mode> I2c<'d, M> {
         StartReservation::acquire(self.info)
     }
 
-    /// Blocking wait for the command FIFO to drain (or a fault to
-    /// appear), bounded by [`Config::transfer_timeout`]: a target
-    /// holding SCL low satisfies neither condition and would otherwise
-    /// spin forever.
-    fn wait_tx_settled(&self) -> Result<(), IOError> {
+    /// Drive the typed terminal sequence of a queued START in blocking
+    /// mode. `StartDrained` can arise only from the facade's fault-first,
+    /// empty-FIFO observation; final W1C cleanup then commits the pending
+    /// session phase before this method releases its mutable borrow.
+    fn settle_start_blocking(&self, open: &mut Session) -> Result<(), IOError> {
+        self.assert_session_owner(open);
         let deadline = embassy_time::Instant::now() + self.timeout;
-        while !self.registers().tx_settled() {
-            if embassy_time::Instant::now() > deadline {
-                return Err(IOError::Timeout);
+        let mut permit = open.start_status_permit();
+        loop {
+            match self.registers().poll_start_drain(permit) {
+                StartDrainStep::Pending(next) if embassy_time::Instant::now() > deadline => {
+                    drop(next);
+                    return Err(IOError::Timeout);
+                }
+                StartDrainStep::Pending(next) => permit = next,
+                StartDrainStep::Fault(fault) => return Err(open.bind_fault(fault)),
+                StartDrainStep::Drained(drained) => {
+                    return match self.registers().finish_start_status(drained) {
+                        Ok(()) => Ok(()),
+                        Err(fault) => Err(open.bind_fault(fault)),
+                    };
+                }
             }
         }
-        Ok(())
     }
 
     /// Form a semantic START action after the public address preflight.
@@ -1601,6 +1971,22 @@ impl<'d, M: Mode> I2c<'d, M> {
         let step = {
             let permit = open.start_transition_permit();
             self.registers().try_enqueue_start(permit, action)
+        };
+        match step {
+            CommandStep::Queued => Ok(true),
+            CommandStep::Full => Ok(false),
+            CommandStep::Fault(fault) => Err(open.bind_fault(fault)),
+        }
+    }
+
+    /// Attempt a normal trailing STOP through the only gate that commits
+    /// `StopPending` when MTDR accepts it. Ordinary command permits cannot
+    /// use this path.
+    fn try_enqueue_stop_session(&self, action: StopAction, open: &mut Session) -> Result<bool, IOError> {
+        self.assert_session_owner(open);
+        let step = {
+            let permit = open.stop_transition_permit();
+            self.registers().try_enqueue_stop(permit, action)
         };
         match step {
             CommandStep::Queued => Ok(true),
@@ -1650,6 +2036,21 @@ impl<'d, M: Mode> I2c<'d, M> {
         let deadline = embassy_time::Instant::now() + self.timeout;
         loop {
             if self.try_enqueue_start_session(action, open)? {
+                return Ok(());
+            }
+            if embassy_time::Instant::now() > deadline {
+                return Err(IOError::Timeout);
+            }
+        }
+    }
+
+    /// Blocking normal-STOP gate. The session becomes `StopPending` exactly
+    /// when the command enters MTDR; callers then move it into `StopWait`
+    /// before any completion wait can begin.
+    fn enqueue_stop_session_blocking(&self, action: StopAction, open: &mut Session) -> Result<(), IOError> {
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        loop {
+            if self.try_enqueue_stop_session(action, open)? {
                 return Ok(());
             }
             if embassy_time::Instant::now() > deadline {
@@ -1720,17 +2121,8 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.assert_session_owner(&open);
 
         self.enqueue_start_session_blocking(self.start_action(address, read), &mut open)?;
-
-        if let Err(error) = self.wait_tx_settled() {
-            return Err(error);
-        }
-        match self.registers().take_start_status() {
-            Ok(()) => {
-                open.finish_start_transition();
-                Ok(open)
-            }
-            Err(fault) => Err(open.bind_fault(fault)),
-        }
+        self.settle_start_blocking(&mut open)?;
+        Ok(open)
     }
 
     fn start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
@@ -1750,17 +2142,8 @@ impl<'d, M: Mode> I2c<'d, M> {
         // cancellation or late halt cannot flatten fresh-read recovery
         // into the wrong close shape.
         let mut open = reservation.into_pending_session(self.timeout);
-        if let Err(e) = self.wait_tx_settled() {
-            return Err(e);
-        }
-
-        match self.registers().take_start_status() {
-            Ok(()) => {
-                open.finish_start_transition();
-                Ok(open)
-            }
-            Err(fault) => Err(open.bind_fault(fault)),
-        }
+        self.settle_start_blocking(&mut open)?;
+        Ok(open)
     }
 
     /// Prepares a Stop condition on the bus and waits for it to
@@ -1776,15 +2159,23 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// the session, whose recovery closes the transaction. Nothing
     /// here recovers explicitly, so recovery stays exactly-once.
     fn stop(&self, mut open: Session) -> Result<(), IOError> {
-        self.enqueue_session_blocking(ControllerAction::stop(), &mut open)?;
+        self.enqueue_stop_session_blocking(StopAction::new(), &mut open)?;
+
+        // Move the queued STOP's recovery owner into the completion state
+        // before polling. Every pending/completed/finalized value now owns
+        // this same session, so it cannot be replayed or detached.
+        let mut stop = open.into_stop_wait();
 
         let deadline = embassy_time::Instant::now() + self.timeout;
         let completed = loop {
-            match self.registers().stop_step() {
-                Some(Ok(completed)) => break completed,
-                Some(Err(fault)) => return Err(open.bind_fault(fault)),
-                None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
-                None => {}
+            match self.registers().stop_step(stop) {
+                StopStep::Completed(completed) => break completed,
+                StopStep::Fault(fault) => return Err(fault.into_error()),
+                StopStep::Pending(next) if embassy_time::Instant::now() > deadline => {
+                    drop(next);
+                    return Err(IOError::Timeout);
+                }
+                StopStep::Pending(next) => stop = next,
             }
         };
 
@@ -1792,10 +2183,11 @@ impl<'d, M: Mode> I2c<'d, M> {
         // classifies a fault that latched in the last poll gap as this
         // transaction's own, and clears the STOP's residual flags so
         // the next START does not misattribute them.
-        if let Err(fault) = self.registers().finish_stop(completed) {
-            return Err(open.bind_fault(fault));
-        }
-        self.consume_session(open);
+        let finalized = match self.registers().finish_stop(completed) {
+            Ok(finalized) => finalized,
+            Err(fault) => return Err(fault.into_error()),
+        };
+        finalized.defuse();
         Ok(())
     }
 
@@ -2176,6 +2568,67 @@ where
         }
     }
 
+    /// Async twin of [`Self::settle_start_blocking`]. The interrupt predicate
+    /// is only a wake source; each wake returns to the facade's typed
+    /// fault-first/empty-FIFO poll, which is the sole way to mint a drained
+    /// START witness.
+    async fn settle_start_async(&self, open: &mut Session) -> Result<(), IOError> {
+        self.assert_session_owner(open);
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        let mut permit = open.start_status_permit();
+        loop {
+            match self.registers().poll_start_drain(permit) {
+                StartDrainStep::Drained(drained) => {
+                    return match self.registers().finish_start_status(drained) {
+                        Ok(()) => Ok(()),
+                        Err(fault) => Err(open.bind_fault(fault)),
+                    };
+                }
+                StartDrainStep::Fault(fault) => return Err(open.bind_fault(fault)),
+                StartDrainStep::Pending(next) => {
+                    let now = embassy_time::Instant::now();
+                    if now >= deadline {
+                        drop(next);
+                        return Err(IOError::Timeout);
+                    }
+                    permit = next;
+                    match embassy_time::with_timeout(
+                        deadline - now,
+                        self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(IOError::Other),
+                        Err(_) => return Err(IOError::Timeout),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Async normal-STOP gate. As with the blocking twin, only this path may
+    /// change the live session to `StopPending` before it is moved into the
+    /// ownership-carrying completion wait.
+    async fn enqueue_stop_session_async(&self, action: StopAction, open: &mut Session) -> Result<(), IOError> {
+        loop {
+            if self.try_enqueue_stop_session(action, open)? {
+                return Ok(());
+            }
+
+            match embassy_time::with_timeout(
+                self.timeout,
+                self.info.wait_cell().wait_for(|| self.registers().tx_room_wake()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(IOError::Other),
+                Err(_) => return Err(IOError::Timeout),
+            }
+        }
+    }
+
     /// Schedule sending a START command and await it being pulled from the FIFO.
     ///
     /// Does not indicate that the command was responded to.
@@ -2206,25 +2659,8 @@ where
 
         self.enqueue_start_session_async(self.start_action(address, read), &mut open)
             .await?;
-
-        match embassy_time::with_timeout(
-            self.timeout,
-            self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(IOError::Other),
-            Err(_) => return Err(IOError::Timeout),
-        }
-
-        match self.registers().take_start_status() {
-            Ok(()) => {
-                open.finish_start_transition();
-                Ok(open)
-            }
-            Err(fault) => Err(open.bind_fault(fault)),
-        }
+        self.settle_start_async(&mut open).await?;
+        Ok(open)
     }
 
     async fn async_start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
@@ -2272,24 +2708,8 @@ where
         // cancellation and late-fault cleanup, including the distinction
         // between a frozen START and its requested read successor.
         let mut open = reservation.into_pending_session(self.timeout);
-        let waited = embassy_time::with_timeout(
-            self.timeout,
-            self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
-        )
-        .await;
-        match waited {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(IOError::Other),
-            Err(_) => return Err(IOError::Timeout),
-        }
-
-        match self.registers().take_start_status() {
-            Ok(()) => {
-                open.finish_start_transition();
-                Ok(open)
-            }
-            Err(fault) => Err(open.bind_fault(fault)),
-        }
+        self.settle_start_async(&mut open).await?;
+        Ok(open)
     }
 
     /// Schedule a STOP command and wait for it to PHYSICALLY complete
@@ -2308,7 +2728,12 @@ where
         // TX DMA completion does not prove the controller FIFO already
         // has room for a CPU STOP. The common gate keeps this close from
         // bypassing capacity/fault classification.
-        self.enqueue_session_async(ControllerAction::stop(), &mut open).await?;
+        self.enqueue_stop_session_async(StopAction::new(), &mut open).await?;
+
+        // From here every loop value owns the STOP-pending session. A
+        // cancellation/drop still runs Session's recovery, while a clean
+        // path can reach `defuse` only through StopFinalized.
+        let mut stop = open.into_stop_wait();
 
         let deadline = embassy_time::Instant::now() + self.timeout;
         let waited = embassy_time::with_timeout(
@@ -2325,24 +2750,29 @@ where
 
         let mut spins = 0u32;
         let completed = loop {
-            match self.registers().stop_step() {
-                Some(Ok(completed)) => break completed,
-                Some(Err(fault)) => return Err(open.bind_fault(fault)),
-                None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
+            match self.registers().stop_step(stop) {
+                StopStep::Completed(completed) => break completed,
+                StopStep::Fault(fault) => return Err(fault.into_error()),
+                StopStep::Pending(next) if embassy_time::Instant::now() > deadline => {
+                    drop(next);
+                    return Err(IOError::Timeout);
+                }
                 // Cooperative AND cancellable: the tail from "pulled"
                 // to "bus idle" has no interrupt to sleep on, and with
                 // no await point the future could neither yield nor be
-                // dropped (a drop landing here is safe — the live
-                // session recovers). The first yields cover the normal
+                // dropped (a drop landing here is safe — `StopWait`
+                // drops its session and recovers). The first yields cover the normal
                 // tail (a bit-time) with no added latency; past them
                 // the wait is a clock stretch, so back off onto the
                 // timer and let the executor actually sleep instead of
                 // self-waking through the run queue.
-                None if spins < 64 => {
+                StopStep::Pending(next) if spins < 64 => {
+                    stop = next;
                     spins += 1;
                     embassy_futures::yield_now().await;
                 }
-                None => {
+                StopStep::Pending(next) => {
+                    stop = next;
                     // Clamp the back-off to the remaining budget so a
                     // short configured timeout is not overrun by a
                     // whole sleep step (the residual overrun is one
@@ -2358,10 +2788,11 @@ where
         };
 
         // See `stop`: classify-and-clear as this transaction's own.
-        if let Err(fault) = self.registers().finish_stop(completed) {
-            return Err(open.bind_fault(fault));
-        }
-        self.consume_session(open);
+        let finalized = match self.registers().finish_stop(completed) {
+            Ok(finalized) => finalized,
+            Err(fault) => return Err(fault.into_error()),
+        };
+        finalized.defuse();
         Ok(())
     }
 
