@@ -323,6 +323,78 @@ impl ControllerRegisters {
         self.mfsr().txcount() == 0 || self.read_status().error().is_some()
     }
 
+    /// True when the RECOVERY drain is over: the command FIFO is empty
+    /// AND this controller's bus engine is idle (MBF clear).
+    ///
+    /// `tx_settled` is the wrong wait for recovery: it exits on any
+    /// latched fault, and an aborted transfer's in-flight command —
+    /// which a FIFO reset deliberately does NOT abort — completes
+    /// autonomously, overflowing the un-drained RX FIFO and latching
+    /// FEF mid-drain. Exiting there lets the trailing FIFO reset
+    /// discard the still-queued recovery STOP, and lets the command's
+    /// remaining bytes land in the RX FIFO *after* the final reset, to
+    /// be served as the stale head of the next transfer (observed on
+    /// hardware via drop-cancellation: a later read returned the
+    /// aborted read's tail bytes first). This predicate ignores faults
+    /// entirely — recovery has no caller to classify for — and insists
+    /// on genuine idleness, so the trailing cleanup runs after the
+    /// last autonomous byte and the STOP.
+    pub(super) fn recovery_settled(&self) -> bool {
+        self.mfsr().txcount() == 0 && self.msr().mbf() == Mbf::Idle
+    }
+
+    /// True while this controller's bus engine is mid-transfer (MBF).
+    /// Recovery keys on this: a recovery STOP is meaningful ONLY for
+    /// an open transfer — queued onto an idle controller it is a
+    /// protocol violation the engine refuses (FEF) and, if the fault
+    /// is then scrubbed, retries forever: a livelock that burns the
+    /// whole recovery deadline. (The old fault-exit drain masked this
+    /// by bailing on the FEF and silently discarding the bogus STOP.)
+    pub(super) fn master_busy(&self) -> bool {
+        self.msr().mbf() == Mbf::Busy
+    }
+
+    /// Number of commands currently waiting in the transmit FIFO.
+    pub(super) fn tx_pending(&self) -> usize {
+        self.mfsr().txcount() as usize
+    }
+
+    /// Recovery helper: discard everything currently in the RX FIFO.
+    ///
+    /// An aborted read's in-flight RECEIVE — which a FIFO reset
+    /// deliberately does not touch — keeps clocking with nobody
+    /// popping, and once the RX FIFO fills the engine holds SCL in
+    /// flow control (no fault latches: it is not an error). The
+    /// abandoned command then never finishes and the recovery STOP
+    /// queued behind it never executes (hardware-observed: MBF busy
+    /// forever, rxcount pinned at the FIFO depth, zero faults). The
+    /// recovery drain must keep popping to let it run to its
+    /// auto-NACKed end.
+    pub(super) fn discard_rx(&self) {
+        while self.mfsr().rxcount() != 0 {
+            let _ = self.regs.mrdr.get();
+        }
+    }
+
+    /// Last-resort recovery escalation: reset the master engine by
+    /// toggling MCR[MEN], aborting a wedged transfer and releasing the
+    /// bus. Unlike MCR[RST] this resets only the master logic — the
+    /// speed/pin/FIFO-watermark configuration is preserved, so no
+    /// re-init is needed.
+    ///
+    /// Needed because a FIFO reset issued while the master is mid
+    /// transfer can wedge the engine (observed on hardware via
+    /// drop-cancellation between the address phase and the first data
+    /// byte of a read: the engine holds the bus, never executes the
+    /// queued recovery STOP, and every later transfer runs with the
+    /// RX FIFO permanently lagging by its own depth). The graceful
+    /// recovery STOP stays the first choice — this runs only when
+    /// that provably cannot drain.
+    pub(super) fn reset_engine(&self) {
+        self.modify_mcr(|w| w.set_men(false));
+        self.modify_mcr(|w| w.set_men(true));
+    }
+
     /// One step of transmit-space progress: room in the command FIFO, a
     /// fault that means the transfer is dead, or `None` to keep waiting.
     pub(super) fn tx_room_step(&self) -> Option<TxStep> {

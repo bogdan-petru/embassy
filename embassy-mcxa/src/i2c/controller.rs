@@ -284,43 +284,244 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
     (best_prescale, clklo, clkhi, sethold, datavd)
 }
 
-/// Proof that a START was issued and its transaction is open on the
-/// wire — a transaction token. Produced only by `start`/`async_start`;
-/// consumed either by `stop`/`async_stop` or by the NEXT start (a
-/// repeated START surrenders the prior transaction's token to mint
-/// its successor). The engines are split into `*_txn` operations,
-/// which leave the transaction open and hand the token back, and
-/// `*_close` operations, which consume it with a trailing STOP and
-/// return nothing.
+/// An open bus transaction — a session whose drop path performs safe
+/// recovery.
 ///
-/// Being precise about what each tier enforces:
+/// Produced only by the `start_fresh`/`start_continue` transitions;
+/// consumed by `stop`/`async_stop` or by the next `start_continue`
+/// (a repeated START takes the predecessor over on the wire). The
+/// engines are split into `*_txn_*` operations, which leave the
+/// session open and hand it back, and `*_close*` operations, which
+/// consume it with a trailing STOP.
+///
+/// What each tier enforces:
 ///
 /// - **Compile-enforced**: a driver-initiated trailing stop cannot be
-///   issued without a token (`remediation()`'s recovery STOP is
-///   outside the token discipline by design — it is cleanup, not
-///   protocol); no operation both ends a transaction and yields a
-///   token (a path that promises a STOP has nothing to leak); a token
-///   cannot be used twice (no `Copy`/`Clone` — moves are checked).
-/// - **Runtime-enforced**: the token carries its controller's
-///   register-block address, and every consumption asserts it — a
-///   token from a different instance fails deterministically instead
-///   of silently continuing the wrong bus's transaction.
-/// - **Advisory**: the token is not lifetime-branded to the controller
-///   (branding would forbid holding it across the `&mut self`
-///   operations a transaction chain is made of), so abandoning one —
-///   an explicit drop, or passing `None` where a live continuation
-///   exists — remains expressible. `#[must_use]` makes that a
-///   visible, deliberate act (an error under this repo's
-///   `-Dwarnings` builds) rather than an accident.
-///
-/// No `Drop` impl, deliberately: cleanup on abandonment
-/// (drop-cancellation, error unwind) stays with the hardware-
-/// validated OnDrop guards and the self-recovering start/stop arms —
-/// the token encodes ORDER and IDENTITY, not cleanup.
+///   issued without a session (`remediation`'s recovery STOP is
+///   cleanup, outside the protocol); no operation both ends a
+///   transaction and yields a session; a session cannot be used twice
+///   (no `Copy`/`Clone`); and there is no fresh-start entry point that
+///   accepts an optional continuation — continuing and starting fresh
+///   are different functions, so "pass nothing while holding a live
+///   session" is not an expressible call.
+/// - **Drop-enforced**: ABANDONMENT IS RECOVERY. A session dropped on
+///   any path — an error unwind, a cancelled future, plain forgetting
+///   to thread it — runs the same self-contained remediation the
+///   recovery arms use, closing the transaction and releasing the
+///   bus. The old silent-abandonment hole is not merely linted away;
+///   it now has defined, safe behavior. (Cleanup that is *channel*
+///   -specific — DMA quiesce — stays in the quiesce-only guards,
+///   which drop before the session by declaration order.)
+/// - **Runtime-enforced**: the session carries its controller's shared
+///   state and every consumption asserts identity, so a session from
+///   another instance fails deterministically.
 #[must_use]
-struct Started {
-    /// The owning controller's register-block address.
-    block: usize,
+struct Session {
+    /// The owning controller's shared state — enough to recover
+    /// without borrowing the controller (which a drop path cannot).
+    info: &'static Info,
+    /// The owner's transfer timeout at session start, bounding the
+    /// recovery drain.
+    timeout: embassy_time::Duration,
+    /// Whether the transaction's most recent START addressed a READ.
+    /// Recovery needs it: aborting a read must clock+NACK one byte
+    /// before the STOP (see `remediate`), and the wire direction is
+    /// not observable from the registers.
+    read: bool,
+}
+
+impl Session {
+    /// Consume without recovery: the transaction reached its defined
+    /// end (a STOP was issued, or a successor START took it over).
+    fn defuse(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // A session always postdates the address phase, and every
+        // read engine issues its FIRST data command unconditionally,
+        // before any fallible or awaitable step (the chained engines
+        // and every seam chunk lead with their RECEIVE — enforced so
+        // this mapping stays sound). An abandoned read is therefore
+        // always aborted as ReadStreaming: its RECEIVE ends in the
+        // auto-NACK that releases the target — no extra clocking
+        // needed, and a command injected after that auto-NACK would
+        // trip the repeated-command silicon quirk.
+        let abort = if self.read {
+            Abort::ReadStreaming
+        } else {
+            Abort::General
+        };
+        remediate(&ControllerRegisters::new(self.info.regs()), self.timeout, abort);
+    }
+}
+
+/// What kind of wire state a recovery is unwinding — the choice of
+/// closing sequence depends on it, and it is not observable from the
+/// registers (hardware-diagnosed via the drop-cancellation rig test):
+///
+/// * a READ whose address may have ACKed with no data command behind
+///   it leaves the TARGET driving SDA, where a bare STOP can never
+///   form (the engine commits and wedges, unrecoverable even by an
+///   engine reset — the target holds the bus);
+/// * a READ with its data command issued must NOT have an extra
+///   RECEIVE appended (the in-flight command's auto-NACK already
+///   releases the target, and a command after an auto-NACK is the
+///   documented unreliable shape on this silicon);
+/// * everything else closes with a bare STOP.
+#[derive(Clone, Copy, PartialEq)]
+enum Abort {
+    /// Writes, STARTs that never reached the wire, STOP failures,
+    /// fault-halted engines: a bare STOP always forms.
+    General,
+    /// A read aborted between its START going out and its first data
+    /// command: clock ONE byte (RECEIVE, count 0) so the auto-NACK
+    /// makes the target release SDA, then STOP.
+    ReadAddressed,
+    /// A read aborted with data command(s) issued: bare STOP behind
+    /// the in-flight command's own auto-NACK.
+    ReadStreaming,
+}
+
+/// Self-contained bus recovery: reset the FIFOs, clear the latched
+/// faults, push a recovery STOP, wait (bounded) for it to drain, and
+/// leave a clean slate. Free-standing so [`Session`]'s drop can run it
+/// without borrowing the controller; `I2c::remediation` is the same
+/// code.
+fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort) {
+    #[cfg(feature = "defmt")]
+    defmt::trace!("Recovering controller",);
+
+    // Recovery must not re-enter the fault-aware wait/classify
+    // paths that lead here (`take_status_and_recover`, the session
+    // drop): with a fault that keeps re-latching, that cycle
+    // recurses until the stack overflows. Everything below is
+    // self-contained.
+    //
+    // Resetting the FIFOs drops whatever the aborted transfer left
+    // queued — but a FIFO reset issued while the engine is ACTIVELY
+    // RUNNING a command corrupts its transaction bookkeeping
+    // (hardware-observed: the closing STOP then forms on the wire,
+    // EPF/SDF latch, yet MBF/BBF stick busy forever and later
+    // commands are ignored — a state not even an engine reset fully
+    // unwinds). So the entry reset runs only when the engine is idle
+    // or halted on a latched fault; an active abort keeps its queued
+    // commands and lets the pipeline run out under the drain below,
+    // which is bounded: at most a FIFO's worth of commands.
+    let busy = regs.master_busy();
+    let halted = regs.read_status().error().is_some();
+    if !busy || halted {
+        regs.reset_fifos();
+    }
+    regs.clear_all_status();
+
+    // The recovery STOP is meaningful ONLY while a transfer is open
+    // on the wire. Queued onto an idle controller (a NACK the
+    // hardware already auto-STOPped, an abort that never reached the
+    // bus) it is a protocol violation the engine refuses with FEF and
+    // never consumes — the drain below would then burn its whole
+    // deadline for nothing (hardware-observed on ordinary NACK
+    // recoveries once the drain stopped exiting on latched faults).
+    // An idle controller needs no closing: reset, clear, done.
+    //
+    // Re-sampled: the engine fetches queued commands autonomously, so
+    // the entry sample can go stale idle→busy between it and the
+    // reset above (a dropped start whose START was still queued). The
+    // drain then closes the now-running transaction properly; if that
+    // reset DID land on the just-started engine and wedge it, the
+    // drain cannot settle and its deadline arm escalates to the
+    // engine reset — a bounded ending instead of a silent skip. (The
+    // opposite staleness, busy→idle, is the drain's 500 µs
+    // idle-with-close-pending break below.)
+    if busy || regs.master_busy() {
+        let deadline = embassy_time::Instant::now() + timeout;
+        // The closing sequence is shape-specific — see [`Abort`] —
+        // and is queued once there is room behind whatever the abort
+        // left pending (those commands run out first; a read
+        // pipeline's final byte auto-NACKs, which is exactly what
+        // frees the target for the STOP).
+        let need = if abort == Abort::ReadAddressed { 2usize } else { 1 };
+        let mut queued = false;
+        let mut idle_since: Option<embassy_time::Instant> = None;
+        loop {
+            // The entry `busy` sample can go stale within microseconds
+            // (an auto-STOP or fault-terminated transfer finishing as
+            // recovery enters). The close then targets an IDLE engine:
+            // a protocol violation it refuses with FEF and — with the
+            // fault scrub below re-clearing it — retries forever, a
+            // livelock that would burn the whole deadline (hardware-
+            // observed at tens of thousands of scrubs per burn). An
+            // engine that stays idle with the close still pending was
+            // never going to run it: the transaction already closed
+            // itself, which is all recovery wanted — drop the bogus
+            // close (trailing FIFO reset) and leave. The persistence
+            // window rides out the legitimate µs-scale fetch gap
+            // between queueing a command and MBF asserting.
+            if !regs.master_busy() && regs.tx_pending() > 0 {
+                let now = embassy_time::Instant::now();
+                let since = *idle_since.get_or_insert(now);
+                if now - since > embassy_time::Duration::from_micros(500) {
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+            // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
+            // stalls the engine in SCL flow control (no fault!) the
+            // moment the un-popped FIFO fills, and would otherwise
+            // never finish — see `discard_rx`.
+            regs.discard_rx();
+
+            if !queued && regs.tx_fifo_capacity() - regs.tx_pending() >= need {
+                if abort == Abort::ReadAddressed {
+                    regs.write_command(ControllerCommand::RECEIVE, 0);
+                }
+                regs.write_command(ControllerCommand::STOP, 0);
+                queued = true;
+            }
+
+            // Settled only counts once the closing commands are in:
+            // the engine idles between the aborted pipeline and the
+            // close, and exiting there would leave the transaction
+            // open.
+            if queued && regs.recovery_settled() {
+                break;
+            }
+
+            // The master HALTS on a latched fault and consumes no
+            // further commands until it is cleared — so a fault
+            // observed mid-drain is scrubbed (only when actually
+            // latched: a tight unconditional clear loop hammering MSR
+            // disturbed otherwise-clean drains on hardware) and the
+            // wait continues; recovery has no caller to classify for.
+            if regs.read_status().error().is_some() {
+                regs.clear_all_status();
+            }
+
+            // A target holding SCL low satisfies no exit condition,
+            // so the wait is bounded like every other — recovery must
+            // not be the one path that can still hang — and on expiry
+            // the engine is hard-reset: whatever holds it, the abort
+            // must complete and release this side of the bus.
+            if embassy_time::Instant::now() > deadline {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("recovery close did not settle within the transfer timeout; resetting the engine");
+                regs.reset_engine();
+                break;
+            }
+        }
+    }
+
+    // Now provably past the active abort (or hard-reset): drop
+    // whatever remains queued or received so the next transaction
+    // starts from a clean slate.
+    regs.reset_fifos();
+
+    // Clear any residual MSR flags raised by the recovery close
+    // (FEF in particular) so the next transaction starts clean.
+    regs.clear_current_status();
 }
 
 /// I2C controller configuration
@@ -563,79 +764,40 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.registers().clear_all_status();
     }
 
+    /// Recovery for non-read-abort contexts: START failures before the
+    /// address went out, STOP failures (data phase already complete),
+    /// and fault-halted engines (`take_status_and_recover`), where a
+    /// bare recovery STOP always forms. Read-abort contexts carry
+    /// their direction instead — see [`Session`] and the start guards.
     fn remediation(&self) {
-        #[cfg(feature = "defmt")]
-        defmt::trace!("Recovering controller",);
-
-        // Recovery must not re-enter the fault-aware wait paths that call
-        // it (`wait_tx_room` -> `status_and_act` -> here): with a fault
-        // that keeps re-latching, that cycle recurses until the stack
-        // overflows. Everything below is self-contained.
-        //
-        // Reset the FIFOs first: this drops whatever the aborted transfer
-        // left queued and guarantees room for the recovery STOP. Then
-        // clear any still-latched fault *before* queueing the STOP —
-        // `tx_settled` below exits on any error flag, and a stale fault
-        // would trip it immediately, after which the trailing FIFO reset
-        // would discard the STOP before it ever reached the bus, leaving
-        // the transaction active. (Callers that arrive via
-        // `status_and_act` already cleared the flags; callers that arrive
-        // via a non-clearing `read_status` fault have not.)
-        self.reset_fifos();
-        self.registers().clear_all_status();
-        self.registers().write_command(ControllerCommand::STOP, 0);
-
-        // Wait for the STOP to be consumed. `tx_settled` also returns on
-        // a fault, but a target holding SCL low satisfies neither
-        // condition, so the wait is bounded like every other: recovery
-        // must not be the one path that can still hang. Either way the
-        // STOP may still sit in the TX FIFO, ready to confuse the next
-        // transaction, so reset again to guarantee a clean slate.
-        let deadline = embassy_time::Instant::now() + self.timeout;
-        while !self.registers().tx_settled() {
-            if embassy_time::Instant::now() > deadline {
-                #[cfg(feature = "defmt")]
-                defmt::warn!("recovery STOP did not drain within the transfer timeout");
-                break;
-            }
-        }
-        self.reset_fifos();
-
-        // Clear any residual MSR flags raised by the recovery STOP
-        // (FEF in particular) so the next transaction starts clean.
-        self.registers().clear_current_status();
+        remediate(&self.registers(), self.timeout, Abort::General);
     }
 
-    /// The register-block address identifying this controller for
-    /// transaction-token binding.
-    fn block_addr(&self) -> usize {
-        self.info.regs().as_ptr() as usize
-    }
-
-    /// Consume a transaction token, asserting it belongs to THIS
-    /// controller. Cross-instance tokens compile (the token is not
-    /// lifetime-branded — see [`Started`]) but are a severe protocol
-    /// violation, so they fail deterministically here.
-    fn consume_token(&self, open: Started) {
-        let Started { block } = open;
+    /// Consume a session at its defined end, asserting it belongs to
+    /// THIS controller. Cross-instance sessions compile (the session
+    /// is not lifetime-branded — see [`Session`]) but are a severe
+    /// protocol violation, so they fail deterministically here, before
+    /// the defuse.
+    fn consume_session(&self, open: Session) {
         assert!(
-            block == self.block_addr(),
-            "i2c: transaction token from a different controller instance"
+            core::ptr::eq(open.info, self.info),
+            "i2c: transaction session from a different controller instance"
         );
+        open.defuse();
+    }
+
+    /// Mint the session for a transaction this controller just opened.
+    fn open_session(&self, read: bool) -> Session {
+        Session {
+            info: self.info,
+            timeout: self.timeout,
+            read,
+        }
     }
 
     /// Resets both TX and RX FIFOs dropping their contents.
     fn reset_fifos(&self) {
         self.registers().reset_fifos();
-    }
-
-    /// Recover from an I2C error by resetting FIFOs and clearing all
-    /// status flags.  Without this, a NACK or FIFO error leaves the
-    /// LPI2C controller in a state where every subsequent transaction
-    /// fails with FifoError.
-    fn recover_from_error(&self) {
-        self.reset_fifos();
-        self.registers().clear_all_status();
     }
 
     /// Blocking wait for the command FIFO to drain (or a fault to
@@ -654,8 +816,10 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     /// Blocking wait for room in the command FIFO, honoring faults: a
     /// halted transfer never frees space, so a data-only wait here would
-    /// spin forever. On a fault, the standard classification/recovery
-    /// path runs before the error is returned.
+    /// spin forever. Classification ONLY — recovery belongs to the
+    /// caller's context: `start`/`stop` recover directly (no session
+    /// exists there), everywhere else the live [`Session`]'s drop is
+    /// the single recoverer.
     fn wait_tx_room(&self) -> Result<(), IOError> {
         let deadline = embassy_time::Instant::now() + self.timeout;
         loop {
@@ -665,14 +829,7 @@ impl<'d, M: Mode> I2c<'d, M> {
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => return Ok(()),
                 Some(TxStep::Fault(_)) => {
-                    let res = self.status_and_act();
-                    if let Err(e) = res {
-                        if matches!(
-                            e,
-                            IOError::ArbitrationLoss | IOError::FifoError | IOError::PinLowTimeout
-                        ) {
-                            self.remediation();
-                        }
+                    if let Err(e) = self.parse_status(self.registers().take_status()) {
                         return Err(e);
                     }
                     // The flag cleared concurrently; keep waiting.
@@ -691,27 +848,29 @@ impl<'d, M: Mode> I2c<'d, M> {
         }
     }
 
-    /// Reads, parses and clears the controller status producing an
-    /// appropriate `Result<(), Error>` variant.
+    /// Take-and-classify the status, then recover for the classes a
+    /// START/STOP transition must not leave behind. ONLY for
+    /// `start`/`stop` (before a session exists / after it is defused)
+    /// — everywhere else the live [`Session`]'s drop owns recovery.
     ///
-    /// Will also send a STOP command if the tx_fifo is empty.
-    fn status_and_act(&self) -> Result<(), IOError> {
+    /// On a NACK: per RM 40.7.1.5, the controller auto-STOPs only with
+    /// MCFGR1[AUTOSTOP] or a non-empty transmit FIFO; otherwise the
+    /// recovery STOP is ours to send. Arbitration loss / FIFO error /
+    /// pin-low timeout leave aborted commands queued for the next
+    /// transaction to trip over, so they recover too.
+    fn take_status_and_recover(&self) -> Result<(), IOError> {
         let status = self.parse_status(self.registers().take_status());
-
-        if let Err(IOError::AddressNack) = status {
-            // According to the Reference Manual, section 40.7.1.5
-            // Controller Status (MSR), the controller will
-            // automatically send a STOP condition if
-            // `MCFGR1[AUTOSTOP]` is enabled or if the transmit FIFO
-            // is *not* empty.
-            //
-            // If neither of those conditions is true, we will send a
-            // STOP ourselves.
-            if self.registers().needs_manual_stop_after_nack() {
+        match status {
+            Err(IOError::AddressNack) => {
+                if self.registers().needs_manual_stop_after_nack() {
+                    self.remediation();
+                }
+            }
+            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout) => {
                 self.remediation();
             }
+            _ => {}
         }
-
         status
     }
 
@@ -729,32 +888,38 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Blocks waiting for space in the FIFO to become available, then
     /// sends the command and blocks waiting for the FIFO to become
     /// empty ensuring the command was sent.
-    fn start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
-        // Preflight BEFORE the continuation is surrendered: a
-        // rejection must not silently abandon a live transaction, so
-        // it is closed (best-effort) and the error wins.
+    /// Open a FRESH transaction: no live session may exist for this
+    /// controller (holding one and calling this drops it eventually —
+    /// which now RECOVERS rather than leaks; still a caller bug, but a
+    /// safe one).
+    fn start_fresh(&self, address: u8, read: bool) -> Result<Session, IOError> {
         if address >= 0x80 {
-            if let Some(open) = continues {
-                let _ = self.stop(open);
-            }
             return Err(IOError::AddressOutOfRange(address));
         }
-        // A repeated START surrenders the prior transaction's token
-        // and mints the successor atomically (verified to belong to
-        // this controller); a fresh START passes `None`.
-        if let Some(open) = continues {
-            self.consume_token(open);
-        }
+        self.start_raw(address, read)
+    }
 
-        // Wait until we have space in the TxFIFO
+    /// Continue an open transaction with a repeated START, consuming
+    /// its session and minting the successor. On a preflight rejection
+    /// the session is dropped — i.e. the open transaction is
+    /// RECOVERED, not abandoned.
+    fn start_continue(&self, address: u8, read: bool, open: Session) -> Result<Session, IOError> {
+        if address >= 0x80 {
+            return Err(IOError::AddressOutOfRange(address));
+        }
+        // The repeated START takes the predecessor over on the wire;
+        // if the START then fails, `start_raw`'s arms recover.
+        self.consume_session(open);
+        self.start_raw(address, read)
+    }
+
+    fn start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
+        // Wait until we have space in the TxFIFO. No session exists
+        // yet, so every failure class recovers HERE (`wait_tx_room` is
+        // classification-only). The START is not on the wire yet, so
+        // this is not a read abort.
         if let Err(e) = self.wait_tx_room() {
-            // The fault classes were already remediated inside
-            // `wait_tx_room`; a timeout means whatever clogged the
-            // FIFO is still queued and must be dropped, or the next
-            // transaction trips over it.
-            if matches!(e, IOError::Timeout) {
-                self.remediation();
-            }
+            self.remediation();
             return Err(e);
         }
 
@@ -769,31 +934,16 @@ impl<'d, M: Mode> I2c<'d, M> {
         );
 
         // Wait for TxFIFO to be drained. Timeout is its only failure:
-        // the START is still queued behind a stretched clock — drop it.
+        // the START is still queued behind a stretched clock — drop
+        // it. The address MAY complete (and, for a read, ACK) while
+        // recovery runs, so the abort carries the direction.
         if let Err(e) = self.wait_tx_settled() {
-            self.remediation();
+            let abort = if read { Abort::ReadAddressed } else { Abort::General };
+            remediate(&self.registers(), self.timeout, abort);
             return Err(e);
         }
 
-        // Check controller status
-        let res = self.status_and_act();
-
-        // `status_and_act` recovers a NACKed start itself, but a start
-        // that failed with arbitration loss or a FIFO error leaves the
-        // controller halted with the aborted commands still queued; a
-        // subsequent transfer would then spin forever waiting for data
-        // that never arrives. Recover here so a failed start always
-        // returns with the controller in a clean state.
-        if matches!(
-            res,
-            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
-        ) {
-            self.remediation();
-        }
-
-        res.map(|()| Started {
-            block: self.block_addr(),
-        })
+        self.take_status_and_recover().map(|()| self.open_session(read))
     }
 
     /// Prepares a Stop condition on the bus.
@@ -802,15 +952,12 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// FIFO to become available, then sends the command and blocks
     /// waiting for the FIFO to become empty ensuring the command was
     /// sent.
-    fn stop(&self, open: Started) -> Result<(), IOError> {
-        self.consume_token(open);
-        // Wait until we have space in the TxFIFO. Timeout recovery
-        // mirrors `start`: fault classes were remediated inside
-        // `wait_tx_room`, a timeout leaves the clog queued.
+    fn stop(&self, open: Session) -> Result<(), IOError> {
+        // The session reaches its defined end here; every failure
+        // below recovers directly (`stop` owns its own failures).
+        self.consume_session(open);
         if let Err(e) = self.wait_tx_room() {
-            if matches!(e, IOError::Timeout) {
-                self.remediation();
-            }
+            self.remediation();
             return Err(e);
         }
 
@@ -823,133 +970,119 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(e);
         }
 
-        let res = self.status_and_act();
-
-        // Mirror `start` (and `async_stop`): the fault classes can
-        // leave the aborted STOP queued, and callers run this after
-        // defusing their guards on the strength of "stop recovers its
-        // own failures".
-        if matches!(
-            res,
-            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
-        ) {
-            self.remediation();
-        }
-
-        res
+        self.take_status_and_recover()
     }
 
-    /// Read leaving the transaction OPEN (no trailing STOP): hands the
-    /// token back to the caller, which must thread it onward.
-    fn blocking_read_txn(&self, address: u8, read: &mut [u8], continues: Option<Started>) -> Result<Started, IOError> {
+    /// Read on a FRESH transaction, leaving it OPEN (no trailing
+    /// STOP): hands the session back to the caller, which must thread
+    /// it onward.
+    fn blocking_read_txn_fresh(&self, address: u8, read: &mut [u8]) -> Result<Session, IOError> {
         if read.is_empty() {
-            // A preflight rejection must not silently abandon a live
-            // continuation — close it so the bus is released.
-            if let Some(open) = continues {
-                let _ = self.stop(open);
-            }
             return Err(IOError::InvalidReadBufferLength);
         }
+        let open = self.start_fresh(address, true)?;
+        self.blocking_read_resume(address, read, open)
+    }
 
+    /// Read continuing an open transaction via repeated START, leaving
+    /// the successor OPEN — see [`Self::blocking_read_txn_fresh`].
+    fn blocking_read_txn_continue(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        if read.is_empty() {
+            // The moved-in session drops on this return — recovering
+            // the open transaction and releasing the bus rather than
+            // silently abandoning it.
+            return Err(IOError::InvalidReadBufferLength);
+        }
+        let open = self.start_continue(address, true, open)?;
+        self.blocking_read_resume(address, read, open)
+    }
+
+    /// The read engine past the address phase: drain the open
+    /// transaction with chained RECEIVE commands, falling back (only
+    /// when the caller opted in) to STOP-seamed re-addressed chunks.
+    fn blocking_read_resume(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
         // A chained read that died mid-transfer leaves the device in an
         // unknown state: its pointer has advanced by however many bytes
         // were clocked out, and destructive reads have already consumed
         // them. Re-reading from the caller's buffer start would return
         // shifted data as success, so it happens only when the caller
         // has explicitly accepted that trade.
-        let mut carry = continues;
-        match self.blocking_read_chained(address, read, carry.take()) {
+        match self.blocking_read_chained(read, open) {
             Ok(open) => Ok(open),
             Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
                 #[cfg(feature = "defmt")]
                 defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
                 let _ = e;
-                // The failed chained attempt consumed the continuation
-                // (its START went on the wire) and its recovery closed
-                // the bus; the fallback starts fresh.
-                self.blocking_read_seamed(address, read)
+                // The failed chained attempt's session dropped on its
+                // error path — recovering and closing the bus — so the
+                // fallback starts fresh.
+                let open = self.start_fresh(address, true)?;
+                self.blocking_read_seamed(address, read, open)
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Read ending the transaction with a trailing STOP: consumes the
-    /// token, returns nothing to leak.
-    fn blocking_read_close(&self, address: u8, read: &mut [u8], continues: Option<Started>) -> Result<(), IOError> {
-        let open = self.blocking_read_txn(address, read, continues)?;
-        self.stop(open)
-    }
-
     /// One read as a single addressed transaction with chained RECEIVE
-    /// commands. Does not send the trailing STOP.
-    fn blocking_read_chained(
-        &self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        // NOTE: start() is outside the recovery guard below —
-        // `status_and_act` inside it already remediates a NACK, and
-        // remediating twice corrupts the controller state for the
-        // next transaction (see the async path's OnDrop note).
-        let open = self.start(address, true, continues)?;
-
+    /// commands on the already-open transaction. Does not send the
+    /// trailing STOP. Every error return drops `open` — the session's
+    /// drop is the single recovery for any abort past the address
+    /// phase.
+    fn blocking_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
         let total = read.len();
-        // Mirror the async path's OnDrop: an error past this point
-        // aborts mid-transaction, and without recovery the bus is
-        // left in a state that fails the next transfer.
-        let mut drain = || -> Result<(), IOError> {
-            // Chain RECEIVE commands under the single address phase: the
-            // controller ACKs across a command boundary only when the next
-            // command is already queued (otherwise it NACKs and terminates
-            // the read early), so the command pipeline is kept ahead of the
-            // data. This preserves >256-byte reads as ONE bus transaction —
-            // no repeated START (unreliable after the auto-NACK on this
-            // silicon) and no STOP seams (which would break embedded-hal
-            // transaction atomicity and let another controller interleave).
-            let mut queued = 0usize;
-            let mut drained = 0usize;
-            let mut deadline = embassy_time::Instant::now() + self.timeout;
-            while drained < total {
-                // Top up the command pipeline whenever there is room.
-                while queued < total {
-                    match self.registers().tx_room_step() {
-                        Some(TxStep::Room) => {
-                            let chunk = (total - queued).min(256);
-                            self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
-                            queued += chunk;
-                        }
-                        Some(TxStep::Fault(e)) => return Err(e.into()),
-                        // Command FIFO full: plenty is queued ahead of
-                        // the data; go drain some of it.
-                        None => break,
+        // Chain RECEIVE commands under the single address phase: the
+        // controller ACKs across a command boundary only when the next
+        // command is already queued (otherwise it NACKs and terminates
+        // the read early), so the command pipeline is kept ahead of the
+        // data. This preserves >256-byte reads as ONE bus transaction —
+        // no repeated START (unreliable after the auto-NACK on this
+        // silicon) and no STOP seams (which would break embedded-hal
+        // transaction atomicity and let another controller interleave).
+        // The FIRST command goes in unconditionally: the start
+        // transition returned only after the command FIFO drained, so
+        // room for one command is guaranteed — and issuing it before
+        // any fallible step upholds [`Session`]'s drop invariant
+        // (read session ⇒ a data command exists, so its abort closes
+        // as ReadStreaming behind that command's auto-NACK).
+        let first = total.min(256);
+        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
+        let mut queued = first;
+        let mut drained = 0usize;
+        let mut deadline = embassy_time::Instant::now() + self.timeout;
+        while drained < total {
+            // Top up the command pipeline whenever there is room.
+            while queued < total {
+                match self.registers().tx_room_step() {
+                    Some(TxStep::Room) => {
+                        let chunk = (total - queued).min(256);
+                        self.send_cmd(ControllerCommand::RECEIVE, (chunk - 1) as u8);
+                        queued += chunk;
                     }
-                }
-
-                // Receive one byte, or bail out on a fault (NACK,
-                // arbitration loss, FIFO error): no more data will
-                // arrive, and a data-only wait would spin forever.
-                match self.registers().rx_step() {
-                    Some(RxStep::Byte(b)) => {
-                        read[drained] = b;
-                        drained += 1;
-                        deadline = embassy_time::Instant::now() + self.timeout;
-                    }
-                    Some(RxStep::Fault(e)) => return Err(e.into()),
-                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
-                    // No progress for a full timeout window: the
-                    // transfer died without a flag.
-                    None if embassy_time::Instant::now() > deadline => {
-                        return Err(IOError::Timeout);
-                    }
-                    None => {}
+                    Some(TxStep::Fault(e)) => return Err(e.into()),
+                    // Command FIFO full: plenty is queued ahead of
+                    // the data; go drain some of it.
+                    None => break,
                 }
             }
-            Ok(())
-        };
-        if let Err(e) = drain() {
-            self.remediation();
-            return Err(e);
+
+            // Receive one byte, or bail out on a fault (NACK,
+            // arbitration loss, FIFO error): no more data will
+            // arrive, and a data-only wait would spin forever.
+            match self.registers().rx_step() {
+                Some(RxStep::Byte(b)) => {
+                    read[drained] = b;
+                    drained += 1;
+                    deadline = embassy_time::Instant::now() + self.timeout;
+                }
+                Some(RxStep::Fault(e)) => return Err(e.into()),
+                Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                // No progress for a full timeout window: the
+                // transfer died without a flag.
+                None if embassy_time::Instant::now() > deadline => {
+                    return Err(IOError::Timeout);
+                }
+                None => {}
+            }
         }
 
         Ok(open)
@@ -957,77 +1090,83 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     /// Fallback: one read as re-addressed 256-byte chunks, each ended
     /// with a STOP. Not atomic, but immune to the chained-boundary
-    /// early-termination quirk. Does not send the trailing STOP.
-    fn blocking_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
-        let nchunks = read.len().div_ceil(256);
-        // Carries the final chunk's transaction out of the loop; every
-        // non-final chunk's is consumed by its seam STOP.
-        // Seamed chunks always start fresh transactions.
-        let mut last_open = None;
-        for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            let open = self.start(address, true, None)?;
-
-            // Outside the drain guard: `wait_tx_room` remediates the
-            // fault classes itself, and routing it through the guard
-            // would remediate those twice. Its Timeout arm does not.
-            if let Err(e) = self.wait_tx_room() {
-                if matches!(e, IOError::Timeout) {
-                    self.remediation();
-                }
-                return Err(e);
-            }
-
-            let mut drain = || -> Result<(), IOError> {
-                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
-
-                let mut deadline = embassy_time::Instant::now() + self.timeout;
-                for byte in chunk.iter_mut() {
-                    *byte = loop {
-                        match self.registers().rx_step() {
-                            Some(RxStep::Byte(b)) => {
-                                deadline = embassy_time::Instant::now() + self.timeout;
-                                break b;
-                            }
-                            Some(RxStep::Fault(e)) => return Err(e.into()),
-                            Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
-                            // No progress for a full timeout window:
-                            // Timeout, like the chained and async
-                            // paths — UnexpectedStop is reserved for
-                            // an observed termination.
-                            None if embassy_time::Instant::now() > deadline => {
-                                return Err(IOError::Timeout);
-                            }
-                            None => {}
-                        }
-                    };
-                }
-
-                Ok(())
-            };
-            if let Err(e) = drain() {
-                self.remediation();
-                return Err(e);
-            }
-
+    /// early-termination quirk. `open` is the first chunk's
+    /// already-open transaction; the final chunk's is returned OPEN.
+    fn blocking_read_seamed(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // The STOP-seamed chunks up front, the final chunk (1..=256
+        // bytes — the caller guarantees a non-empty read) apart, so
+        // the session is threaded linearly and never conditionally
+        // moved.
+        let seam_len = (read.len() - 1) / 256 * 256;
+        let (seams, tail) = read.split_at_mut(seam_len);
+        let mut open = open;
+        for chunk in seams.chunks_mut(256) {
+            let drained = self.blocking_read_seam_chunk(chunk, open)?;
             // End every non-final chunk with a STOP; a repeated START
             // right after the auto-NACK of a consumed RECEIVE command
-            // is not reliably accepted on this silicon. Outside the
-            // drain guard: `stop` recovers its own failures, and the
-            // guard must not stack a second remediation on top.
-            if idx + 1 < nchunks {
-                self.stop(open)?;
-            } else {
-                last_open = Some(open);
-            }
+            // is not reliably accepted on this silicon. `stop`
+            // recovers its own failures.
+            self.stop(drained)?;
+            open = self.start_fresh(address, true)?;
         }
-        // Non-empty reads are guaranteed by the caller, so the loop ran.
-        Ok(last_open.expect("blocking_read_seamed called with an empty buffer"))
+        self.blocking_read_seam_chunk(tail, open)
     }
 
-    /// Write leaving the transaction OPEN — see `blocking_read_txn`.
-    fn blocking_write_txn(&self, address: u8, write: &[u8], continues: Option<Started>) -> Result<Started, IOError> {
-        let open = self.start(address, false, continues)?;
+    /// Drain ONE seam chunk (at most 256 bytes, one RECEIVE command)
+    /// on the open transaction. Error returns drop the session, whose
+    /// recovery closes the transaction.
+    fn blocking_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // No wait for room: the start transition returned only after
+        // the command FIFO drained, so one command always fits — and
+        // like the async/DMA seam chunks, the RECEIVE must be the
+        // FIRST statement so the session never exists without a data
+        // command behind it (the drop invariant — see [`Session`]).
+        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
+        let mut deadline = embassy_time::Instant::now() + self.timeout;
+        for byte in chunk.iter_mut() {
+            *byte = loop {
+                match self.registers().rx_step() {
+                    Some(RxStep::Byte(b)) => {
+                        deadline = embassy_time::Instant::now() + self.timeout;
+                        break b;
+                    }
+                    Some(RxStep::Fault(e)) => return Err(e.into()),
+                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                    // No progress for a full timeout window: Timeout,
+                    // like the chained and async paths —
+                    // UnexpectedStop is reserved for an observed
+                    // termination.
+                    None if embassy_time::Instant::now() > deadline => {
+                        return Err(IOError::Timeout);
+                    }
+                    None => {}
+                }
+            };
+        }
+
+        Ok(open)
+    }
+
+    /// Write on a FRESH transaction, leaving it OPEN — see
+    /// [`Self::blocking_read_txn_fresh`].
+    fn blocking_write_txn_fresh(&self, address: u8, write: &[u8]) -> Result<Session, IOError> {
+        let open = self.start_fresh(address, false)?;
+        self.blocking_write_body(write, open)
+    }
+
+    /// Write continuing an open transaction, leaving the successor
+    /// OPEN — see [`Self::blocking_read_txn_continue`].
+    fn blocking_write_txn_continue(&self, address: u8, write: &[u8], open: Session) -> Result<Session, IOError> {
+        let open = self.start_continue(address, false, open)?;
+        self.blocking_write_body(write, open)
+    }
+
+    /// The write engine past the address phase. An error mid-write
+    /// aborts the transaction with TRANSMIT commands still queued and
+    /// the bus held; the error returns drop `open`, whose recovery
+    /// cleans both up.
+    fn blocking_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -1044,33 +1183,33 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Ok(open);
         }
 
-        // Mirror the read paths' recovery guard: an error mid-write
-        // aborts the transaction with TRANSMIT commands still queued
-        // and the bus held. `wait_tx_room` remediates the fault
-        // classes itself; its Timeout arm does not.
-        let push = || -> Result<(), IOError> {
-            for byte in write {
-                // Wait until we have space in the TxFIFO
-                self.wait_tx_room()?;
+        for byte in write {
+            // Wait until we have space in the TxFIFO
+            self.wait_tx_room()?;
 
-                self.send_cmd(ControllerCommand::TRANSMIT, *byte);
-            }
-            Ok(())
-        };
-        if let Err(e) = push() {
-            if matches!(e, IOError::Timeout) {
-                self.remediation();
-            }
-            return Err(e);
+            self.send_cmd(ControllerCommand::TRANSMIT, *byte);
         }
 
         Ok(open)
     }
 
-    /// Write ending the transaction with a trailing STOP — see
-    /// `blocking_read_close`.
-    fn blocking_write_close(&self, address: u8, write: &[u8], continues: Option<Started>) -> Result<(), IOError> {
-        let open = self.blocking_write_txn(address, write, continues)?;
+    /// Read ending its FRESH transaction with a trailing STOP: nothing
+    /// is returned to leak.
+    fn blocking_read_close_fresh(&self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+        let open = self.blocking_read_txn_fresh(address, read)?;
+        self.stop(open)
+    }
+
+    /// Read consuming an open transaction and ending with a STOP.
+    fn blocking_read_close_continue(&self, address: u8, read: &mut [u8], open: Session) -> Result<(), IOError> {
+        let open = self.blocking_read_txn_continue(address, read, open)?;
+        self.stop(open)
+    }
+
+    /// Write ending its FRESH transaction with a trailing STOP — see
+    /// [`Self::blocking_read_close_fresh`].
+    fn blocking_write_close_fresh(&self, address: u8, write: &[u8]) -> Result<(), IOError> {
+        let open = self.blocking_write_txn_fresh(address, write)?;
         self.stop(open)
     }
 
@@ -1103,7 +1242,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// controller, the read operation will be performed in multiple
     /// chunks. This will be transparent to the caller.
     pub fn blocking_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
-        self.blocking_read_close(address, read, None)
+        self.blocking_read_close_fresh(address, read)
     }
 
     /// Writes data to the specified I2C address from the provided buffer.
@@ -1126,7 +1265,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
     pub fn blocking_write(&mut self, address: u8, write: &[u8]) -> Result<(), IOError> {
-        self.blocking_write_close(address, write, None)
+        self.blocking_write_close_fresh(address, write)
     }
 
     /// Performs a combined write and read operation on the specified I2C
@@ -1158,10 +1297,10 @@ impl<'d, M: Mode> I2c<'d, M> {
         if read.is_empty() {
             return Err(IOError::InvalidReadBufferLength);
         }
-        let open = self.blocking_write_txn(address, write, None)?;
+        let open = self.blocking_write_txn_fresh(address, write)?;
         // The read half's repeated START consumes the write half's
-        // token; its trailing STOP closes the transaction.
-        self.blocking_read_close(address, read, Some(open))
+        // session; its trailing STOP closes the transaction.
+        self.blocking_read_close_continue(address, read, open)
     }
 }
 
@@ -1177,27 +1316,31 @@ where
     /// The wait is bounded by [`Config::transfer_timeout`] like its
     /// blocking counterpart: a target stretching SCL indefinitely
     /// satisfies neither the drain condition nor any error flag. A
-    /// start that fails is returned with the controller recovered, and
-    /// the awaited wait is guarded against drop-cancellation — callers
-    /// arm their cancellation guards only *after* the start (see the
-    /// seamed branch), so nobody else would clean up either kind of
-    /// abort.
-    async fn async_start(&self, address: u8, read: bool, continues: Option<Started>) -> Result<Started, IOError> {
-        // Preflight BEFORE the continuation is surrendered — see
-        // `start`.
+    /// start that fails is returned with the controller recovered and
+    /// NO session minted, so recovery for a failed start runs
+    /// exactly once, here. The awaited wait is guarded against
+    /// drop-cancellation for the same reason: no session exists while
+    /// it is pending, so nobody else would clean up that abort.
+    async fn async_start_fresh(&self, address: u8, read: bool) -> Result<Session, IOError> {
         if address >= 0x80 {
-            if let Some(open) = continues {
-                let _ = self.async_stop(open).await;
-            }
             return Err(IOError::AddressOutOfRange(address));
         }
-        // A repeated START surrenders the prior transaction's token
-        // and mints the successor atomically (verified to belong to
-        // this controller); a fresh START passes `None`.
-        if let Some(open) = continues {
-            self.consume_token(open);
-        }
+        self.async_start_raw(address, read).await
+    }
 
+    /// Continue an open transaction with a repeated START — the async
+    /// twin of [`Self::start_continue`]: a preflight rejection drops
+    /// (= recovers) the session; past that, the raw start's arms own
+    /// every failure.
+    async fn async_start_continue(&self, address: u8, read: bool, open: Session) -> Result<Session, IOError> {
+        if address >= 0x80 {
+            return Err(IOError::AddressOutOfRange(address));
+        }
+        self.consume_session(open);
+        self.async_start_raw(address, read).await
+    }
+
+    async fn async_start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
         // send the start command
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
@@ -1212,10 +1355,13 @@ where
         // Cancellation guard for THIS await: if the caller's future is
         // dropped here (an outer select/timeout), the queued START
         // still executes autonomously on the wire and opens a
-        // transaction nothing would ever close. Defused the moment the
-        // wait resolves — the arms below own their remediation, so
-        // recovery stays exactly-once.
-        let on_drop = OnDrop::new(|| self.remediation());
+        // transaction nothing would ever close — for a read it may
+        // ACK its address with no RECEIVE behind it, the exact shape
+        // whose recovery needs the direction (see `remediate`).
+        // Defused the moment the wait resolves — the arms below own
+        // their remediation, so recovery stays exactly-once.
+        let abort = if read { Abort::ReadAddressed } else { Abort::General };
+        let on_drop = OnDrop::new(|| remediate(&self.registers(), self.timeout, abort));
 
         let waited = embassy_time::with_timeout(
             self.timeout,
@@ -1229,48 +1375,35 @@ where
             Ok(Err(_)) => return Err(IOError::Other),
             Err(_) => {
                 // The START never drained: drop it, or the next
-                // transaction trips over the stale queued command.
-                self.remediation();
+                // transaction trips over the stale queued command —
+                // and the address may still complete mid-recovery.
+                remediate(&self.registers(), self.timeout, abort);
                 return Err(IOError::Timeout);
             }
         }
 
         // Note: the START + ACK/NACK have not necessarily been finished here.
         // thus this might return Ok(()), but might at a later state result in NAK or FifoError.
-        let res = self.status_and_act();
-
-        // Mirror the blocking `start`: `status_and_act` recovers a
-        // NACKed start itself, but a start that failed with arbitration
-        // loss or a FIFO error leaves the controller halted with the
-        // aborted commands still queued.
-        if matches!(
-            res,
-            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
-        ) {
-            self.remediation();
-        }
-
-        res.map(|()| Started {
-            block: self.block_addr(),
-        })
+        self.take_status_and_recover().map(|()| self.open_session(read))
     }
 
     /// Schedule a STOP command and await it being pulled from the FIFO.
     ///
-    /// Bounded like [`Self::async_start`], and like it fully
+    /// Bounded like [`Self::async_start_raw`], and like it fully
     /// self-recovering: a timeout means the STOP is stuck behind a
     /// stretched clock and remediation drops it, and the fault classes
     /// (arbitration loss, FIFO error, pin-low timeout) can leave the
     /// aborted STOP queued — `tx_settled` also exits on an error flag
-    /// — so they remediate too. Callers rely on this: every seam and
-    /// trailing stop runs AFTER its cancellation guard was defused
-    /// (letting a still-armed guard also fire would run remediation
-    /// twice, the double-recovery hazard the OnDrop placement notes
-    /// warn about), so nobody else would clean up a failed stop. The
-    /// awaited wait is guarded against drop-cancellation for the same
-    /// reason — see `async_start`.
-    async fn async_stop(&self, open: Started) -> Result<(), IOError> {
-        self.consume_token(open);
+    /// — so they remediate too. The session is consumed (defused) at
+    /// entry, so recovery for a failed stop runs exactly once, here —
+    /// nothing else holds a claim on the transaction. The awaited wait
+    /// is guarded against drop-cancellation for the same reason — see
+    /// `async_start_raw`.
+    async fn async_stop(&self, open: Session) -> Result<(), IOError> {
+        // The session reaches its defined end here; every failure
+        // below recovers directly (`async_stop` owns its own
+        // failures).
+        self.consume_session(open);
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
@@ -1296,16 +1429,7 @@ where
             }
         }
 
-        let res = self.status_and_act();
-
-        if matches!(
-            res,
-            Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout)
-        ) {
-            self.remediation();
-        }
-
-        res
+        self.take_status_and_recover()
     }
 
     // Public API: Async
@@ -1331,7 +1455,7 @@ where
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
     pub async fn async_read(&mut self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
-        self.async_read_close(address, read, None).await
+        self.async_read_close_fresh(address, read).await
     }
 
     /// Writes data to the specified I2C address from the provided buffer asynchronously.
@@ -1354,7 +1478,7 @@ where
     /// - `IOError::FifoError`: If there is an issue with the FIFO queue.
     /// - Other variants of `IOError` for specific I2C errors.
     pub async fn async_write(&mut self, address: u8, write: &[u8]) -> Result<(), IOError> {
-        self.async_write_close(address, write, None).await
+        self.async_write_close_fresh(address, write).await
     }
 
     /// Performs a combined write and read operation on the specified I2C
@@ -1387,39 +1511,33 @@ where
         read: &'a mut [u8],
     ) -> Result<(), IOError> {
         // Reject a doomed read BEFORE the no-STOP write half touches
-        // the bus. The read-side preflight checks (empty buffer, DMA
-        // command-FIFO capacity) run before any guard is armed, so a
-        // rejection after the write would return with the transaction
-        // still open and the bus held — nothing would ever send the
-        // STOP.
+        // the bus: a rejection between the halves would recover (drop)
+        // the write half's open transaction — safe, but a needless
+        // wire round-trip for a doomed request.
         <Self as AsyncEngine>::read_preflight(self, read)?;
-        let open = <Self as AsyncEngine>::async_write_txn(self, address, write, None).await?;
+        let open = <Self as AsyncEngine>::async_write_txn_fresh(self, address, write).await?;
         // The read half's repeated START consumes the write half's
-        // token; its trailing STOP closes the transaction.
-        self.async_read_close(address, read, Some(open)).await
+        // session; its trailing STOP closes the transaction.
+        self.async_read_close_continue(address, read, open).await
     }
 
-    /// Read ending the transaction with a trailing STOP: consumes the
-    /// token, returns nothing to leak.
-    async fn async_read_close(
-        &mut self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<(), IOError> {
-        let open = <Self as AsyncEngine>::async_read_txn(self, address, read, continues).await?;
+    /// Read ending its FRESH transaction with a trailing STOP: nothing
+    /// is returned to leak.
+    async fn async_read_close_fresh(&mut self, address: u8, read: &mut [u8]) -> Result<(), IOError> {
+        let open = <Self as AsyncEngine>::async_read_txn_fresh(self, address, read).await?;
         self.async_stop(open).await
     }
 
-    /// Write ending the transaction with a trailing STOP — see
-    /// [`Self::async_read_close`].
-    async fn async_write_close(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        continues: Option<Started>,
-    ) -> Result<(), IOError> {
-        let open = <Self as AsyncEngine>::async_write_txn(self, address, write, continues).await?;
+    /// Read consuming an open transaction and ending with a STOP.
+    async fn async_read_close_continue(&mut self, address: u8, read: &mut [u8], open: Session) -> Result<(), IOError> {
+        let open = <Self as AsyncEngine>::async_read_txn_continue(self, address, read, open).await?;
+        self.async_stop(open).await
+    }
+
+    /// Write ending its FRESH transaction with a trailing STOP — see
+    /// [`Self::async_read_close_fresh`].
+    async fn async_write_close_fresh(&mut self, address: u8, write: &[u8]) -> Result<(), IOError> {
+        let open = <Self as AsyncEngine>::async_write_txn_fresh(self, address, write).await?;
         self.async_stop(open).await
     }
 }
@@ -1430,23 +1548,41 @@ trait AsyncEngine {
     /// run it at entry. Must stay side-effect free.
     fn read_preflight(&self, read: &[u8]) -> Result<(), IOError>;
 
-    /// Read leaving the transaction OPEN (no trailing STOP): hands the
-    /// token back to the caller, which must thread it onward. The
-    /// close variants live on the driver (`async_read_close`).
-    fn async_read_txn<'a>(
+    /// Read on a FRESH transaction, leaving it OPEN (no trailing
+    /// STOP): hands the session back to the caller, which must thread
+    /// it onward. The close variants live on the driver
+    /// (`async_read_close_fresh`).
+    fn async_read_txn_fresh<'a>(
         &'a mut self,
         address: u8,
         read: &'a mut [u8],
-        continues: Option<Started>,
-    ) -> impl Future<Output = Result<Started, IOError>> + 'a;
+    ) -> impl Future<Output = Result<Session, IOError>> + 'a;
 
-    /// Write leaving the transaction OPEN — see [`Self::async_read_txn`].
-    fn async_write_txn<'a>(
+    /// Read continuing an open transaction via repeated START, leaving
+    /// the successor OPEN — see [`Self::async_read_txn_fresh`].
+    fn async_read_txn_continue<'a>(
+        &'a mut self,
+        address: u8,
+        read: &'a mut [u8],
+        open: Session,
+    ) -> impl Future<Output = Result<Session, IOError>> + 'a;
+
+    /// Write on a FRESH transaction, leaving it OPEN — see
+    /// [`Self::async_read_txn_fresh`].
+    fn async_write_txn_fresh<'a>(
         &'a mut self,
         address: u8,
         write: &'a [u8],
-        continues: Option<Started>,
-    ) -> impl Future<Output = Result<Started, IOError>> + 'a;
+    ) -> impl Future<Output = Result<Session, IOError>> + 'a;
+
+    /// Write continuing an open transaction, leaving the successor
+    /// OPEN — see [`Self::async_read_txn_continue`].
+    fn async_write_txn_continue<'a>(
+        &'a mut self,
+        address: u8,
+        write: &'a [u8],
+        open: Session,
+    ) -> impl Future<Output = Result<Session, IOError>> + 'a;
 }
 
 impl<'d> I2c<'d, Async> {
@@ -1498,27 +1634,43 @@ impl<'d> I2c<'d, Async> {
 }
 
 impl<'d> I2c<'d, Async> {
+    /// The read engine past the address phase: drain the open
+    /// transaction with chained RECEIVE commands, falling back (only
+    /// when the caller opted in) to STOP-seamed re-addressed chunks.
+    async fn async_read_resume(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // A chained read that died mid-transfer leaves the device in an
+        // unknown state: its pointer has advanced by however many bytes
+        // were clocked out, and destructive reads have already consumed
+        // them. Re-reading from the caller's buffer start would return
+        // shifted data as success, so it happens only when the caller
+        // has explicitly accepted that trade.
+        match self.async_read_chained(read, open).await {
+            Ok(open) => Ok(open),
+            Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
+                let _ = e;
+                // The failed chained attempt's session dropped on its
+                // error path — recovering and closing the bus — so the
+                // fallback starts fresh.
+                let open = self.async_start_fresh(address, true).await?;
+                self.async_read_seamed(address, read, open).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// One read as a single addressed transaction with chained RECEIVE
-    /// commands. Does not send the trailing STOP.
-    async fn async_read_chained(
-        &self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        let open = self.async_start(address, true, continues).await?;
-
-        // perform corrective action if the future is dropped or an
-        // error happens between here and the end of the read.
-        //
-        // NOTE: this *must* be set up *after* async_start. async_start
-        // already runs `status_and_act`, which on NACK performs its
-        // own remediation; if we set OnDrop earlier, the early `?`
-        // return would invoke remediation a second time and corrupt
-        // the controller state for the next transaction.
-        let on_drop = OnDrop::new(|| self.remediation());
-
+    /// commands on the already-open transaction. Does not send the
+    /// trailing STOP. Every abort past the address phase — an error
+    /// return or this future dropped mid-await — drops `open`, whose
+    /// recovery closes the transaction; no separate guard exists to
+    /// stack a second recovery on top.
+    async fn async_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
         let total = read.len();
+        // First command unconditionally — see `blocking_read_chained`.
+        let first = total.min(256);
+        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
         // Chain RECEIVE commands under the single address phase: the
         // controller ACKs across a command boundary only when the next
         // command is already queued (otherwise it NACKs and terminates
@@ -1527,7 +1679,7 @@ impl<'d> I2c<'d, Async> {
         // no repeated START (unreliable after the auto-NACK on this
         // silicon) and no STOP seams (which would break embedded-hal
         // transaction atomicity and let another controller interleave).
-        let mut queued = 0usize;
+        let mut queued = first;
         let mut drained = 0usize;
         while drained < total {
             // Top up the command pipeline whenever there is room.
@@ -1572,125 +1724,73 @@ impl<'d> I2c<'d, Async> {
             }
         }
 
-        on_drop.defuse();
-
         Ok(open)
     }
 
     /// Fallback: one read as re-addressed 256-byte chunks, each ended
     /// with a STOP. Not atomic, but immune to the chained-boundary
-    /// early-termination quirk. Does not send the trailing STOP.
-    async fn async_read_seamed(&self, address: u8, read: &mut [u8]) -> Result<Started, IOError> {
-        let nchunks = read.len().div_ceil(256);
-        // Carries the final chunk's transaction out of the loop; every
-        // non-final chunk's is consumed by its seam STOP. Seamed
-        // chunks always start fresh transactions.
-        let mut last_open = None;
-        for (idx, chunk) in read.chunks_mut(256).enumerate() {
-            let open = self.async_start(address, true, None).await?;
+    /// early-termination quirk. `open` is the first chunk's
+    /// already-open transaction; the final chunk's is returned OPEN.
+    async fn async_read_seamed(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // The STOP-seamed chunks up front, the final chunk (1..=256
+        // bytes — the preflight guarantees a non-empty read) apart, so
+        // the session is threaded linearly and never conditionally
+        // moved.
+        let seam_len = (read.len() - 1) / 256 * 256;
+        let (seams, tail) = read.split_at_mut(seam_len);
+        let mut open = open;
+        for chunk in seams.chunks_mut(256) {
+            let drained = self.async_read_seam_chunk(chunk, open).await?;
+            // End every non-final chunk with a STOP; a repeated START
+            // right after the auto-NACK of a consumed RECEIVE command
+            // is not reliably accepted on this silicon. `async_stop`
+            // recovers its own failures.
+            self.async_stop(drained).await?;
+            open = self.async_start_fresh(address, true).await?;
+        }
+        self.async_read_seam_chunk(tail, open).await
+    }
 
-            // See async_read_chained for the OnDrop placement rationale.
-            let on_drop = OnDrop::new(|| self.remediation());
+    /// Drain ONE seam chunk (at most 256 bytes, one RECEIVE command)
+    /// on the open transaction. Aborts — error returns and
+    /// drop-cancellation alike — drop the session, whose recovery
+    /// closes the transaction.
+    async fn async_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
-            self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
+        for byte in chunk.iter_mut() {
+            loop {
+                let timed_out = match embassy_time::with_timeout(
+                    self.timeout,
+                    self.info.wait_cell().wait_for(|| self.registers().rx_wake()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => false,
+                    Ok(Err(_)) => return Err(IOError::ReadFail),
+                    Err(_) => true,
+                };
 
-            for byte in chunk.iter_mut() {
-                loop {
-                    let timed_out = match embassy_time::with_timeout(
-                        self.timeout,
-                        self.info.wait_cell().wait_for(|| self.registers().rx_wake()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => false,
-                        Ok(Err(_)) => return Err(IOError::ReadFail),
-                        Err(_) => true,
-                    };
-
-                    match self.registers().rx_step() {
-                        Some(RxStep::Byte(b)) => {
-                            *byte = b;
-                            break;
-                        }
-                        Some(RxStep::Fault(e)) => return Err(e.into()),
-                        Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
-                        None if timed_out => return Err(IOError::Timeout),
-                        None => {}
+                match self.registers().rx_step() {
+                    Some(RxStep::Byte(b)) => {
+                        *byte = b;
+                        break;
                     }
+                    Some(RxStep::Fault(e)) => return Err(e.into()),
+                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                    None if timed_out => return Err(IOError::Timeout),
+                    None => {}
                 }
             }
-
-            // The chunk's data is drained; defuse before the seam STOP,
-            // which recovers its own failures (see `async_stop`).
-            on_drop.defuse();
-
-            // End every non-final chunk with a STOP; a repeated START
-            // right after the auto-NACK of a consumed RECEIVE command is
-            // not reliably accepted on this silicon.
-            if idx + 1 < nchunks {
-                self.async_stop(open).await?;
-            } else {
-                last_open = Some(open);
-            }
         }
-        // Non-empty reads are guaranteed by the preflight, so the loop ran.
-        Ok(last_open.expect("async_read_seamed called with an empty buffer"))
-    }
-}
 
-impl<'d> AsyncEngine for I2c<'d, Async> {
-    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
-        if read.is_empty() {
-            return Err(IOError::InvalidReadBufferLength);
-        }
-        Ok(())
+        Ok(open)
     }
 
-    async fn async_read_txn(
-        &mut self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        if let Err(e) = self.read_preflight(read) {
-            // A preflight rejection must not silently abandon a live
-            // continuation — close it so the bus is released.
-            if let Some(open) = continues {
-                let _ = self.async_stop(open).await;
-            }
-            return Err(e);
-        }
-
-        // A chained read that died mid-transfer leaves the device in an
-        // unknown state: its pointer has advanced by however many bytes
-        // were clocked out, and destructive reads have already consumed
-        // them. Re-reading from the caller's buffer start would return
-        // shifted data as success, so it happens only when the caller
-        // has explicitly accepted that trade.
-        let mut carry = continues;
-        match self.async_read_chained(address, read, carry.take()).await {
-            Ok(open) => Ok(open),
-            Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
-                #[cfg(feature = "defmt")]
-                defmt::trace!("chained read failed ({}); retrying chunked (opted in)", e);
-                let _ = e;
-                // The failed chained attempt consumed the continuation
-                // (its START went on the wire) and its recovery closed
-                // the bus; the fallback starts fresh.
-                self.async_read_seamed(address, read).await
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn async_write_txn(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        let open = self.async_start(address, false, continues).await?;
-
+    /// The write engine past the address phase. Aborts — error returns
+    /// and drop-cancellation alike — drop `open`, whose recovery
+    /// closes the transaction.
+    async fn async_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -1707,15 +1807,6 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             return Ok(open);
         }
 
-        // Corrective action if the future is dropped or a write step
-        // fails. Armed only AFTER the empty-write return above: this
-        // guard exists to close an *aborted* transaction, and the
-        // empty-write path returns with its transaction either cleanly
-        // stopped or deliberately left open for a combined
-        // transaction's read half — a guard firing on that success
-        // would inject a STOP into it.
-        let on_drop = OnDrop::new(|| self.remediation());
-
         for byte in write {
             // initiate transmit
             self.send_cmd(ControllerCommand::TRANSMIT, *byte);
@@ -1729,26 +1820,57 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(IOError::WriteFail),
                 // No progress within the transfer timeout (a target
-                // holding SCL low): the guard above closes the
+                // holding SCL low): the session drop closes the
                 // transaction on this return.
                 Err(_) => return Err(IOError::Timeout),
             }
 
-            // NOT `status_and_act`: its NACK arm can run remediation
-            // itself (manual STOP when the FIFO drained before the
-            // NACK was observed), and the still-armed guard would then
-            // remediate a second time on the error return. The guard
-            // is the single remediator for every error class here —
-            // remediation subsumes the manual-STOP special case.
+            // NOT `take_status_and_recover`: recovery here belongs to
+            // the session's drop on the error return — this is
+            // classification only, keeping recovery exactly-once.
             self.parse_status(self.registers().take_status())?;
         }
 
-        // Nothing after the data loop needs the guard; the close
-        // variant owns the trailing stop, which recovers its own
-        // failures without stacking a second remediation.
-        on_drop.defuse();
-
         Ok(open)
+    }
+}
+
+impl<'d> AsyncEngine for I2c<'d, Async> {
+    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
+        if read.is_empty() {
+            return Err(IOError::InvalidReadBufferLength);
+        }
+        Ok(())
+    }
+
+    async fn async_read_txn_fresh(&mut self, address: u8, read: &mut [u8]) -> Result<Session, IOError> {
+        self.read_preflight(read)?;
+        let open = self.async_start_fresh(address, true).await?;
+        self.async_read_resume(address, read, open).await
+    }
+
+    async fn async_read_txn_continue(
+        &mut self,
+        address: u8,
+        read: &mut [u8],
+        open: Session,
+    ) -> Result<Session, IOError> {
+        // Preflight BEFORE the repeated START touches the bus; on a
+        // rejection the moved-in session drops — recovering the open
+        // transaction rather than silently abandoning it.
+        self.read_preflight(read)?;
+        let open = self.async_start_continue(address, true, open).await?;
+        self.async_read_resume(address, read, open).await
+    }
+
+    async fn async_write_txn_fresh(&mut self, address: u8, write: &[u8]) -> Result<Session, IOError> {
+        let open = self.async_start_fresh(address, false).await?;
+        self.async_write_body(write, open).await
+    }
+
+    async fn async_write_txn_continue(&mut self, address: u8, write: &[u8], open: Session) -> Result<Session, IOError> {
+        let open = self.async_start_continue(address, false, open).await?;
+        self.async_write_body(write, open).await
     }
 }
 
@@ -1914,32 +2036,69 @@ impl<'d> I2c<'d, Dma<'d>> {
 }
 
 impl<'d> I2c<'d, Dma<'d>> {
-    /// One read as a single addressed transaction: every RECEIVE command
-    /// queued up front (caller checks they fit the FIFO), one DMA
-    /// transfer over the whole buffer. Does not send the trailing STOP.
-    async fn dma_read_chained(
-        &self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        let open = self.async_start(address, true, continues).await?;
+    /// The DMA read engine past the FIRST address phase: chained when
+    /// the command FIFO can hold the whole pipeline, seamed otherwise
+    /// (the preflight guaranteed the opt-in) or as the opted-in
+    /// fallback after a failed chained attempt.
+    async fn dma_read_resume(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // Chain all RECEIVE commands under a single address phase when
+        // they fit the command FIFO: the controller ACKs across a
+        // command boundary only when the next command is already
+        // queued, so a read up to capacity*256 bytes stays ONE bus
+        // transaction. Longer reads cannot be served atomically here at
+        // all, because nothing refills the command FIFO while the CPU
+        // sleeps on the DMA completion — they go straight to the
+        // seamed path, whose first chunk runs on the already-open
+        // transaction.
+        let ncmds = read.len().div_ceil(256);
+        if ncmds > self.registers().tx_fifo_capacity() {
+            return self.dma_read_seamed(address, read, open).await;
+        }
+        match self.dma_read_chained(read, open).await {
+            Ok(open) => Ok(open),
+            // A chained read that died mid-transfer leaves the device in an
+            // unknown state: its pointer has advanced by however many bytes
+            // were clocked out, and destructive reads have already consumed
+            // them. Re-reading from the caller's buffer start would return
+            // shifted data as success, so it happens only when the caller
+            // has explicitly accepted that trade.
+            Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("chained DMA read failed ({}); retrying chunked (opted in)", e);
+                let _ = e;
+                // The failed chained attempt's session dropped on its
+                // error path — recovering and closing the bus — so the
+                // fallback starts fresh.
+                let open = self.async_start_fresh(address, true).await?;
+                self.dma_read_seamed(address, read, open).await
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        // NOTE: OnDrop *after* async_start — see the seamed branch.
-        let on_drop = OnDrop::new(|| {
-            // Stop the DMA request path and wait for the channel to go
-            // inactive before any recovery: remediation resets the
-            // FIFOs, which can reassert the peripheral request, and
-            // `read` is about to be released — an in-flight minor loop
-            // would write into it after this future unwound.
-            // `disable_request` alone does not wait for that loop.
+    /// One read as a single addressed transaction: every RECEIVE command
+    /// queued up front (the caller checked they fit the FIFO), one DMA
+    /// transfer over the whole buffer, on the already-open transaction.
+    /// Does not send the trailing STOP.
+    ///
+    /// Abort ordering on any drop path: `quiesce` is declared after
+    /// `open`, so it drops FIRST — the DMA request path must be off
+    /// and the channel provably inactive before the session's recovery
+    /// resets the FIFOs (which can reassert the peripheral request)
+    /// and before `read`'s borrow ends (an in-flight minor loop would
+    /// write into it after this future unwound; `disable_request`
+    /// alone does not wait for that loop).
+    async fn dma_read_chained(&self, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        let quiesce = OnDrop::new(|| {
             self.finish_rx_dma();
-            self.remediation();
         });
 
-        // Queue every RECEIVE command up front (they fit).
+        // Queue every RECEIVE command up front (they fit). The first
+        // goes in unconditionally — see `blocking_read_chained`.
         let total = read.len();
-        let mut queued = 0usize;
+        let first = total.min(256);
+        self.send_cmd(ControllerCommand::RECEIVE, (first - 1) as u8);
+        let mut queued = first;
         while queued < total {
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => {
@@ -1955,131 +2114,62 @@ impl<'d> I2c<'d, Dma<'d>> {
 
         self.dma_read_into(read).await?;
 
-        on_drop.defuse();
+        // `dma_read_into`'s completion path already quiesced the
+        // channel; nothing is in flight past this point.
+        quiesce.defuse();
         Ok(open)
     }
-}
 
-impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
-    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
-        if read.is_empty() {
-            return Err(IOError::InvalidReadBufferLength);
+    /// Seamed path: one read as re-addressed 256-byte chunks, each
+    /// ended with a STOP — see `async_read_seamed` for the trade.
+    /// `open` is the first chunk's already-open transaction (on the
+    /// straight-to-seamed path it continues the caller's carry); the
+    /// final chunk's is returned OPEN.
+    async fn dma_read_seamed(&self, address: u8, read: &mut [u8], open: Session) -> Result<Session, IOError> {
+        // The STOP-seamed chunks up front, the final chunk (1..=256
+        // bytes — the preflight guarantees a non-empty read) apart, so
+        // the session is threaded linearly and never conditionally
+        // moved.
+        let seam_len = (read.len() - 1) / 256 * 256;
+        let (seams, tail) = read.split_at_mut(seam_len);
+        let mut open = open;
+        for chunk in seams.chunks_mut(256) {
+            let drained = self.dma_read_seam_chunk(chunk, open).await?;
+            // End every non-final chunk with a STOP: a repeated START
+            // right after the auto-NACK of a consumed RECEIVE command
+            // is not reliably accepted on this silicon. `async_stop`
+            // recovers its own failures.
+            self.async_stop(drained).await?;
+            open = self.async_start_fresh(address, true).await?;
         }
-        // Longer reads than the command FIFO can chain cannot be
-        // served atomically here — see `async_read_txn`.
-        let ncmds = read.len().div_ceil(256);
-        if ncmds > self.registers().tx_fifo_capacity() && !self.allow_chunked_reads {
-            return Err(IOError::ChunkingRequired);
-        }
-        Ok(())
+        self.dma_read_seam_chunk(tail, open).await
     }
 
-    async fn async_read_txn(
-        &mut self,
-        address: u8,
-        read: &mut [u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        if let Err(e) = self.read_preflight(read) {
-            // A preflight rejection must not silently abandon a live
-            // continuation — close it so the bus is released.
-            if let Some(open) = continues {
-                let _ = self.async_stop(open).await;
-            }
-            return Err(e);
-        }
+    /// Drain ONE seam chunk (at most 256 bytes: one RECEIVE command,
+    /// one DMA transfer) on the open transaction. Abort ordering as in
+    /// [`Self::dma_read_chained`]: the quiesce guard drops before the
+    /// session's recovery.
+    async fn dma_read_seam_chunk(&self, chunk: &mut [u8], open: Session) -> Result<Session, IOError> {
+        let quiesce = OnDrop::new(|| {
+            self.finish_rx_dma();
+        });
 
-        // Chain all RECEIVE commands under a single address phase when
-        // they fit the command FIFO: the controller ACKs across a
-        // command boundary only when the next command is already
-        // queued, so a read up to capacity*256 bytes stays ONE bus
-        // transaction. Longer reads cannot be served atomically here at
-        // all, because nothing refills the command FIFO while the CPU
-        // sleeps on the DMA completion.
-        let ncmds = read.len().div_ceil(256);
-        let mut seamed = ncmds > self.registers().tx_fifo_capacity();
-        // The open transaction carried between branches: set by a
-        // successful chained attempt or by the seamed loop's final
-        // chunk.
-        let mut open = None;
-        let mut carry = continues;
-        if !seamed {
-            match self.dma_read_chained(address, read, carry.take()).await {
-                Ok(o) => open = Some(o),
-                // A chained read that died mid-transfer leaves the device in an
-                // unknown state: its pointer has advanced by however many bytes
-                // were clocked out, and destructive reads have already consumed
-                // them. Re-reading from the caller's buffer start would return
-                // shifted data as success, so it happens only when the caller
-                // has explicitly accepted that trade.
-                Err(e @ (IOError::UnexpectedStop | IOError::Timeout)) if self.allow_chunked_reads => {
-                    #[cfg(feature = "defmt")]
-                    defmt::trace!("chained DMA read failed ({}); retrying chunked (opted in)", e);
-                    let _ = e;
-                    seamed = true;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if seamed {
-            // A surviving continuation is consumed by the first seam
-            // chunk's START (reachable only on the straight-to-seamed
-            // path; the fallback path consumed it in the failed
-            // chained attempt).
-            let nchunks = read.len().div_ceil(256);
-            for (idx, chunk) in read.chunks_mut(256).enumerate() {
-                let chunk_open = self.async_start(address, true, carry.take()).await?;
+        // send receive command
+        self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
 
-                // perform corrective action if the future is dropped or
-                // an error happens between here and the end of the read.
-                //
-                // NOTE: this *must* be set up *after* async_start.
-                // async_start already runs `status_and_act`, which on
-                // NACK performs its own remediation; if we set OnDrop
-                // earlier, the early `?` return would invoke remediation
-                // a second time and corrupt the controller state for the
-                // next transaction.
-                let on_drop = OnDrop::new(|| {
-                    // Handoff before recovery — see `dma_read_chained`.
-                    self.finish_rx_dma();
-                    self.remediation();
-                });
+        self.dma_read_into(chunk).await?;
 
-                // send receive command
-                self.send_cmd(ControllerCommand::RECEIVE, (chunk.len() - 1) as u8);
-
-                self.dma_read_into(chunk).await?;
-
-                // The chunk is drained and its channel quiesced by
-                // `dma_read_into`; defuse before the seam STOP, which
-                // recovers its own failures (see `async_stop`). We
-                // re-arm on the next chunk if any.
-                on_drop.defuse();
-
-                // End every non-final chunk with a STOP: a repeated START
-                // right after the auto-NACK of a consumed RECEIVE command
-                // is not reliably accepted on this silicon.
-                if idx + 1 < nchunks {
-                    self.async_stop(chunk_open).await?;
-                } else {
-                    open = Some(chunk_open);
-                }
-            }
-        }
-
-        // One of the branches ran to completion, so a transaction is
-        // open here.
-        Ok(open.expect("read completed without an open transaction"))
+        // The chunk is drained and its channel quiesced by
+        // `dma_read_into`'s completion path.
+        quiesce.defuse();
+        Ok(open)
     }
 
-    async fn async_write_txn(
-        &mut self,
-        address: u8,
-        write: &[u8],
-        continues: Option<Started>,
-    ) -> Result<Started, IOError> {
-        let open = self.async_start(address, false, continues).await?;
-
+    /// The DMA write engine past the address phase. Abort ordering as
+    /// in [`Self::dma_read_chained`]: the quiesce guard drops before
+    /// the session, so the channel is provably idle before recovery
+    /// touches the FIFOs and before `write`'s borrow ends.
+    async fn dma_write_body(&self, write: &[u8], open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
         // logic through write probing. That is, we send a start with
@@ -2096,14 +2186,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             return Ok(open);
         }
 
-        // perform corrective action if the future is dropped
-        let on_drop = OnDrop::new(|| {
-            // Same rationale as the DMA read path: kill the request
-            // path and wait for the channel to go inactive before
-            // recovery touches the FIFOs, since `write` is about to be
-            // released.
+        let quiesce = OnDrop::new(|| {
             self.finish_tx_dma();
-            self.remediation();
         });
 
         for chunk in write.chunks(DMA_MAX_TRANSFER_SIZE) {
@@ -2158,8 +2242,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
             match embassy_time::with_timeout(bound, wait).await {
                 Ok(r) => r?,
-                // The guard above is still armed: it quiesces the
-                // channel and closes the transaction on this return.
+                // The quiesce guard and the session drop handle this
+                // return, in that order.
                 Err(_) => return Err(IOError::Timeout),
             }
 
@@ -2168,9 +2252,54 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
 
         // Every chunk is drained and the channel quiesced; the close
         // variant owns the trailing stop.
-        on_drop.defuse();
+        quiesce.defuse();
 
         Ok(open)
+    }
+}
+
+impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
+    fn read_preflight(&self, read: &[u8]) -> Result<(), IOError> {
+        if read.is_empty() {
+            return Err(IOError::InvalidReadBufferLength);
+        }
+        // Longer reads than the command FIFO can chain cannot be
+        // served atomically here — see `dma_read_resume`.
+        let ncmds = read.len().div_ceil(256);
+        if ncmds > self.registers().tx_fifo_capacity() && !self.allow_chunked_reads {
+            return Err(IOError::ChunkingRequired);
+        }
+        Ok(())
+    }
+
+    async fn async_read_txn_fresh(&mut self, address: u8, read: &mut [u8]) -> Result<Session, IOError> {
+        self.read_preflight(read)?;
+        let open = self.async_start_fresh(address, true).await?;
+        self.dma_read_resume(address, read, open).await
+    }
+
+    async fn async_read_txn_continue(
+        &mut self,
+        address: u8,
+        read: &mut [u8],
+        open: Session,
+    ) -> Result<Session, IOError> {
+        // Preflight BEFORE the repeated START touches the bus; on a
+        // rejection the moved-in session drops — recovering the open
+        // transaction rather than silently abandoning it.
+        self.read_preflight(read)?;
+        let open = self.async_start_continue(address, true, open).await?;
+        self.dma_read_resume(address, read, open).await
+    }
+
+    async fn async_write_txn_fresh(&mut self, address: u8, write: &[u8]) -> Result<Session, IOError> {
+        let open = self.async_start_fresh(address, false).await?;
+        self.dma_write_body(write, open).await
+    }
+
+    async fn async_write_txn_continue(&mut self, address: u8, write: &[u8], open: Session) -> Result<Session, IOError> {
+        let open = self.async_start_continue(address, false, open).await?;
+        self.dma_write_body(write, open).await
     }
 }
 
@@ -2225,30 +2354,26 @@ impl<'d, M: Mode> embedded_hal_02::blocking::i2c::Transactional for I2c<'d, M> {
             }
         }
 
-        if let Some((last, rest)) = operations.split_last_mut() {
-            // Each op leaves its transaction open; the next op's
-            // repeated START consumes the token, and the last op's
-            // trailing STOP closes the chain.
-            let mut open: Option<Started> = None;
+        if let Some((first, rest)) = operations.split_first_mut() {
+            // The first op opens the chain; each further op's repeated
+            // START consumes its predecessor's session; the final
+            // `stop` closes the chain. The session threads linearly —
+            // any error return drops it, and the drop recovers.
+            let mut open = match first {
+                embedded_hal_02::blocking::i2c::Operation::Read(buf) => self.blocking_read_txn_fresh(address, buf)?,
+                embedded_hal_02::blocking::i2c::Operation::Write(buf) => self.blocking_write_txn_fresh(address, buf)?,
+            };
             for op in rest {
-                open = Some(match op {
+                open = match op {
                     embedded_hal_02::blocking::i2c::Operation::Read(buf) => {
-                        self.blocking_read_txn(address, buf, open.take())?
+                        self.blocking_read_txn_continue(address, buf, open)?
                     }
                     embedded_hal_02::blocking::i2c::Operation::Write(buf) => {
-                        self.blocking_write_txn(address, buf, open.take())?
+                        self.blocking_write_txn_continue(address, buf, open)?
                     }
-                });
+                };
             }
-
-            match last {
-                embedded_hal_02::blocking::i2c::Operation::Read(buf) => {
-                    self.blocking_read_close(address, buf, open.take())
-                }
-                embedded_hal_02::blocking::i2c::Operation::Write(buf) => {
-                    self.blocking_write_close(address, buf, open.take())
-                }
-            }
+            self.stop(open)
         } else {
             Ok(())
         }
@@ -2278,8 +2403,7 @@ impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
         operations: &mut [embedded_hal_1::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
         // Reject a doomed read before ANY op touches the bus — see
-        // `exec` above; `recover_from_error` below clears flags but
-        // does not close an open transaction.
+        // `exec` above.
         for op in operations.iter() {
             if let embedded_hal_1::i2c::Operation::Read(buf) = op {
                 if buf.is_empty() {
@@ -2288,36 +2412,27 @@ impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
             }
         }
 
-        let result = (|| {
-            if let Some((last, rest)) = operations.split_last_mut() {
-                // Each op leaves its transaction open; the next op's
-                // repeated START consumes the token, and the last op's
-                // trailing STOP closes the chain.
-                let mut open: Option<Started> = None;
-                for op in rest {
-                    open = Some(match op {
-                        embedded_hal_1::i2c::Operation::Read(buf) => {
-                            self.blocking_read_txn(address, buf, open.take())?
-                        }
-                        embedded_hal_1::i2c::Operation::Write(buf) => {
-                            self.blocking_write_txn(address, buf, open.take())?
-                        }
-                    });
-                }
-
-                match last {
-                    embedded_hal_1::i2c::Operation::Read(buf) => self.blocking_read_close(address, buf, open.take()),
-                    embedded_hal_1::i2c::Operation::Write(buf) => self.blocking_write_close(address, buf, open.take()),
-                }
-            } else {
-                Ok(())
+        // No trailing cleanup: every abort recovers by construction —
+        // pre-session failures inside `start`, post-defuse failures
+        // inside `stop`, everything in between via the session's drop.
+        if let Some((first, rest)) = operations.split_first_mut() {
+            // See `exec` above for the threading.
+            let mut open = match first {
+                embedded_hal_1::i2c::Operation::Read(buf) => self.blocking_read_txn_fresh(address, buf)?,
+                embedded_hal_1::i2c::Operation::Write(buf) => self.blocking_write_txn_fresh(address, buf)?,
+            };
+            for op in rest {
+                open = match op {
+                    embedded_hal_1::i2c::Operation::Read(buf) => self.blocking_read_txn_continue(address, buf, open)?,
+                    embedded_hal_1::i2c::Operation::Write(buf) => {
+                        self.blocking_write_txn_continue(address, buf, open)?
+                    }
+                };
             }
-        })();
-
-        if result.is_err() {
-            self.recover_from_error();
+            self.stop(open)
+        } else {
+            Ok(())
         }
-        result
     }
 }
 
@@ -2333,51 +2448,44 @@ where
         // Reject a doomed read before ANY op touches the bus. This is
         // the entry point device-driver crates actually use (the
         // trait's `write_read` is a provided method that delegates
-        // here), and `read_preflight` errors — empty buffer,
-        // `ChunkingRequired` on the DMA engine — fire before a
-        // recovery guard is armed, so a mid-list rejection would
-        // otherwise leave the transaction open with the bus held.
+        // here); a mid-list `read_preflight` rejection — empty buffer,
+        // `ChunkingRequired` on the DMA engine — would drop (and so
+        // recover) the open session, which is safe but wastes the
+        // whole partial transaction on a request that was doomed from
+        // the start.
         for op in operations.iter() {
             if let embedded_hal_async::i2c::Operation::Read(buf) = op {
                 <Self as AsyncEngine>::read_preflight(self, buf)?;
             }
         }
 
-        let result = async {
-            if let Some((last, rest)) = operations.split_last_mut() {
-                // Each op leaves its transaction open; the next op's
-                // repeated START consumes the token, and the last op's
-                // trailing STOP closes the chain.
-                let mut open: Option<Started> = None;
-                for op in rest {
-                    open = Some(match op {
-                        embedded_hal_async::i2c::Operation::Read(buf) => {
-                            <Self as AsyncEngine>::async_read_txn(self, address, buf, open.take()).await?
-                        }
-                        embedded_hal_async::i2c::Operation::Write(buf) => {
-                            <Self as AsyncEngine>::async_write_txn(self, address, buf, open.take()).await?
-                        }
-                    });
+        // No trailing cleanup: every abort — error returns and
+        // drop-cancellation alike — recovers by construction (see the
+        // blocking `transaction` above).
+        if let Some((first, rest)) = operations.split_first_mut() {
+            // See `exec` above for the threading.
+            let mut open = match first {
+                embedded_hal_async::i2c::Operation::Read(buf) => {
+                    <Self as AsyncEngine>::async_read_txn_fresh(self, address, buf).await?
                 }
-
-                match last {
+                embedded_hal_async::i2c::Operation::Write(buf) => {
+                    <Self as AsyncEngine>::async_write_txn_fresh(self, address, buf).await?
+                }
+            };
+            for op in rest {
+                open = match op {
                     embedded_hal_async::i2c::Operation::Read(buf) => {
-                        self.async_read_close(address, buf, open.take()).await
+                        <Self as AsyncEngine>::async_read_txn_continue(self, address, buf, open).await?
                     }
                     embedded_hal_async::i2c::Operation::Write(buf) => {
-                        self.async_write_close(address, buf, open.take()).await
+                        <Self as AsyncEngine>::async_write_txn_continue(self, address, buf, open).await?
                     }
-                }
-            } else {
-                Ok(())
+                };
             }
+            self.async_stop(open).await
+        } else {
+            Ok(())
         }
-        .await;
-
-        if result.is_err() {
-            self.recover_from_error();
-        }
-        result
     }
 }
 

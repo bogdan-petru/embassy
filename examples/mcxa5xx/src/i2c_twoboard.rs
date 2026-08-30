@@ -744,6 +744,11 @@ pub mod harness {
         );
         run_test!("soak", tests::t_soak(ctrl, &mut model, &mut stats));
         run_test!("settle_audit", tests::t_settle_audit(ctrl, &mut stats));
+        // AFTER the settle audit: the cancellation probe ends by
+        // scrubbing the audit counters (its aborts inflate them by
+        // design), and running it earlier would wipe the evidence the
+        // phase-end audit exists to judge.
+        run_test!("cancellation", tests::t_cancellation(ctrl, &mut model, &mut stats));
 
         defmt::info!(
             "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
@@ -1592,6 +1597,157 @@ pub mod tests {
             result = Err("set_config restore failed");
         }
         result
+    }
+
+    /// Drop-cancellation probe: races transfers against staggered
+    /// timer deadlines so their futures are dropped in every
+    /// transaction phase, then proves the driver recovered.
+    ///
+    /// The driver's contract under cancellation is that dropping a
+    /// transfer future — at ANY await point — recovers the bus: the
+    /// transaction session's drop runs remediation, and on the DMA
+    /// engine the channel is quiesced before the buffer borrow ends.
+    /// At the suite's Standard-speed base rate (~90 µs/byte) the
+    /// deadlines land inside the START/address phase, inside the
+    /// first data bytes, mid-transfer, and (the largest) racing
+    /// natural completion and the trailing STOP. Each race is followed
+    /// by an anchored exact read: if cancellation left the bus held,
+    /// commands queued, or a DMA channel live, that verify — or its
+    /// anchoring resync write — fails.
+    ///
+    /// Scope: the proof is END-TO-END recoverability. From outside the
+    /// driver a rig cannot attribute the recovery to the session's
+    /// drop specifically — a later transition's own recovery arms
+    /// clean up some abandonment shapes too — but a recovery path
+    /// that wedges the controller or corrupts later transfers fails
+    /// here regardless of which owner was supposed to run (this test
+    /// caught exactly such a wedge on first contact with hardware).
+    pub async fn t_cancellation<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+        use embassy_futures::select::{Either, select};
+        use embassy_time::Timer;
+
+        // On this rig a 32-byte read runs ~5–6 ms end to end (the
+        // emulated target stretches SCL between bytes); 30/80 µs
+        // cancel inside the START/address phase (before and after the
+        // driver queues its commands), 150–1500 µs land across the
+        // early data bytes, 2400–4500 µs walk the middle and late
+        // data, and 7000 µs sits past natural completion against the
+        // DMA target, so some transfers genuinely finish first there —
+        // the cancellation-vs-completion race at the close is probed
+        // from both sides. (The interrupt target's per-byte service
+        // stretches reads past even this; its races all cancel, which
+        // is fine — the completion side is covered by the DMA-target
+        // runs.)
+        const DEADLINES_US: &[u64] = &[30, 80, 150, 300, 700, 1500, 2400, 2900, 3200, 3800, 4500, 7000];
+        const REPS: usize = 3;
+
+        let mut cancelled = 0u32;
+        let mut completed = 0u32;
+        let mut faulted = 0u32;
+        for _rep in 0..REPS {
+            for &d in DEADLINES_US {
+                // Read race, anchored so a completed read is exactly
+                // checkable.
+                resync(ctrl, model).await?;
+                let t_race = Instant::now();
+                let mut buf = [0u8; 32];
+                match select(ctrl.read(TARGET_ADDR, &mut buf), Timer::after_micros(d)).await {
+                    Either::First(Ok(())) => {
+                        completed += 1;
+                        if !model.check_read(&buf) {
+                            return Err("cancellation: completed read mismatch");
+                        }
+                    }
+                    // A fault surfaced by the interference (e.g. the
+                    // spurious-ALF quirk) is acceptable: those error
+                    // paths recover too, and the verify below proves
+                    // it.
+                    Either::First(Err(_)) => faulted += 1,
+                    Either::Second(()) => cancelled += 1,
+                }
+                defmt::debug!(
+                    "[c] d={=u64} read race+recovery took {=u64}us",
+                    d,
+                    t_race.elapsed().as_micros()
+                );
+
+                // Recovery proof for the read race.
+                let mut verify = [0u8; 32];
+                op_read(ctrl, &mut verify, model, stats).await?;
+                if !model.check_read(&verify) {
+                    defmt::error!(
+                        "cancellation d={=u64}us post-read: got={:02x} want={:02x}",
+                        d,
+                        verify[..32],
+                        model.buf[..8]
+                    );
+                    // Raw follow-up reads (no resync): distinguish
+                    // drained-once staleness from a persistent shift.
+                    let mut r2 = [0u8; 8];
+                    let _ = ctrl.read(TARGET_ADDR, &mut r2).await;
+                    defmt::error!("  raw re-read 1: {:02x}", r2);
+                    let _ = ctrl.read(TARGET_ADDR, &mut r2).await;
+                    defmt::error!("  raw re-read 2: {:02x}", r2);
+                    return Err("cancellation: post-read-cancel verify mismatch");
+                }
+
+                // Write race: cancels mid-TRANSMIT and during the
+                // address phase. A cancelled write leaves the target
+                // buffer partially committed; the verify's anchoring
+                // resync rewrites it, so the model stays exact.
+                let w = [0xC5u8; 32];
+                let t_race = Instant::now();
+                match select(ctrl.write(TARGET_ADDR, &w), Timer::after_micros(d)).await {
+                    Either::First(Ok(())) => {
+                        completed += 1;
+                        model.write(&w);
+                    }
+                    Either::First(Err(_)) => faulted += 1,
+                    Either::Second(()) => cancelled += 1,
+                }
+                defmt::debug!(
+                    "[c] d={=u64} write race+recovery took {=u64}us",
+                    d,
+                    t_race.elapsed().as_micros()
+                );
+
+                // Recovery proof for the write race.
+                let mut verify = [0u8; 32];
+                op_read(ctrl, &mut verify, model, stats).await?;
+                if !model.check_read(&verify) {
+                    defmt::error!(
+                        "cancellation d={=u64}us post-write: got={:02x} want={:02x}",
+                        d,
+                        verify[..8],
+                        model.buf[..8]
+                    );
+                    return Err("cancellation: post-write-cancel verify mismatch");
+                }
+            }
+        }
+
+        // The short deadlines cannot lose to a multi-millisecond
+        // transfer; zero cancellations means the race never actually
+        // exercised the drop path.
+        if cancelled == 0 {
+            return Err("cancellation: no future was ever cancelled");
+        }
+        defmt::info!(
+            "[cancellation] {=u32} dropped mid-flight, {=u32} completed, {=u32} faulted",
+            cancelled,
+            completed,
+            faulted
+        );
+
+        // The aborts above are intentional protocol violations and can
+        // legitimately bump the target's premature-NeedMore counter (a
+        // recovery STOP can land at the razor boundary the audit
+        // watches for). This phase's settle_audit already ran — the
+        // scrub protects whatever comes NEXT (the following phase, or
+        // a rerun without a target reboot) from inheriting counts this
+        // test manufactured, defense in depth alongside the
+        // audit-reset every phase opens with.
+        t_audit_reset(ctrl, stats).await
     }
 
     /// Budget for premature-NeedMore events per phase. The documented

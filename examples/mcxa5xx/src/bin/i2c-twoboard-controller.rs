@@ -50,6 +50,17 @@ bind_interrupts!(
     }
 );
 
+/// Build-time phase filter: `SUITE_PHASES=async,dma,blocking` (default
+/// all). Lets a phase run as its own short probe session when the
+/// debug-probe environment cannot sustain a full-suite session (the
+/// board-A probe drops RTT-heavy sessions after 10–40 s of uptime).
+fn phase_enabled(phase: &str) -> bool {
+    match option_env!("SUITE_PHASES") {
+        None => true,
+        Some(list) => list.split(',').any(|p| p.trim() == phase),
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut config = Config::default();
@@ -57,6 +68,20 @@ async fn main(spawner: Spawner) {
 
     let mut p = hal::init(config);
     defmt::info!("i2c-twoboard-controller: driving 0x2a on LPI2C3 (P3_21 SCL / P3_20 SDA)");
+
+    // A phase-filtered build must say so loudly (a leaked env var in a
+    // CI build would otherwise skip phases yet exit success), and a
+    // filter that enables NO phase is a footgun, not a run.
+    if let Some(list) = option_env!("SUITE_PHASES") {
+        defmt::warn!(
+            "SUITE_PHASES={=str}: phase-filtered build, NOT a full validation run",
+            list
+        );
+        assert!(
+            ["async", "dma", "blocking"].iter().any(|p| phase_enabled(p)),
+            "SUITE_PHASES enables no phase"
+        );
+    }
 
     // Quiet window: this binary's own flash/reset can glitch a listening
     // target into a half-addressed ADRSTALL stretch that wedges the bus.
@@ -70,7 +95,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(i2c_twoboard::interference::task(160_000, 1_500).unwrap());
 
     // Phase 1: interrupt-driven async controller.
-    {
+    if phase_enabled("async") {
         let mut ccfg = controller::Config::default();
         ccfg.speed = Speed::Standard;
         let mut ctrl = I2c::new_async(p.LPI2C3.reborrow(), p.P3_21.reborrow(), p.P3_20.reborrow(), Irqs, ccfg).unwrap();
@@ -83,7 +108,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Phase 2: DMA controller over the same bus.
-    {
+    if phase_enabled("dma") {
         let mut ccfg = controller::Config::default();
         ccfg.speed = Speed::Standard;
         let mut ctrl = I2c::new_async_with_dma(
@@ -107,14 +132,14 @@ async fn main(spawner: Spawner) {
     }
 
     // Phase 3: blocking (polled) controller.
-    {
+    if phase_enabled("blocking") {
         let mut ccfg = controller::Config::default();
         ccfg.speed = Speed::Standard;
         let mut ctrl = I2c::new_blocking(p.LPI2C3.reborrow(), p.P3_21.reborrow(), p.P3_20.reborrow(), ccfg).unwrap();
         i2c_twoboard::harness::run_blocking("blocking", &mut ctrl);
     }
 
-    defmt::info!("== two-board i2c test: all phases passed ==");
+    defmt::info!("== two-board i2c test: all enabled phases passed ==");
     // Let the host drain the final RTT lines before the semihosting
     // exit tears the session down — the tail (including the verdict
     // line above) was otherwise observed truncated, with only the
