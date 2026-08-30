@@ -74,7 +74,7 @@ use super::controller_registers::{
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
-use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
+use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
@@ -314,9 +314,9 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 ///   to thread it — runs the same self-contained remediation the
 ///   recovery arms use, closing the transaction and releasing the
 ///   bus. The old silent-abandonment hole is not merely linted away;
-///   it now has defined, safe behavior. (Cleanup that is *channel*
-///   -specific — DMA quiesce — stays in the quiesce-only guards,
-///   which drop before the session by declaration order.)
+///   it now has defined, safe behavior. Channel-specific cleanup is
+///   owned by scoped RX/TX DMA leases, which retain the session and
+///   buffer until they disable MDER and quiesce eDMA.
 /// - **Runtime-enforced**: the session carries its controller's shared
 ///   state and every consumption asserts identity, so a session from
 ///   another instance fails deterministically — and `Info` carries a
@@ -376,6 +376,34 @@ impl Session {
             "i2c: a chained read command was requested before the first RECEIVE"
         );
         ReadReceivePermit::new(ControllerRegisters::new(self.info.regs()).identity(), self)
+    }
+
+    /// Mint the capability required to arm RX DMA. Keeping the session
+    /// borrow inside the resulting lease means cancellation cannot release
+    /// either the session or its destination buffer before the channel has
+    /// been quiesced.
+    fn rx_dma_permit(&mut self) -> RxDmaPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was handed to RX DMA"
+        );
+        let owner = ControllerRegisters::new(self.info.regs()).identity();
+        RxDmaPermit::new(owner, self)
+    }
+
+    /// Mint the capability required to arm TX DMA. DMA writes are valid
+    /// only after a write START has settled, while the session is in its
+    /// ordinary wire state.
+    fn tx_dma_permit(&mut self) -> TxDmaPermit<'_> {
+        assert!(
+            self.halt.is_empty(),
+            "i2c: a session with an unresolved halt was handed to TX DMA"
+        );
+        assert!(
+            self.phase == SessionPhase::Stable(Abort::General),
+            "i2c: TX DMA was requested outside the write transaction phase"
+        );
+        TxDmaPermit::new(ControllerRegisters::new(self.info.regs()).identity(), self)
     }
 
     /// A received byte proves the first queued RECEIVE executed. Later
@@ -863,6 +891,62 @@ pub(in crate::i2c) struct ReadReceivePermit<'a> {
 
 impl<'a> ReadReceivePermit<'a> {
     fn new(owner: usize, _session: &'a Session) -> Self {
+        Self {
+            owner,
+            _session: PhantomData,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+}
+
+/// Capability consumed by a controller RX-DMA lease. It is minted only
+/// after a first RECEIVE entered the FIFO (or while that read is already
+/// streaming), and the lease calls `note_read_progress` only after it has
+/// stopped the channel and observed the final transfer state.
+#[must_use]
+pub(in crate::i2c) struct RxDmaPermit<'a> {
+    owner: usize,
+    session: &'a mut Session,
+}
+
+impl<'a> RxDmaPermit<'a> {
+    fn new(owner: usize, session: &'a mut Session) -> Self {
+        assert!(
+            matches!(
+                session.phase,
+                SessionPhase::FirstReceivePending | SessionPhase::Stable(Abort::ReadStreaming)
+            ),
+            "i2c: RX DMA was requested before the first read command"
+        );
+        Self { owner, session }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    /// Preserve evidence that the first RECEIVE executed after the DMA
+    /// channel is genuinely idle. This is intentionally unavailable to a
+    /// caller before it has performed the lease's paired cleanup.
+    pub(in crate::i2c) fn note_read_progress(&mut self) {
+        self.session.note_read_progress();
+    }
+}
+
+/// Capability consumed by a controller TX-DMA lease. Its session borrow
+/// pins the recovery owner in place until the lease has disabled MDER and
+/// quiesced the eDMA channel.
+#[must_use]
+pub(in crate::i2c) struct TxDmaPermit<'a> {
+    owner: usize,
+    _session: PhantomData<&'a mut Session>,
+}
+
+impl<'a> TxDmaPermit<'a> {
+    fn new(owner: usize, _session: &'a mut Session) -> Self {
         Self {
             owner,
             _session: PhantomData,
@@ -2740,69 +2824,18 @@ impl<'d> I2c<'d, Dma<'d>> {
 }
 
 impl<'d> I2c<'d, Dma<'d>> {
-    /// One operation owns the RX DMA handoff: DMA writes made visible,
-    /// peripheral request off, channel quiesced (provably idle before
-    /// the buffer borrow ends). Returns whether the major loop had
-    /// completed. The register layer provides the primitives; this
-    /// compound sequence is the driver's protocol, in one place.
-    fn finish_rx_dma(&self) -> bool {
-        cortex_m::asm::dsb();
-        self.registers().set_rx_dma(false);
-        self.mode.rx_dma.quiesce()
-    }
-
-    /// Quiesce RX DMA and update the session phase from a post-quiesce byte
-    /// count. An incomplete major loop retains CITER, while a completed one
-    /// reloads it, so `quiesce`'s DONE result distinguishes the two cases.
-    /// This matters on a fault: a byte in memory *or still resident in the
-    /// RX FIFO* proves the first RECEIVE did execute, so recovery must not
-    /// inject another release RECEIVE.
-    fn finish_rx_dma_and_note(&self, total: usize, open: &mut Session) {
-        let complete = self.finish_rx_dma();
-        let moved = if complete {
-            total
-        } else {
-            self.mode.rx_dma.transferred_bytes()
-        };
-        if moved != 0 || self.registers().rx_pending() {
-            open.note_read_progress();
-        }
-    }
-
-    /// TX twin of [`Self::finish_rx_dma`].
-    fn finish_tx_dma(&self) -> bool {
-        cortex_m::asm::dsb();
-        self.registers().set_tx_dma(false);
-        self.mode.tx_dma.quiesce()
-    }
-
     /// Run one RX DMA transfer covering `buf`, waking on completion or on
     /// a bus fault (which would otherwise leave the DMA waiting forever).
-    /// The caller owns command queueing; this function binds any halting
-    /// fault to `open` before its public `IOError` can escape.
+    /// The returned lease owns the raw FIFO endpoint, the MDER/ERQ sequence,
+    /// and the cancellation cleanup; this function only waits and binds a
+    /// typed fault to the session before its public `IOError` can escape.
     async fn dma_read_into(&self, buf: &mut [u8], open: &mut Session) -> Result<(), IOError> {
-        let peri_addr = self.registers().rx_data_ptr();
-
-        unsafe {
-            // Clean up channel state
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-            self.mode.rx_dma.clear_interrupt();
-
-            // Set DMA request source from instance type (type-safe)
-            self.mode.rx_dma.set_request_source(self.mode.rx_request);
-
-            // Configure TCD for peripheral-to-memory transfer
-            self.mode
-                .rx_dma
-                .setup_read_from_peripheral(peri_addr, buf, false, TransferOptions::COMPLETE_INTERRUPT)?;
-
-            // Enable I2C RX DMA request
-            self.registers().set_rx_dma(true);
-
-            // Enable DMA channel request
-            self.mode.rx_dma.enable_request();
-        }
+        // Compute this before borrowing `buf` into the DMA lease. The lease
+        // keeps that borrow live until its Drop/finish quiesces the channel.
+        let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
+        let lease = self
+            .registers()
+            .arm_rx_dma(open.rx_dma_permit(), &self.mode.rx_dma, self.mode.rx_request, buf)?;
 
         // Wait for completion asynchronously — or for a bus error
         // (NACK, arbitration loss, FIFO error) that stops the
@@ -2835,17 +2868,11 @@ impl<'d> I2c<'d, Dma<'d>> {
             }
             core::task::Poll::Pending
         });
-        // ~1 ms/byte of margin on top of a generous floor.
-        let bound = self.timeout + embassy_time::Duration::from_millis(buf.len() as u64);
-        let total = buf.len();
-        // This inner guard carries the session phase across cancellation of
-        // the DMA wait itself. The outer read guards still protect their
-        // wider pipelines; this one is the only layer that can distinguish
-        // an incomplete DMA major loop with a partially received first byte.
-        let cleanup = OnDrop::new(|| self.finish_rx_dma_and_note(total, open));
         let result = embassy_time::with_timeout(bound, wait).await;
-        cleanup.defuse();
-        self.finish_rx_dma_and_note(total, open);
+        // Consume the lease before touching `open`: it both releases the
+        // session borrow and preserves a first-RECEIVE execution proof from
+        // the final DMA/FIFO state.
+        let _ = lease.finish();
 
         match result {
             Ok(Ok(())) => {}
@@ -2911,18 +2938,10 @@ impl<'d> I2c<'d, Dma<'d>> {
     /// transfer over the whole buffer, on the already-open transaction.
     /// Does not send the trailing STOP.
     ///
-    /// Abort ordering on any drop path: `quiesce` is declared after
-    /// `open`, so it drops FIRST — the DMA request path must be off
-    /// and the channel provably inactive before the session's recovery
-    /// resets the FIFOs (which can reassert the peripheral request)
-    /// and before `read`'s borrow ends (an in-flight minor loop would
-    /// write into it after this future unwound; `disable_request`
-    /// alone does not wait for that loop).
+    /// A live `RxDmaLease` owns the DMA handoff. On any cancellation path it
+    /// drops before this session, first disabling MDER and quiescing eDMA,
+    /// then allowing session recovery to reset FIFOs or release `read`.
     async fn dma_read_chained(&self, read: &mut [u8], mut open: Session) -> Result<Session, IOError> {
-        let quiesce = OnDrop::new(|| {
-            self.finish_rx_dma();
-        });
-
         // Queue every RECEIVE command up front (they fit). The first
         // goes in unconditionally — see `blocking_read_chained`.
         let total = read.len();
@@ -2945,10 +2964,6 @@ impl<'d> I2c<'d, Dma<'d>> {
         }
 
         self.dma_read_into(read, &mut open).await?;
-
-        // `dma_read_into`'s completion path already quiesced the
-        // channel; nothing is in flight past this point.
-        quiesce.defuse();
         Ok(open)
     }
 
@@ -2978,29 +2993,19 @@ impl<'d> I2c<'d, Dma<'d>> {
     }
 
     /// Drain ONE seam chunk (at most 256 bytes: one RECEIVE command,
-    /// one DMA transfer) on the open transaction. Abort ordering as in
-    /// [`Self::dma_read_chained`]: the quiesce guard drops before the
-    /// session's recovery.
+    /// one DMA transfer) on the open transaction. Its scoped DMA lease
+    /// quiesces before any session recovery can run.
     async fn dma_read_seam_chunk(&self, chunk: &mut [u8], mut open: Session) -> Result<Session, IOError> {
-        let quiesce = OnDrop::new(|| {
-            self.finish_rx_dma();
-        });
-
         // send receive command
         self.enqueue_first_receive(chunk.len(), &mut open)?;
 
         self.dma_read_into(chunk, &mut open).await?;
-
-        // The chunk is drained and its channel quiesced by
-        // `dma_read_into`'s completion path.
-        quiesce.defuse();
         Ok(open)
     }
 
-    /// The DMA write engine past the address phase. Abort ordering as
-    /// in [`Self::dma_read_chained`]: the quiesce guard drops before
-    /// the session, so the channel is provably idle before recovery
-    /// touches the FIFOs and before `write`'s borrow ends.
+    /// The DMA write engine past the address phase. Each scoped TX lease
+    /// owns request shutdown and quiescence before recovery can touch FIFOs
+    /// or the caller's write borrow can end.
     async fn dma_write_body(&self, write: &[u8], mut open: Session) -> Result<Session, IOError> {
         // Usually, embassy HALs error out with an empty write,
         // however empty writes are useful for writing I2C scanning
@@ -3018,36 +3023,13 @@ impl<'d> I2c<'d, Dma<'d>> {
             return Ok(open);
         }
 
-        let quiesce = OnDrop::new(|| {
-            self.finish_tx_dma();
-        });
-
         for chunk in write.chunks(DMA_MAX_TRANSFER_SIZE) {
-            let peri_addr = self.registers().tx_data_ptr();
-
-            unsafe {
-                // Clean up channel state
-                self.mode.tx_dma.disable_request();
-                self.mode.tx_dma.clear_done();
-                self.mode.tx_dma.clear_interrupt();
-
-                // Set DMA request source from instance type (type-safe)
-                self.mode.tx_dma.set_request_source(self.mode.tx_request);
-
-                // Configure TCD for memory-to-peripheral transfer
-                self.mode.tx_dma.setup_write_to_peripheral(
-                    chunk,
-                    peri_addr,
-                    false,
-                    TransferOptions::COMPLETE_INTERRUPT,
-                )?;
-
-                // Enable I2C TX DMA request
-                self.registers().set_tx_dma(true);
-
-                // Enable DMA channel request
-                self.mode.tx_dma.enable_request();
-            }
+            // Compute the deadline before the TX lease retains the source
+            // borrow. It will not release that borrow until eDMA is idle.
+            let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
+            let lease =
+                self.registers()
+                    .arm_tx_dma(open.tx_dma_permit(), &self.mode.tx_dma, self.mode.tx_request, chunk)?;
 
             // Wait for completion asynchronously — or for a bus error
             // (NACK, arbitration loss, FIFO error) that stops the
@@ -3070,18 +3052,18 @@ impl<'d> I2c<'d, Dma<'d>> {
                 }
                 core::task::Poll::Pending
             });
-            // ~1 ms/byte of margin on top of a generous floor.
-            let bound = self.timeout + embassy_time::Duration::from_millis(chunk.len() as u64);
-            match embassy_time::with_timeout(bound, wait).await {
+            let result = embassy_time::with_timeout(bound, wait).await;
+            // The lease is consumed before an error can hand a fault to the
+            // session, so no DMA write remains live while recovery runs.
+            let _ = lease.finish();
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(DmaWaitError::Fault(fault))) => return Err(open.bind_fault(fault)),
                 Ok(Err(DmaWaitError::UnexpectedStop)) => unreachable!("TX DMA does not wait for receive termination"),
-                // The quiesce guard and the session drop handle this
-                // return, in that order.
+                // `lease.finish` already shut down the DMA request path;
+                // dropping the session now owns only bus recovery.
                 Err(_) => return Err(IOError::Timeout),
             }
-
-            self.finish_tx_dma();
 
             // As in RX, a major-loop completion can win the poll race
             // against a simultaneous controller fault. The channel is
@@ -3090,10 +3072,6 @@ impl<'d> I2c<'d, Dma<'d>> {
                 return Err(open.bind_fault(fault));
             }
         }
-
-        // Every chunk is drained and the channel quiesced; the close
-        // variant owns the trailing stop.
-        quiesce.defuse();
 
         Ok(open)
     }

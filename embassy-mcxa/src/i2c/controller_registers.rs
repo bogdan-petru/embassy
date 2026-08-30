@@ -25,8 +25,10 @@
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
+use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest, InvalidParameters, TransferOptions};
 use crate::i2c::controller::{
-    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, StartTransitionPermit,
+    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, RxDmaPermit, StartTransitionPermit,
+    TxDmaPermit,
 };
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
@@ -441,9 +443,111 @@ const _: () = {
 };
 
 /// Safe controller-specific operations over the LPI2C register block.
+#[derive(Clone, Copy)]
 pub(in crate::i2c) struct ControllerRegisters {
     regs: &'static LpI2cRegisters,
 }
+
+/// A live RX DMA handoff to the controller's read-only FIFO port.
+///
+/// It owns the pairing that raw pointer APIs cannot express: MDER is off
+/// and the channel is quiesced before the destination borrow and its session
+/// capability are released. The only explicit completion path and `Drop`
+/// use the same cleanup routine.
+#[must_use]
+pub(in crate::i2c) struct RxDmaLease<'s, 'channel, 'dma, 'buf> {
+    regs: ControllerRegisters,
+    channel: &'channel DmaChannel<'dma>,
+    permit: RxDmaPermit<'s>,
+    total: usize,
+    armed: bool,
+    _buffer: core::marker::PhantomData<&'buf mut [u8]>,
+}
+
+impl RxDmaLease<'_, '_, '_, '_> {
+    /// Quiesce the exact request path this lease armed and retain a
+    /// first-read proof if DMA moved a byte or a byte remains in MRDR.
+    fn quiesce_and_note(&mut self) -> bool {
+        cortex_m::asm::dsb();
+        self.regs.set_rx_dma(false);
+        let complete = self.channel.quiesce();
+        let moved = if complete {
+            self.total
+        } else {
+            self.channel.transferred_bytes()
+        };
+        if moved != 0 || self.regs.rx_pending() {
+            self.permit.note_read_progress();
+        }
+        complete
+    }
+
+    /// Finish the DMA handoff before inspecting status or returning from the
+    /// transfer. Dropping an unfinished lease performs the same operation.
+    pub(in crate::i2c) fn finish(mut self) -> bool {
+        let complete = self.quiesce_and_note();
+        self.armed = false;
+        complete
+    }
+}
+
+impl Drop for RxDmaLease<'_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.quiesce_and_note();
+        }
+    }
+}
+
+/// A live TX DMA handoff to the controller's write-only command/data port.
+/// See [`RxDmaLease`] for why this is a lease rather than a bare address.
+#[must_use]
+pub(in crate::i2c) struct TxDmaLease<'s, 'channel, 'dma, 'buf> {
+    regs: ControllerRegisters,
+    channel: &'channel DmaChannel<'dma>,
+    _permit: TxDmaPermit<'s>,
+    armed: bool,
+    _buffer: core::marker::PhantomData<&'buf [u8]>,
+}
+
+impl TxDmaLease<'_, '_, '_, '_> {
+    fn quiesce(&mut self) -> bool {
+        cortex_m::asm::dsb();
+        self.regs.set_tx_dma(false);
+        self.channel.quiesce()
+    }
+
+    /// Finish the DMA handoff before status is inspected or its source
+    /// buffer can be released. Dropping an unfinished lease does the same.
+    pub(in crate::i2c) fn finish(mut self) -> bool {
+        let complete = self.quiesce();
+        self.armed = false;
+        complete
+    }
+}
+
+impl Drop for TxDmaLease<'_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.quiesce();
+        }
+    }
+}
+
+/// Match the eDMA setup APIs' buffer precondition before an arm method
+/// mutates any channel state. That keeps a rejected future call site
+/// completely side-effect free rather than relying on a cleanup lease that
+/// cannot exist until after setup succeeds.
+const fn dma_buffer_fits(length: usize) -> bool {
+    length != 0 && length <= DMA_MAX_TRANSFER_SIZE
+}
+
+const _: () = {
+    assert!(!dma_buffer_fits(0));
+    assert!(dma_buffer_fits(1));
+    assert!(dma_buffer_fits(DMA_MAX_TRANSFER_SIZE));
+    assert!(!dma_buffer_fits(DMA_MAX_TRANSFER_SIZE.saturating_add(1)));
+};
 
 impl ControllerRegisters {
     pub(in crate::i2c) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
@@ -1240,22 +1344,113 @@ impl ControllerRegisters {
         self.regs.mtdr.set(v.0);
     }
 
-    // DMA plumbing: request enables and the FIFO data addresses the DMA
-    // engine reads/writes directly.
+    // DMA plumbing. The FIFO addresses remain entirely inside the facade:
+    // callers receive a directional lease rather than a raw pointer, so the
+    // setup order and inverse cleanup cannot drift apart.
 
-    pub(in crate::i2c) fn set_rx_dma(&self, enable: bool) {
+    fn set_rx_dma(&self, enable: bool) {
         self.modify_mder(|w| w.set_rdde(enable));
     }
 
-    pub(in crate::i2c) fn set_tx_dma(&self, enable: bool) {
+    fn set_tx_dma(&self, enable: bool) {
         self.modify_mder(|w| w.set_tdde(enable));
     }
 
-    pub(in crate::i2c) fn rx_data_ptr(&self) -> *const u8 {
-        &self.regs.mrdr as *const _ as *const u8
+    /// Configure and arm a controller-to-memory DMA transfer.
+    ///
+    /// This is the sole safe owner of the MRDR endpoint. Its return value
+    /// retains both the live session proof and destination borrow until the
+    /// paired `MDER off -> eDMA quiesce` cleanup runs.
+    pub(in crate::i2c) fn arm_rx_dma<'s, 'channel, 'dma, 'buf>(
+        &self,
+        permit: RxDmaPermit<'s>,
+        channel: &'channel DmaChannel<'dma>,
+        request: DmaRequest,
+        buffer: &'buf mut [u8],
+    ) -> Result<RxDmaLease<'s, 'channel, 'dma, 'buf>, InvalidParameters> {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: an RX DMA permit was used through a different controller"
+        );
+        if !dma_buffer_fits(buffer.len()) {
+            return Err(InvalidParameters);
+        }
+        let total = buffer.len();
+
+        // SAFETY: the capability proves this controller has a live read
+        // session, MRDR is the Tock-typed read-only FIFO port, and the
+        // returned lease retains `buffer` until it disables MDER and waits
+        // for an active minor loop to finish.
+        unsafe {
+            channel.disable_request();
+            channel.clear_done();
+            channel.clear_interrupt();
+            channel.set_request_source(request);
+            channel.setup_read_from_peripheral(
+                &self.regs.mrdr as *const _ as *const u8,
+                buffer,
+                false,
+                TransferOptions::COMPLETE_INTERRUPT,
+            )?;
+            self.set_rx_dma(true);
+            channel.enable_request();
+        }
+
+        Ok(RxDmaLease {
+            regs: *self,
+            channel,
+            permit,
+            total,
+            armed: true,
+            _buffer: core::marker::PhantomData,
+        })
     }
 
-    pub(in crate::i2c) fn tx_data_ptr(&self) -> *mut u8 {
-        &self.regs.mtdr as *const _ as *mut u8
+    /// Configure and arm a memory-to-controller DMA transfer.
+    ///
+    /// This is the sole safe owner of the MTDR endpoint. The directional
+    /// permit prevents an RX phase from accidentally writing commands/data,
+    /// and the returned lease owns the matching shutdown.
+    pub(in crate::i2c) fn arm_tx_dma<'s, 'channel, 'dma, 'buf>(
+        &self,
+        permit: TxDmaPermit<'s>,
+        channel: &'channel DmaChannel<'dma>,
+        request: DmaRequest,
+        buffer: &'buf [u8],
+    ) -> Result<TxDmaLease<'s, 'channel, 'dma, 'buf>, InvalidParameters> {
+        assert!(
+            self.register_address() == permit.owner(),
+            "i2c: a TX DMA permit was used through a different controller"
+        );
+        if !dma_buffer_fits(buffer.len()) {
+            return Err(InvalidParameters);
+        }
+
+        // SAFETY: the capability proves this controller has a live write
+        // session, MTDR is the Tock-typed write-only FIFO port, and the
+        // returned lease retains `buffer` until the request path is shut
+        // down and eDMA has become inactive.
+        unsafe {
+            channel.disable_request();
+            channel.clear_done();
+            channel.clear_interrupt();
+            channel.set_request_source(request);
+            channel.setup_write_to_peripheral(
+                buffer,
+                &self.regs.mtdr as *const _ as *mut u8,
+                false,
+                TransferOptions::COMPLETE_INTERRUPT,
+            )?;
+            self.set_tx_dma(true);
+            channel.enable_request();
+        }
+
+        Ok(TxDmaLease {
+            regs: *self,
+            channel,
+            _permit: permit,
+            armed: true,
+            _buffer: core::marker::PhantomData,
+        })
     }
 }
