@@ -214,4 +214,94 @@ impl TargetRegisters {
         v.set_data(byte);
         self.regs.stdr.set(v.0);
     }
+
+    // DMA-transfer vocabulary. A DMA-driven transfer moves data
+    // through the engine, so RDF/TDF are not firmware events — but
+    // every OTHER decision (what wakes the waiter, how a finished
+    // chunk is classified, in which priority co-latched flags are
+    // honored) is the same decision the interrupt paths make, and it
+    // is made HERE, once, so the two modes cannot drift. The
+    // marooned-residue and FEF-before-BEF defects both lived in a DMA
+    // path that re-made these decisions at the call site.
+
+    /// Interrupts for a DMA-driven transfer: fault and termination
+    /// sources only (RDF/TDF service the DMA engine, not firmware).
+    /// The armed set equals [`Self::dma_transfer_event`]'s wake set.
+    pub(super) fn enable_dma_transfer_interrupts(&self) {
+        self.write_sier(|w| {
+            w.set_feie(true);
+            w.set_beie(true);
+            w.set_sdie(true);
+            w.set_rsie(true);
+        });
+    }
+
+    /// Wake condition paired with
+    /// [`Self::enable_dma_transfer_interrupts`]: any latched fault or
+    /// termination. (DMA completion wakes through the channel's own
+    /// cell and is checked separately.)
+    pub(super) fn dma_transfer_event(&self) -> bool {
+        let ssr = self.ssr();
+        ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf()
+    }
+
+    /// Drain RX residue into `data[from..]`, returning the new count.
+    ///
+    /// Routes through [`Self::rx_event`], so the drain inherits the
+    /// vocabulary's order (data first) and its popping discipline. The
+    /// loop ends at buffer capacity or on the first non-data event —
+    /// which is NOT consumed, so the caller's classification still
+    /// sees it.
+    pub(super) fn drain_rx(&self, data: &mut [u8], mut from: usize) -> usize {
+        while from < data.len() {
+            match self.rx_event() {
+                Some(TargetRxEvent::Byte(b)) => {
+                    data[from] = b;
+                    from += 1;
+                }
+                _ => break,
+            }
+        }
+        from
+    }
+
+    /// Whether RX data is still pending — the full-chunk residue
+    /// decision after a drain hit buffer capacity.
+    pub(super) fn rx_pending(&self) -> bool {
+        self.ssr().rdf()
+    }
+
+    /// Terminal classification of a DMA chunk, in the vocabulary's
+    /// single flag-priority order: bit error before FIFO error
+    /// (matching [`Self::rx_event`]/[`Self::tx_step`]), faults before
+    /// termination. Consumes nothing.
+    pub(super) fn chunk_end(&self) -> ChunkEnd {
+        let ssr = self.ssr();
+        if ssr.bef() {
+            ChunkEnd::Fault(TargetFault::Bit)
+        } else if ssr.fef() {
+            ChunkEnd::Fault(TargetFault::Fifo)
+        } else if ssr.sdf() {
+            ChunkEnd::Stopped
+        } else if ssr.rsf() {
+            ChunkEnd::Restarted
+        } else {
+            ChunkEnd::Continue
+        }
+    }
+}
+
+/// Terminal classification of a DMA chunk transfer — see
+/// [`TargetRegisters::chunk_end`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum ChunkEnd {
+    /// A fault; the transfer is compromised.
+    Fault(TargetFault),
+    /// The controller issued a STOP.
+    Stopped,
+    /// The controller issued a repeated START.
+    Restarted,
+    /// No fault or termination latched.
+    Continue,
 }

@@ -277,21 +277,59 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 // write, so the controller's read-back verifies the
                 // residue byte end to end.
                 let mut small = [0u8; OVERFLOW_PROBE_LEN + 8];
-                let s1 = tgt.respond_write(&mut small[..OVERFLOW_PROBE_LEN]).await.unwrap();
-                let n1 = match s1 {
+                // Latency spike, joined with the first respond: block
+                // all interrupts for ~600us starting ~600us in — right
+                // when the 8th byte's DMA completion fires (~765us
+                // after the address phase released). Without this the
+                // maroon branches are unreachable in practice:
+                // ADRSTALL phase-locks every transaction to the
+                // periodic interference grid (the address phase
+                // stretches THROUGH a blackout, so the data phase runs
+                // in the clear — measured 0/48 branch hits), and an
+                // un-delayed poll classifies the DMA completion before
+                // the ninth byte and STOP even arrive. With the spike,
+                // the completion, the residue byte, and the
+                // termination are all latched by the time firmware
+                // looks — the residue-deferral branch, deterministic.
+                // The eDMA and the bus need no CPU service meanwhile.
+                let spike = async {
+                    embassy_time::Timer::after_micros(600).await;
+                    critical_section::with(|_| cortex_m::asm::delay(20_000));
+                };
+                let (s1, ()) =
+                    embassy_futures::join::join(tgt.respond_write(&mut small[..OVERFLOW_PROBE_LEN]), spike).await;
+                let mut status = s1.unwrap();
+                let mut total = match status {
                     WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
                     _ => 0,
-                };
-                let mut total = n1.min(OVERFLOW_PROBE_LEN);
-                if matches!(s1, WriteStatus::BufferFull(_)) {
-                    let s2 = tgt.respond_write(&mut small[total..]).await.unwrap();
-                    let n2 = match s2 {
-                        WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
-                        _ => 0,
-                    };
-                    let n2 = n2.min(small.len() - total);
-                    defmt::info!("[T] overflow probe: BufferFull({}) + residue {}", total, n2);
-                    total += n2;
+                }
+                .min(OVERFLOW_PROBE_LEN);
+                let first_full = matches!(status, WriteStatus::BufferFull(_));
+                // Service to a clean termination NO MATTER how much
+                // arrives: an armed probe can be consumed by a retry's
+                // 40-byte resync instead of the 9-byte probe write,
+                // and abandoning a still-open transaction here would
+                // wedge the bus under RXSTALL. Collect what fits,
+                // discard the rest.
+                while matches!(status, WriteStatus::BufferFull(_)) {
+                    if total < small.len() {
+                        status = tgt.respond_write(&mut small[total..]).await.unwrap();
+                        let n = match status {
+                            WriteStatus::Stopped(n) | WriteStatus::Restarted(n) | WriteStatus::BufferFull(n) => n,
+                            _ => 0,
+                        };
+                        total = (total + n).min(small.len());
+                    } else {
+                        let mut waste = [0u8; 64];
+                        status = tgt.respond_write(&mut waste).await.unwrap();
+                    }
+                }
+                if first_full {
+                    defmt::info!(
+                        "[T] overflow probe: BufferFull({}) then {} more",
+                        OVERFLOW_PROBE_LEN,
+                        total - OVERFLOW_PROBE_LEN.min(total)
+                    );
                 } else {
                     defmt::info!("[T] overflow probe: no overflow ({})", total);
                 }
@@ -1195,30 +1233,38 @@ pub mod tests {
         op_write(ctrl, &msg, model, stats).await
     }
 
+    /// How many times the overflow probe runs per phase — the residue
+    /// branches it aims at are timing-dependent (see below), so the
+    /// probe repeats to give them many chances per run.
+    const OVERFLOW_PROBE_REPS: usize = 24;
+
     /// Overflow probe: arm the target to serve the next write with a
     /// deliberately small buffer, then write one byte more than it
-    /// holds. Exercises the `BufferFull` follow-up contract — and on
-    /// the DMA target, deterministically executes BOTH residue
-    /// branches of the driver's chunk read: the first respond hits
-    /// full-chunk-with-RDF-pending (the extra byte's DMA request is
-    /// never granted, the major loop having completed) and must report
-    /// `BufferFull`, and the follow-up respond hits the terminal drain
-    /// (data collected through `rx_event` before the latched
-    /// termination is honored). Neither branch is reachable through
-    /// the normal oversized scratch. The read-back proves the residue
-    /// byte survived end to end; the target's log says which path ran.
+    /// holds, and read back WITHOUT re-anchoring — the read-back is
+    /// the proof, and an anchor resync would repair a dropped ninth
+    /// byte before validation could see it (each retry restarts the
+    /// whole arm/write/read sequence instead).
     ///
-    /// A bus-error retry of the data write consumes the one-shot probe
-    /// and lands on the normal oversized path — the data contract is
-    /// identical, so the test stays green (and writes are effectively
-    /// immune to the read-side ALF quirk, so the probe path is the
-    /// overwhelmingly common one).
+    /// What this proves deterministically: the `BufferFull` follow-up
+    /// contract end to end, on both target modes — no byte of the
+    /// overflowing write is lost or misattributed, whichever internal
+    /// path served it. What it exercises statistically: the DMA
+    /// target's residue branches. Whether the ninth byte is marooned
+    /// (its request rescinded or never granted with the termination
+    /// already latched) or simply collected by the follow-up
+    /// respond's fresh DMA depends on executor latency relative to
+    /// the last two byte times, so the probe repeats
+    /// [`OVERFLOW_PROBE_REPS`] times per phase under the target's
+    /// interference blackouts, and the driver logs each residue
+    /// branch at debug level — branch counts are MEASURED from the
+    /// target's RTT and reported, not asserted, because they depend
+    /// on bus timing; the correctness contract above is what must
+    /// always hold.
     pub async fn t_overflow_write<C: Controller>(
         ctrl: &mut C,
         model: &mut Model,
         stats: &mut RetryStats,
     ) -> TestResult {
-        // Arm (one-shot). A command, not data — nothing to commit.
         let arm = [
             CTRL_MAGIC[0],
             CTRL_MAGIC[1],
@@ -1226,21 +1272,57 @@ pub mod tests {
             CTRL_MAGIC[3],
             CTRL_ARM_OVERFLOW_PROBE,
         ];
-        op_write(ctrl, &arm, model, stats).await?;
-
-        // One byte more than the probe buffer holds; distinct values.
         let mut w = [0u8; OVERFLOW_PROBE_LEN + 1];
-        for (i, b) in w.iter_mut().enumerate() {
-            *b = 0xA0 | i as u8;
-        }
-        op_write(ctrl, &w, model, stats).await?;
-        model.write(&w);
 
-        let mut r = [0u8; OVERFLOW_PROBE_LEN + 1];
-        op_read(ctrl, &mut r, model, stats).await?;
-        if !model.check_read(&r) {
-            defmt::error!("overflow write: read-back mismatch got={:02x}", r);
-            return Err("overflow_write: mismatch");
+        'reps: for rep in 0..OVERFLOW_PROBE_REPS {
+            for attempt in 0..=MAX_RETRIES {
+                // One byte more than the probe buffer holds. The
+                // payload VARIES per rep AND per attempt: the previous
+                // rep (or this rep's previous attempt) already
+                // committed its values, so a dropped ninth byte would
+                // otherwise be masked by an identical stale value
+                // underneath.
+                let base = 0xA0u8 ^ (rep as u8).wrapping_mul(0x21) ^ (attempt as u8).wrapping_mul(0x0B);
+                for (i, b) in w.iter_mut().enumerate() {
+                    *b = base ^ i as u8;
+                }
+                // Arm (one-shot; a command, not data). An arm consumed
+                // by a retry's resync routes the data write through the
+                // normal oversized path — correctness identical, branch
+                // chance lost for this rep; the target log tells.
+                op_write(ctrl, &arm, model, stats).await?;
+                // The overflowing write; commits and rewinds cursor.
+                op_write(ctrl, &w, model, stats).await?;
+                model.write(&w);
+
+                // UNANCHORED read-back: the write above rewound the
+                // cursor, and nothing may rewrite the buffer between
+                // write and verify. A dropped ninth byte fails here.
+                let mut r = [0u8; OVERFLOW_PROBE_LEN + 1];
+                match ctrl.read(TARGET_ADDR, &mut r).await {
+                    Ok(()) => {
+                        if !model.check_read(&r) {
+                            defmt::error!("overflow write: read-back mismatch got={:02x}", r);
+                            return Err("overflow_write: mismatch");
+                        }
+                        continue 'reps;
+                    }
+                    // The failed read advanced the cursor by however
+                    // many bytes it clocked, so an unanchored re-read
+                    // would be shifted: restart the whole sequence.
+                    Err(ControllerIOError::ArbitrationLoss) => stats.alf_retries += 1,
+                    Err(ControllerIOError::UnexpectedStop) | Err(ControllerIOError::Timeout) => {
+                        stats.end_retries += 1;
+                    }
+                    Err(e) => {
+                        defmt::error!("overflow write: read failed {}", e);
+                        return Err("overflow_write: read failed");
+                    }
+                }
+                if attempt == MAX_RETRIES {
+                    return Err("overflow_write: retries exhausted");
+                }
+            }
         }
         Ok(())
     }

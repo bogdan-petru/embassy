@@ -73,7 +73,7 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::target_registers::{TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
+use super::target_registers::{ChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -960,15 +960,10 @@ impl<'d> I2c<'d, Dma<'d>> {
             while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
-            self.info.regs().sier().write(|w| {
-                w.set_feie(true);
-                w.set_beie(true);
-                w.set_sdie(true);
-                w.set_rsie(true);
-            });
-
-            let ssr = self.info.regs().ssr().read();
-            if ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf() || self.mode.rx_dma.is_done() {
+            // Arm-and-check through the vocabulary: the armed set and
+            // the wake set are defined together in one place.
+            self.registers().enable_dma_transfer_interrupts();
+            if self.registers().dma_transfer_event() || self.mode.rx_dma.is_done() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -990,7 +985,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // Ensure all writes by DMA are visible to the CPU
         fence(Ordering::Acquire);
 
-        let mut bytes = if filled {
+        let moved = if filled {
             chunk_len
         } else {
             self.mode.rx_dma.transferred_bytes()
@@ -1000,57 +995,60 @@ impl<'d> I2c<'d, Dma<'d>> {
         // controller can deliver a byte (RDF set, DMA request asserted)
         // and STOP before the eDMA arbitrates the request, and shutting
         // the request path down above rescinds it — marooning the byte
-        // in the FIFO while the count reads one short. Drain what the
-        // FIFO still holds through the vocabulary, whose order (data
-        // before termination) is exactly what the interrupt path's
-        // `rx_event` already enforces and what the reference driver
-        // does. Nothing new can arrive mid-drain: the transaction has
-        // terminated, and ADRSTALL stretches the next address phase
-        // until `listen` services it, so every drained byte belongs to
-        // this transfer. (Residue the chunk has no room for is handled
-        // by the RDF arm of the classification below.)
-        while bytes < chunk_len {
-            match self.registers().rx_event() {
-                Some(TargetRxEvent::Byte(b)) => {
-                    data[bytes] = b;
-                    bytes += 1;
-                }
-                _ => break,
-            }
+        // in the FIFO while the count reads one short. `drain_rx`
+        // collects what the FIFO still holds through the vocabulary,
+        // whose order (data before termination) is exactly what the
+        // interrupt path's `rx_event` already enforces and what the
+        // reference driver does. Nothing new can arrive mid-drain: the
+        // transaction has terminated, and ADRSTALL stretches the next
+        // address phase until `listen` services it, so every drained
+        // byte belongs to this transfer. (Residue the chunk has no
+        // room for is handled by the residue check below.)
+        let bytes = self.registers().drain_rx(&mut data[..chunk_len], moved);
+        #[cfg(feature = "defmt")]
+        if bytes > moved {
+            defmt::debug!(
+                "i2c target rx: drained {} residue byte(s) at termination",
+                bytes - moved
+            );
         }
 
-        let ssr = self.info.regs().ssr().read();
-
-        if ssr.fef() {
-            // Parity with the interrupt paths' fault arms: the error
-            // discards this transfer's accounting, so whatever the
-            // FIFOs still hold must not survive into the next
-            // transaction as its first bytes.
-            self.reset_fifos();
-            Err(IOError::FifoError)
-        } else if ssr.bef() {
-            self.reset_fifos();
-            Err(IOError::BitError)
-        } else if ssr.rdf() && bytes == chunk_len {
-            // Data is still pending with no room left in this chunk —
-            // even if a termination flag is also latched. Mirror the
-            // interrupt engine's data-before-termination contract:
-            // report the chunk full so the caller collects the residue
-            // (next chunk, or `BufferFull` and a follow-up respond —
-            // SDF/RSF stay latched for it, so the follow-up's entry
-            // wait completes immediately, drains the residue, and only
-            // then reports the termination). Affirming `Stopped` here
-            // would maroon the residue in the FIFO to be DMA'd into
-            // the NEXT transaction's first bytes.
-            Ok(RxChunkOutcome::Filled(chunk_len))
-        } else if ssr.sdf() {
-            Ok(RxChunkOutcome::Stopped(bytes))
-        } else if ssr.rsf() {
-            Ok(RxChunkOutcome::Restarted(bytes))
-        } else {
-            // DMA done with no end-of-transfer flag: chunk filled, controller
-            // may want to write more bytes.
-            Ok(RxChunkOutcome::Filled(chunk_len))
+        match self.registers().chunk_end() {
+            ChunkEnd::Fault(f) => {
+                // Parity with the interrupt paths' fault arms: the
+                // error discards this transfer's accounting, so
+                // whatever the FIFOs still hold must not survive into
+                // the next transaction as its first bytes.
+                self.reset_fifos();
+                Err(f.into())
+            }
+            end => {
+                if self.registers().rx_pending() && bytes == chunk_len {
+                    // Data is still pending with no room left in this
+                    // chunk — even if a termination flag is also
+                    // latched. Mirror the interrupt engine's
+                    // data-before-termination contract: report the
+                    // chunk full so the caller collects the residue
+                    // (next chunk, or `BufferFull` and a follow-up
+                    // respond — SDF/RSF stay latched for it, so the
+                    // follow-up's entry wait completes immediately,
+                    // drains the residue, and only then reports the
+                    // termination). Affirming `Stopped` here would
+                    // maroon the residue in the FIFO to be DMA'd into
+                    // the NEXT transaction's first bytes.
+                    #[cfg(feature = "defmt")]
+                    defmt::debug!("i2c target rx: residue beyond chunk; deferring to follow-up");
+                    return Ok(RxChunkOutcome::Filled(chunk_len));
+                }
+                match end {
+                    ChunkEnd::Stopped => Ok(RxChunkOutcome::Stopped(bytes)),
+                    ChunkEnd::Restarted => Ok(RxChunkOutcome::Restarted(bytes)),
+                    // DMA done with no end-of-transfer flag: chunk
+                    // filled, controller may want to write more bytes.
+                    // (Fault is unreachable in this arm.)
+                    ChunkEnd::Continue | ChunkEnd::Fault(_) => Ok(RxChunkOutcome::Filled(chunk_len)),
+                }
+            }
         }
     }
 
@@ -1105,15 +1103,10 @@ impl<'d> I2c<'d, Dma<'d>> {
             while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
             while self.info.wait_cell().poll_wait(cx).is_ready() {}
 
-            self.info.regs().sier().write(|w| {
-                w.set_feie(true);
-                w.set_beie(true);
-                w.set_sdie(true);
-                w.set_rsie(true);
-            });
-
-            let ssr = self.info.regs().ssr().read();
-            if ssr.fef() || ssr.bef() || ssr.sdf() || ssr.rsf() || self.mode.tx_dma.is_done() {
+            // Arm-and-check through the vocabulary — see
+            // `read_dma_chunk`.
+            self.registers().enable_dma_transfer_interrupts();
+            if self.registers().dma_transfer_event() || self.mode.tx_dma.is_done() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -1134,24 +1127,49 @@ impl<'d> I2c<'d, Dma<'d>> {
         } else {
             self.mode.tx_dma.transferred_bytes()
         };
-        let ssr = self.info.regs().ssr().read();
 
-        if ssr.fef() {
-            // Parity with the interrupt paths' fault arms — see
-            // `read_dma_chunk`.
-            self.reset_fifos();
-            Err(IOError::FifoError)
-        } else if ssr.bef() {
-            self.reset_fifos();
-            Err(IOError::BitError)
-        } else if ssr.sdf() {
-            Ok(TxChunkOutcome::Stopped(bytes))
-        } else if ssr.rsf() {
-            Ok(TxChunkOutcome::Restarted(bytes))
-        } else {
-            // DMA done with no end-of-transfer flag: chunk exhausted,
-            // controller still expects more bytes.
-            Ok(TxChunkOutcome::NeedMore(chunk_len))
+        match self.registers().chunk_end() {
+            ChunkEnd::Fault(f) => {
+                // Parity with the interrupt paths' fault arms — see
+                // `read_dma_chunk`.
+                self.reset_fifos();
+                Err(f.into())
+            }
+            ChunkEnd::Stopped => Ok(TxChunkOutcome::Stopped(bytes)),
+            ChunkEnd::Restarted => Ok(TxChunkOutcome::Restarted(bytes)),
+            ChunkEnd::Continue => {
+                // DMA exhaustion proves only that the final byte
+                // entered STDR — NOT that the controller wants more.
+                // The interrupt path decides NeedMore-vs-done only
+                // after the next observable event; settle the same
+                // way through the vocabulary (`tx_ready` couples TDF
+                // with faults and termination, so this cannot spin on
+                // a dead transfer): TDF means the controller took the
+                // byte and clocks on; a termination means the read
+                // ended exactly at the chunk. Without this, an
+                // exact-length read returns NeedMore here where the
+                // interrupt engine returns Complete.
+                self.info
+                    .wait_cell()
+                    .wait_for(|| {
+                        self.registers().enable_transmit_interrupts();
+                        self.registers().tx_ready()
+                    })
+                    .await
+                    .map_err(|_| IOError::Other)?;
+
+                match self.registers().chunk_end() {
+                    ChunkEnd::Fault(f) => {
+                        self.reset_fifos();
+                        Err(f.into())
+                    }
+                    ChunkEnd::Stopped => Ok(TxChunkOutcome::Stopped(bytes)),
+                    ChunkEnd::Restarted => Ok(TxChunkOutcome::Restarted(bytes)),
+                    // TDF: chunk exhausted and the controller still
+                    // clocks — it really does expect more bytes.
+                    ChunkEnd::Continue => Ok(TxChunkOutcome::NeedMore(chunk_len)),
+                }
+            }
         }
     }
 }
