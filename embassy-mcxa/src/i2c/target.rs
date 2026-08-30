@@ -67,11 +67,10 @@
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::ops::Range;
-use core::sync::atomic::{Ordering, fence};
 use core::task::Poll;
 
 use embassy_hal_internal::Peri;
-use embassy_hal_internal::drop::OnDrop;
+use maitake_sync::WaitCell;
 
 use super::target_registers::{
     ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep,
@@ -80,7 +79,7 @@ use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPi
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, WakeGuard, enable_and_reset};
-use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, TransferOptions};
+use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
@@ -808,6 +807,108 @@ enum RxChunkOutcome {
     Filled(usize),
 }
 
+/// The fixed RX channel/request pair for this target instance.
+///
+/// The constructor is private to this module, so the register facade never
+/// accepts an interchangeable channel/request tuple at an arm site.
+#[must_use]
+pub(in crate::i2c) struct TargetRxDma<'a, 'd> {
+    owner: usize,
+    registers: TargetRegisters,
+    wait_cell: &'a WaitCell,
+    channel: &'a DmaChannel<'d>,
+    request: DmaRequest,
+    _target: PhantomData<&'a mut I2c<'d, Dma<'d>>>,
+}
+
+impl<'a, 'd> TargetRxDma<'a, 'd> {
+    fn new(
+        registers: TargetRegisters,
+        wait_cell: &'a WaitCell,
+        channel: &'a DmaChannel<'d>,
+        request: DmaRequest,
+    ) -> Self {
+        Self {
+            owner: registers.identity(),
+            registers,
+            wait_cell,
+            channel,
+            request,
+            _target: PhantomData,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+        self.channel
+    }
+
+    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+        self.request
+    }
+
+    pub(in crate::i2c) fn registers(&self) -> TargetRegisters {
+        self.registers
+    }
+
+    pub(in crate::i2c) fn wait_cell(&self) -> &'a WaitCell {
+        self.wait_cell
+    }
+}
+
+/// The fixed TX channel/request pair for this target instance. See
+/// [`TargetRxDma`] for why this is not a generic `(channel, request)` pair.
+#[must_use]
+pub(in crate::i2c) struct TargetTxDma<'a, 'd> {
+    owner: usize,
+    registers: TargetRegisters,
+    wait_cell: &'a WaitCell,
+    channel: &'a DmaChannel<'d>,
+    request: DmaRequest,
+    _target: PhantomData<&'a mut I2c<'d, Dma<'d>>>,
+}
+
+impl<'a, 'd> TargetTxDma<'a, 'd> {
+    fn new(
+        registers: TargetRegisters,
+        wait_cell: &'a WaitCell,
+        channel: &'a DmaChannel<'d>,
+        request: DmaRequest,
+    ) -> Self {
+        Self {
+            owner: registers.identity(),
+            registers,
+            wait_cell,
+            channel,
+            request,
+            _target: PhantomData,
+        }
+    }
+
+    pub(in crate::i2c) fn owner(&self) -> usize {
+        self.owner
+    }
+
+    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+        self.channel
+    }
+
+    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+        self.request
+    }
+
+    pub(in crate::i2c) fn registers(&self) -> TargetRegisters {
+        self.registers
+    }
+
+    pub(in crate::i2c) fn wait_cell(&self) -> &'a WaitCell {
+        self.wait_cell
+    }
+}
+
 impl<'d> I2c<'d, Dma<'d>> {
     /// Create a new asynchronous instance of the I2C Target bus driver with DMA support.
     ///
@@ -865,31 +966,37 @@ impl<'d> I2c<'d, Dma<'d>> {
         )
     }
 
-    /// One operation owns the RX DMA handoff: peripheral request off,
-    /// channel quiesced (provably idle before the buffer borrow ends),
-    /// DMA writes made visible. Returns whether the major loop had
-    /// completed. The register layer provides the primitives; this
-    /// compound sequence is the driver's protocol, in one place.
-    fn finish_rx_dma(&self) -> bool {
-        self.registers().set_rx_dma(false);
-        let filled = self.mode.rx_dma.quiesce();
-        fence(Ordering::Acquire);
-        filled
+    /// Brand this target's RX channel/request wiring for the register
+    /// facade. The only construction site is here, so an arm call cannot
+    /// swap RX and TX plumbing by accident.
+    fn target_rx_dma<'a>(&'a mut self) -> TargetRxDma<'a, 'd> {
+        let registers = self.registers();
+        TargetRxDma::new(
+            registers,
+            self.info.wait_cell(),
+            &self.mode.rx_dma,
+            self.mode.rx_request,
+        )
     }
 
-    /// TX twin of [`Self::finish_rx_dma`] (no acquire fence needed:
-    /// the DMA read from the buffer, nothing to make visible to us).
-    fn finish_tx_dma(&self) -> bool {
-        self.registers().set_tx_dma(false);
-        self.mode.tx_dma.quiesce()
+    /// Brand this target's TX channel/request wiring. See
+    /// [`Self::target_rx_dma`] for the pairing guarantee.
+    fn target_tx_dma<'a>(&'a mut self) -> TargetTxDma<'a, 'd> {
+        let registers = self.registers();
+        TargetTxDma::new(
+            registers,
+            self.info.wait_cell(),
+            &self.mode.tx_dma,
+            self.mode.tx_request,
+        )
     }
 
-    // Takes `&self`: every DMA setup call is `&self`, and the caller's
-    // cancellation `OnDrop` closure holds the channel by shared
-    // reference to quiesce it.
-    async fn read_dma_chunk(&self, data: &mut [u8]) -> Result<RxChunkOutcome, IOError> {
-        let peri_addr = self.registers().rx_data_ptr();
+    // A chunk takes `&mut self`: its directional DMA lease retains an
+    // exclusive target-operation borrow alongside the channel and caller
+    // buffer until normal completion or Drop.
+    async fn read_dma_chunk(&mut self, data: &mut [u8]) -> Result<RxChunkOutcome, IOError> {
         let chunk_len = data.len();
+        let registers = self.registers();
 
         // NOTE: deliberately no entry `clear_status()` here. The
         // `listen` that announced this transaction already cleared
@@ -899,26 +1006,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // call. Clearing it would erase the only signal that the
         // transfer is over and leave the wait below hanging.
 
-        unsafe {
-            // Clean up channel state
-            self.mode.rx_dma.disable_request();
-            self.mode.rx_dma.clear_done();
-            self.mode.rx_dma.clear_interrupt();
-
-            // Set DMA request source from instance type (type-safe)
-            self.mode.rx_dma.set_request_source(self.mode.rx_request);
-
-            // Configure TCD for peripheral-to-memory transfer
-            self.mode
-                .rx_dma
-                .setup_read_from_peripheral(peri_addr, data, false, TransferOptions::COMPLETE_INTERRUPT)?;
-
-            // Enable I2C RX DMA request
-            self.registers().set_rx_dma(true);
-
-            // Enable DMA channel request
-            self.mode.rx_dma.enable_request();
-        }
+        let lease = registers.arm_rx_dma(self.target_rx_dma(), data)?;
 
         // Wait for any of:
         //  - I2C end-of-transfer flag (sdf, rsf) -> controller terminated
@@ -928,17 +1016,9 @@ impl<'d> I2c<'d, Dma<'d>> {
         // The DMA done interrupt wakes the DMA's wait_cell; I2C status
         // changes wake the I2C wait_cell. Register on both.
         poll_fn(|cx| {
-            // Drain any stale WOKEN token and finish REGISTERED:
-            // `poll_wait` registers the waker only when it returns
-            // Pending — discarding a `Ready` (a token left by a
-            // cancellation racing a completion, which `quiesce` cannot
-            // remove) would park this task with no waker on the cell.
-            // Same pattern as `Transfer::poll` in dma.rs.
-            while self.mode.rx_dma.wait_cell().poll_wait(cx).is_ready() {}
-            while self.info.wait_cell().poll_wait(cx).is_ready() {}
-
-            // Arm-and-check through the vocabulary, as one operation.
-            if self.registers().dma_transfer_wake() || self.mode.rx_dma.is_done() {
+            // Arm and check both the I2C and exact DMA wait sources through
+            // the lease. No target operation is available while it is live.
+            if lease.poll_wake(cx) {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -946,21 +1026,11 @@ impl<'d> I2c<'d, Dma<'d>> {
         })
         .await;
 
-        // Cleanup: request path off, then quiesce. `disable_request`
-        // alone only stops NEW service requests — a minor loop already
-        // in flight keeps writing into `data`, which is about to be
-        // released to the caller, and keeps moving the count under the
-        // read below. Quiesce waits for the channel to go provably
-        // idle first, and reports whether the major loop had completed
-        // (after which CITER has auto-reloaded and `transferred_bytes`
-        // would read zero).
-        let filled = self.finish_rx_dma();
-
-        let moved = if filled {
-            chunk_len
-        } else {
-            self.mode.rx_dma.transferred_bytes()
-        };
+        // Consuming the lease first shuts down RDDE and quiesces the exact
+        // channel before `data` is touched again. It returns the count only
+        // after DONE/CITER are stable; Drop performs the same cleanup if
+        // this future is cancelled at any earlier await.
+        let moved = lease.finish();
 
         // The termination wake races the final byte's DMA handoff: the
         // controller can deliver a byte (RDF set, DMA request asserted)
@@ -975,7 +1045,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // address phase until `listen` services it, so every drained
         // byte belongs to this transfer. (Residue the chunk has no
         // room for is handled by the residue check below.)
-        let bytes = self.registers().drain_rx(&mut data[..chunk_len], moved);
+        let bytes = registers.drain_rx(&mut data[..chunk_len], moved);
         #[cfg(feature = "defmt")]
         if bytes > moved {
             defmt::debug!(
@@ -984,13 +1054,13 @@ impl<'d> I2c<'d, Dma<'d>> {
             );
         }
 
-        match self.registers().rx_chunk_end(bytes == chunk_len) {
+        match registers.rx_chunk_end(bytes == chunk_len) {
             RxChunkEnd::Fault(f) => {
                 // Parity with the interrupt paths' fault arms: the
                 // error discards this transfer's accounting, so
                 // whatever the FIFOs still hold must not survive into
                 // the next transaction as its first bytes.
-                self.reset_fifos();
+                registers.reset_fifos();
                 Err(f.into())
             }
             RxChunkEnd::ResiduePending => {
@@ -1017,10 +1087,10 @@ impl<'d> I2c<'d, Dma<'d>> {
         }
     }
 
-    // Takes `&self` — see `read_dma_chunk`.
-    async fn write_dma_chunk(&self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
-        let peri_addr = self.registers().tx_data_ptr();
+    // Takes `&mut self` — see `read_dma_chunk`.
+    async fn write_dma_chunk(&mut self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
         let chunk_len = data.len();
+        let registers = self.registers();
 
         // NOTE: deliberately no entry `clear_status()` here. The
         // `listen` that announced this transaction already cleared
@@ -1030,32 +1100,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // call. Clearing it would erase the only signal that the
         // transfer is over and leave the wait below hanging.
 
-        unsafe {
-            // Clean up channel state
-            self.mode.tx_dma.disable_request();
-            self.mode.tx_dma.clear_done();
-            self.mode.tx_dma.clear_interrupt();
-
-            // Set DMA request source from instance type (type-safe)
-            self.mode.tx_dma.set_request_source(self.mode.tx_request);
-
-            // Configure TCD for memory-to-peripheral transfer. Use
-            // COMPLETE_INTERRUPT so the channel wakes us on DMA exhaustion
-            // (which lets us return NeedMore when the controller wants more
-            // bytes than the chunk holds).
-            self.mode
-                .tx_dma
-                .setup_write_to_peripheral(data, peri_addr, false, TransferOptions::COMPLETE_INTERRUPT)?;
-
-            // Ensure all writes by DMA are visible to the CPU
-            fence(Ordering::Release);
-
-            // Enable I2C TX DMA request
-            self.registers().set_tx_dma(true);
-
-            // Enable DMA channel request
-            self.mode.tx_dma.enable_request();
-        }
+        let lease = registers.arm_tx_dma(self.target_tx_dma(), data)?;
 
         // Wait for any of:
         //  - I2C end-of-transfer flag (sdf, rsf) -> controller terminated
@@ -1063,13 +1108,9 @@ impl<'d> I2c<'d, Dma<'d>> {
         //  - DMA channel completion -> chunk exhausted; if controller still
         //    clocking, caller may want to call again (NeedMore)
         poll_fn(|cx| {
-            // Drain stale tokens and finish registered — see
-            // `read_dma_chunk`.
-            while self.mode.tx_dma.wait_cell().poll_wait(cx).is_ready() {}
-            while self.info.wait_cell().poll_wait(cx).is_ready() {}
-
-            // Arm-and-check through the vocabulary, as one operation.
-            if self.registers().dma_transfer_wake() || self.mode.tx_dma.is_done() {
+            // See `read_dma_chunk`: the lease owns both wake sources while
+            // it holds the target operation exclusively.
+            if lease.poll_wake(cx) {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -1077,24 +1118,15 @@ impl<'d> I2c<'d, Dma<'d>> {
         })
         .await;
 
-        // Cleanup: request path off, then quiesce — same rationale as
-        // `read_dma_chunk`. The hazard here is the count, not the
-        // buffer contents: an in-flight minor loop is still consuming
-        // `data` and advancing CITER while the caller's borrow ends
-        // and the count is read.
-        let exhausted = self.finish_tx_dma();
+        // Consume the lease before inspecting status or ending the source
+        // borrow. Its Drop path covers cancellation while DMA remains live.
+        let bytes = lease.finish();
 
-        let bytes = if exhausted {
-            chunk_len
-        } else {
-            self.mode.tx_dma.transferred_bytes()
-        };
-
-        match self.registers().chunk_end() {
+        match registers.chunk_end() {
             ChunkEnd::Fault(f) => {
                 // Parity with the interrupt paths' fault arms — see
                 // `read_dma_chunk`.
-                self.reset_fifos();
+                registers.reset_fifos();
                 Err(f.into())
             }
             ChunkEnd::Stopped => Ok(TxChunkOutcome::Stopped(bytes)),
@@ -1113,13 +1145,13 @@ impl<'d> I2c<'d, Dma<'d>> {
                 // interrupt engine returns Complete.
                 self.info
                     .wait_cell()
-                    .wait_for(|| self.registers().tx_wake())
+                    .wait_for(|| registers.tx_wake())
                     .await
                     .map_err(|_| IOError::Other)?;
 
-                match self.registers().chunk_end() {
+                match registers.chunk_end() {
                     ChunkEnd::Fault(f) => {
-                        self.reset_fifos();
+                        registers.reset_fifos();
                         Err(f.into())
                     }
                     ChunkEnd::Stopped => Ok(TxChunkOutcome::Stopped(bytes)),
@@ -1411,14 +1443,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // call. Clearing it would erase the only signal that the
         // transfer is over and leave the wait below hanging.
 
-        // perform corrective action if the future is dropped
-        let on_drop = OnDrop::new(|| {
-            // Disabling the peripheral request is not enough: an
-            // in-flight minor loop would keep reading the caller's
-            // buffer after this future unwound.
-            self.finish_tx_dma();
-        });
-
         let total = buf.len();
         let mut chunks = buf.chunks(DMA_MAX_TRANSFER_SIZE).peekable();
         while let Some(chunk) = chunks.next() {
@@ -1426,7 +1450,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             match self.write_dma_chunk(chunk).await? {
                 TxChunkOutcome::Stopped(n) => {
                     count += n;
-                    on_drop.defuse();
                     return Ok(if is_last && count == total {
                         ReadStatus::Complete(count)
                     } else {
@@ -1435,7 +1458,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 }
                 TxChunkOutcome::Restarted(n) => {
                     count += n;
-                    on_drop.defuse();
                     return Ok(if is_last && count == total {
                         ReadStatus::Complete(count)
                     } else {
@@ -1445,7 +1467,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 TxChunkOutcome::NeedMore(n) => {
                     count += n;
                     if is_last {
-                        on_drop.defuse();
                         return Ok(ReadStatus::NeedMore(count));
                     }
                     // Non-last chunk completed normally: proceed to next
@@ -1456,7 +1477,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         }
 
         // Reached only when buf was empty.
-        on_drop.defuse();
         Ok(ReadStatus::NeedMore(count))
     }
 
@@ -1471,33 +1491,21 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         // call. Clearing it would erase the only signal that the
         // transfer is over and leave the wait below hanging.
 
-        // perform corrective action if the future is dropped
-        let on_drop = OnDrop::new(|| {
-            // Disabling the peripheral request is not enough: an
-            // in-flight minor loop would keep writing into the caller's
-            // buffer after this future unwound.
-            self.finish_rx_dma();
-        });
-
-        let total = buf.len();
         let mut chunks = buf.chunks_mut(DMA_MAX_TRANSFER_SIZE).peekable();
         while let Some(chunk) = chunks.next() {
             let is_last = chunks.peek().is_none();
             match self.read_dma_chunk(chunk).await? {
                 RxChunkOutcome::Stopped(n) => {
                     count += n;
-                    on_drop.defuse();
                     return Ok(WriteStatus::Stopped(count));
                 }
                 RxChunkOutcome::Restarted(n) => {
                     count += n;
-                    on_drop.defuse();
                     return Ok(WriteStatus::Restarted(count));
                 }
                 RxChunkOutcome::Filled(n) => {
                     count += n;
                     if is_last {
-                        on_drop.defuse();
                         return Ok(WriteStatus::BufferFull(count));
                     }
                     // Non-last chunk filled: proceed to next chunk.
@@ -1506,8 +1514,6 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
         }
 
         // Reached only when buf was empty.
-        on_drop.defuse();
-        let _ = total;
         Ok(WriteStatus::BufferFull(count))
     }
 }

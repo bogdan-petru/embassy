@@ -27,9 +27,14 @@
 //! the PAC: they are outside the hot-path map, written once at
 //! construction, and never part of a transfer-time sequence.
 
+use core::marker::PhantomData;
+use core::sync::atomic::{Ordering, fence};
+
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
+use crate::dma::{DMA_MAX_TRANSFER_SIZE, InvalidParameters, TransferOptions};
+use crate::i2c::target::{TargetRxDma, TargetTxDma};
 use crate::pac;
 use crate::pac::lpi2c::{Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
 
@@ -97,9 +102,141 @@ pub(in crate::i2c) enum ListenEvent {
 }
 
 /// Safe target-specific operations over the LPI2C register block.
+#[derive(Clone, Copy)]
 pub(in crate::i2c) struct TargetRegisters {
     regs: &'static LpI2cRegisters,
 }
+
+/// A live target RX-DMA handoff to the read-only SRDR FIFO port.
+///
+/// The lease ties the destination borrow to the exact shutdown protocol:
+/// target DMA requests are disabled and the eDMA channel is quiesced before
+/// a caller can inspect the count or release the buffer. `Drop` runs the
+/// same protocol, so cancellation cannot leave a DMA write live.
+#[must_use]
+pub(in crate::i2c) struct TargetRxDmaLease<'channel, 'dma, 'buf> {
+    port: TargetRxDma<'channel, 'dma>,
+    total: usize,
+    armed: bool,
+    _buffer: PhantomData<&'buf mut [u8]>,
+}
+
+impl TargetRxDmaLease<'_, '_, '_> {
+    /// Register for this exact channel's completion and report its
+    /// level-latched DONE state. The caller cannot accidentally wait on a
+    /// different target DMA channel after arming this lease.
+    fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.port.channel().wait_cell().poll_wait(cx).is_ready() {}
+        self.port.channel().is_done()
+    }
+
+    /// Arm/check the exact I2C interrupt set and this lease's DMA channel
+    /// together. The live port owns an exclusive target-operation borrow,
+    /// so no other target register sequence can run during the handoff.
+    pub(in crate::i2c) fn poll_wake(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.port.wait_cell().poll_wait(cx).is_ready() {}
+        self.port.registers().dma_transfer_wake() || self.poll_complete(cx)
+    }
+
+    /// Disable the matching peripheral request, wait until the exact
+    /// channel is inactive, then return a stable transfer count. RX needs
+    /// an acquire fence before its destination is visible to the CPU.
+    fn quiesce(&mut self) -> usize {
+        cortex_m::asm::dsb();
+        self.port.registers().set_rx_dma(false);
+        self.port.registers().disarm_dma_transfer_interrupts();
+        let complete = self.port.channel().quiesce();
+        fence(Ordering::Acquire);
+        let moved = if complete {
+            self.total
+        } else {
+            self.port.channel().transferred_bytes()
+        };
+        moved
+    }
+
+    /// Finish the handoff before status classification or releasing the
+    /// caller buffer. Dropping an unfinished lease has identical cleanup.
+    pub(in crate::i2c) fn finish(mut self) -> usize {
+        let moved = self.quiesce();
+        self.armed = false;
+        moved
+    }
+}
+
+impl Drop for TargetRxDmaLease<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.quiesce();
+        }
+    }
+}
+
+/// A live target TX-DMA handoff to the write-only STDR FIFO port. See
+/// [`TargetRxDmaLease`] for why this is a lease instead of a raw pointer.
+#[must_use]
+pub(in crate::i2c) struct TargetTxDmaLease<'channel, 'dma, 'buf> {
+    port: TargetTxDma<'channel, 'dma>,
+    total: usize,
+    armed: bool,
+    _buffer: PhantomData<&'buf [u8]>,
+}
+
+impl TargetTxDmaLease<'_, '_, '_> {
+    /// Register for this exact channel's completion; see
+    /// [`TargetRxDmaLease::poll_complete`].
+    fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.port.channel().wait_cell().poll_wait(cx).is_ready() {}
+        self.port.channel().is_done()
+    }
+
+    /// See [`TargetRxDmaLease::poll_wake`].
+    pub(in crate::i2c) fn poll_wake(&self, cx: &mut core::task::Context<'_>) -> bool {
+        while self.port.wait_cell().poll_wait(cx).is_ready() {}
+        self.port.registers().dma_transfer_wake() || self.poll_complete(cx)
+    }
+
+    fn quiesce(&mut self) -> usize {
+        cortex_m::asm::dsb();
+        self.port.registers().set_tx_dma(false);
+        self.port.registers().disarm_dma_transfer_interrupts();
+        let complete = self.port.channel().quiesce();
+        if complete {
+            self.total
+        } else {
+            self.port.channel().transferred_bytes()
+        }
+    }
+
+    /// Finish the handoff before status classification or releasing the
+    /// source buffer. Dropping an unfinished lease has identical cleanup.
+    pub(in crate::i2c) fn finish(mut self) -> usize {
+        let moved = self.quiesce();
+        self.armed = false;
+        moved
+    }
+}
+
+impl Drop for TargetTxDmaLease<'_, '_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.quiesce();
+        }
+    }
+}
+
+/// Match the eDMA setup APIs' buffer precondition before an arm method
+/// mutates channel state. A rejected arm is completely side-effect free.
+const fn dma_buffer_fits(length: usize) -> bool {
+    length != 0 && length <= DMA_MAX_TRANSFER_SIZE
+}
+
+const _: () = {
+    assert!(!dma_buffer_fits(0));
+    assert!(dma_buffer_fits(1));
+    assert!(dma_buffer_fits(DMA_MAX_TRANSFER_SIZE));
+    assert!(!dma_buffer_fits(DMA_MAX_TRANSFER_SIZE.saturating_add(1)));
+};
 
 impl TargetRegisters {
     pub(in crate::i2c) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
@@ -113,6 +250,16 @@ impl TargetRegisters {
     /// never the cells themselves.
     pub(in crate::i2c) fn check_layout(regs: pac::lpi2c::Lpi2c) {
         lpi2c_regs::check_layout(regs);
+    }
+
+    fn register_address(&self) -> usize {
+        self.regs as *const LpI2cRegisters as usize
+    }
+
+    /// Stable identity used to bind a target's fixed DMA channel/request
+    /// pair to this exact LPI2C register block.
+    pub(in crate::i2c) fn identity(&self) -> usize {
+        self.register_address()
     }
 
     fn ssr(&self) -> Ssr {
@@ -188,24 +335,115 @@ impl TargetRegisters {
         self.tx_ready()
     }
 
-    /// Enable or disable the RX DMA request path (SDER[RDDE]).
-    pub(in crate::i2c) fn set_rx_dma(&self, enable: bool) {
+    /// Enable or disable the RX DMA request path (SDER[RDDE]). This stays
+    /// private: only an RX DMA lease may pair it with channel ownership.
+    fn set_rx_dma(&self, enable: bool) {
         self.modify_sder(|w| w.set_rdde(enable));
     }
 
-    /// Enable or disable the TX DMA request path (SDER[TDDE]).
-    pub(in crate::i2c) fn set_tx_dma(&self, enable: bool) {
+    /// Enable or disable the TX DMA request path (SDER[TDDE]). See
+    /// [`Self::set_rx_dma`].
+    fn set_tx_dma(&self, enable: bool) {
         self.modify_sder(|w| w.set_tdde(enable));
     }
 
-    /// Address of the RX data register, for DMA descriptors.
-    pub(in crate::i2c) fn rx_data_ptr(&self) -> *const u8 {
-        &self.regs.srdr as *const _ as *const u8
+    /// Stop the DMA transfer interrupt sources before the matching channel
+    /// is quiesced. A cancelled response must not leave SIER armed to wake
+    /// a future waiter after its lease has gone away.
+    fn disarm_dma_transfer_interrupts(&self) {
+        self.regs.sier.set(0);
     }
 
-    /// Address of the TX data register, for DMA descriptors.
-    pub(in crate::i2c) fn tx_data_ptr(&self) -> *mut u8 {
-        &self.regs.stdr as *const _ as *mut u8
+    /// Configure and arm one controller-to-target DMA transfer. The
+    /// read-only FIFO endpoint, channel/request pairing, and inverse
+    /// teardown are all retained by the returned lease.
+    pub(in crate::i2c) fn arm_rx_dma<'channel, 'dma, 'buf>(
+        &self,
+        port: TargetRxDma<'channel, 'dma>,
+        buffer: &'buf mut [u8],
+    ) -> Result<TargetRxDmaLease<'channel, 'dma, 'buf>, InvalidParameters> {
+        assert!(
+            self.register_address() == port.owner(),
+            "i2c: an RX DMA port was used through a different target"
+        );
+        if !dma_buffer_fits(buffer.len()) {
+            return Err(InvalidParameters);
+        }
+        let total = buffer.len();
+        let channel = port.channel();
+        let request = port.request();
+
+        // SAFETY: `port` proves the fixed RX channel/request pairing for
+        // this target; SRDR is the Tock-typed read-only FIFO port; and the
+        // returned lease retains `buffer` until SDER is off and eDMA is
+        // quiesced.
+        unsafe {
+            channel.disable_request();
+            channel.clear_done();
+            channel.clear_interrupt();
+            channel.set_request_source(request);
+            channel.setup_read_from_peripheral(
+                &self.regs.srdr as *const _ as *const u8,
+                buffer,
+                false,
+                TransferOptions::COMPLETE_INTERRUPT,
+            )?;
+            self.set_rx_dma(true);
+            channel.enable_request();
+        }
+
+        Ok(TargetRxDmaLease {
+            port,
+            total,
+            armed: true,
+            _buffer: PhantomData,
+        })
+    }
+
+    /// Configure and arm one target-to-controller DMA transfer. See
+    /// [`Self::arm_rx_dma`] for the ownership/cleanup contract.
+    pub(in crate::i2c) fn arm_tx_dma<'channel, 'dma, 'buf>(
+        &self,
+        port: TargetTxDma<'channel, 'dma>,
+        buffer: &'buf [u8],
+    ) -> Result<TargetTxDmaLease<'channel, 'dma, 'buf>, InvalidParameters> {
+        assert!(
+            self.register_address() == port.owner(),
+            "i2c: a TX DMA port was used through a different target"
+        );
+        if !dma_buffer_fits(buffer.len()) {
+            return Err(InvalidParameters);
+        }
+        let total = buffer.len();
+        let channel = port.channel();
+        let request = port.request();
+
+        // SAFETY: `port` proves the fixed TX channel/request pairing for
+        // this target; STDR is the Tock-typed write-only FIFO port; and the
+        // returned lease retains `buffer` until SDER is off and eDMA is
+        // quiesced.
+        unsafe {
+            channel.disable_request();
+            channel.clear_done();
+            channel.clear_interrupt();
+            channel.set_request_source(request);
+            channel.setup_write_to_peripheral(
+                buffer,
+                &self.regs.stdr as *const _ as *mut u8,
+                false,
+                TransferOptions::COMPLETE_INTERRUPT,
+            )?;
+            fence(Ordering::Release);
+            self.set_tx_dma(true);
+            channel.enable_request();
+        }
+
+        Ok(TargetTxDmaLease {
+            port,
+            total,
+            armed: true,
+            _buffer: PhantomData,
+        })
     }
 
     /// Interrupts for listening for a new transaction. Deliberately no
