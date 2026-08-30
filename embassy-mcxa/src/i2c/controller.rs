@@ -1824,6 +1824,24 @@ impl<'d> I2c<'d, Dma<'d>> {
 }
 
 impl<'d> I2c<'d, Dma<'d>> {
+    /// One operation owns the RX DMA handoff: DMA writes made visible,
+    /// peripheral request off, channel quiesced (provably idle before
+    /// the buffer borrow ends). Returns whether the major loop had
+    /// completed. The register layer provides the primitives; this
+    /// compound sequence is the driver's protocol, in one place.
+    fn finish_rx_dma(&self) -> bool {
+        cortex_m::asm::dsb();
+        self.registers().set_rx_dma(false);
+        self.mode.rx_dma.quiesce()
+    }
+
+    /// TX twin of [`Self::finish_rx_dma`].
+    fn finish_tx_dma(&self) -> bool {
+        cortex_m::asm::dsb();
+        self.registers().set_tx_dma(false);
+        self.mode.tx_dma.quiesce()
+    }
+
     /// Run one RX DMA transfer covering `buf`, waking on completion or on
     /// a bus fault (which would otherwise leave the DMA waiting forever).
     /// The caller owns command queueing and recovery (OnDrop).
@@ -1889,12 +1907,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             Err(_) => return Err(IOError::Timeout),
         }
 
-        // Ensure DMA writes are visible to CPU
-        cortex_m::asm::dsb();
-        // Cleanup: quiesce rather than merely disabling requests, so the
-        // channel is provably idle before `buf`'s borrow ends.
-        self.registers().set_rx_dma(false);
-        self.mode.rx_dma.quiesce();
+        self.finish_rx_dma();
 
         Ok(())
     }
@@ -1920,8 +1933,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             // `read` is about to be released — an in-flight minor loop
             // would write into it after this future unwound.
             // `disable_request` alone does not wait for that loop.
-            self.registers().set_rx_dma(false);
-            self.mode.rx_dma.quiesce();
+            self.finish_rx_dma();
             self.remediation();
         });
 
@@ -2028,10 +2040,8 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 // a second time and corrupt the controller state for the
                 // next transaction.
                 let on_drop = OnDrop::new(|| {
-                    // Request path off and channel quiesced before
-                    // recovery — see `dma_read_chained`.
-                    self.registers().set_rx_dma(false);
-                    self.mode.rx_dma.quiesce();
+                    // Handoff before recovery — see `dma_read_chained`.
+                    self.finish_rx_dma();
                     self.remediation();
                 });
 
@@ -2092,8 +2102,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // path and wait for the channel to go inactive before
             // recovery touches the FIFOs, since `write` is about to be
             // released.
-            self.registers().set_tx_dma(false);
-            self.mode.tx_dma.quiesce();
+            self.finish_tx_dma();
             self.remediation();
         });
 
@@ -2154,13 +2163,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 Err(_) => return Err(IOError::Timeout),
             }
 
-            // Ensure DMA writes are visible to CPU
-            cortex_m::asm::dsb();
-            // Cleanup: quiesce rather than merely disabling requests, so
-            // the channel is provably idle before this chunk's borrow
-            // ends.
-            self.registers().set_tx_dma(false);
-            self.mode.tx_dma.quiesce();
+            self.finish_tx_dma();
         }
 
         // Every chunk is drained and the channel quiesced; the close

@@ -18,12 +18,20 @@
 //!
 //! Call sites consume typed events and cannot reorder these checks; the
 //! wrapper exposes no raw status accessor to reorder them with.
+//!
+//! Scope: every PROTOCOL register — status, interrupts, DMA enables,
+//! data, address status — is reachable only through this facade; the
+//! driver holds no generic read/write/modify on any of them. The one
+//! deliberate exception is `set_configuration`, which touches
+//! init-only configuration registers (SCR/SCFGR1/SCFGR2/SAMR) through
+//! the PAC: they are outside the hot-path map, written once at
+//! construction, and never part of a transfer-time sequence.
 
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::lpi2c_regs::{self, LpI2cRegisters};
 use crate::pac;
-use crate::pac::lpi2c::{Scr, ScrRrf, ScrRtf, Sier, Srdr, Ssr, Stdr};
+use crate::pac::lpi2c::{Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
 
 /// Hardware faults the target status register can report mid-transfer.
 ///
@@ -65,6 +73,29 @@ pub(super) enum TargetTxStep {
     Ended,
 }
 
+/// One classified listen event — see
+/// [`TargetRegisters::take_listen_event`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum ListenEvent {
+    /// A fault surfaced while listening.
+    Fault(TargetFault),
+    /// Address match for one of the configured addresses.
+    AddressValid(u16),
+    /// General-call address match.
+    GeneralCall,
+    /// SMBus-alert address match.
+    SmbusAlert,
+    /// Transmit-ACK request.
+    TransmitAck,
+    /// Repeated START observed (address from the last match).
+    RepeatedStart(u16),
+    /// STOP observed (address from the last match).
+    Stop(u16),
+    /// Nothing classifiable was latched.
+    None,
+}
+
 /// Safe target-specific operations over the LPI2C register block.
 pub(super) struct TargetRegisters {
     regs: &'static LpI2cRegisters,
@@ -85,6 +116,12 @@ impl TargetRegisters {
         let mut v = Sier(0);
         f(&mut v);
         self.regs.sier.set(v.0);
+    }
+
+    fn modify_sder(&self, f: impl FnOnce(&mut Sder)) {
+        let mut v = Sder(self.regs.sder.get());
+        f(&mut v);
+        self.regs.sder.set(v.0);
     }
 
     fn modify_scr(&self, f: impl FnOnce(&mut Scr)) {
@@ -142,6 +179,105 @@ impl TargetRegisters {
     pub(super) fn tx_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_ready()
+    }
+
+    /// Enable or disable the RX DMA request path (SDER[RDDE]).
+    pub(super) fn set_rx_dma(&self, enable: bool) {
+        self.modify_sder(|w| w.set_rdde(enable));
+    }
+
+    /// Enable or disable the TX DMA request path (SDER[TDDE]).
+    pub(super) fn set_tx_dma(&self, enable: bool) {
+        self.modify_sder(|w| w.set_tdde(enable));
+    }
+
+    /// Address of the RX data register, for DMA descriptors.
+    pub(super) fn rx_data_ptr(&self) -> *const u8 {
+        &self.regs.srdr as *const _ as *const u8
+    }
+
+    /// Address of the TX data register, for DMA descriptors.
+    pub(super) fn tx_data_ptr(&self) -> *mut u8 {
+        &self.regs.stdr as *const _ as *mut u8
+    }
+
+    /// Interrupts for listening for a new transaction. Deliberately no
+    /// RSIE: the armed set must equal [`Self::listen_ready`]'s wake
+    /// set, or a source that fires without satisfying the predicate
+    /// re-arms and interrupts forever. A repeated START is not itself
+    /// a listen event — the address phase that follows it raises AVF
+    /// (armed), which is what classification keys on; an RSF-only wake
+    /// would classify against a stale SASR. The general-call and
+    /// SMBus-alert sources are driver configuration, passed in.
+    pub(super) fn enable_listen_interrupts(&self, general_call: bool, smbus_alert: bool) {
+        self.write_sier(|w| {
+            w.set_sarie(smbus_alert);
+            w.set_gcie(general_call);
+            w.set_am1ie(true);
+            w.set_am0ie(true);
+            w.set_feie(true);
+            w.set_beie(true);
+            w.set_sdie(true);
+            w.set_avie(true);
+        });
+    }
+
+    /// Unconditionally clear the W1C event flags. ONLY for the entry
+    /// to `listen`, where everything still latched is by definition
+    /// stale (the previous transaction's lifecycle is complete).
+    /// Anywhere a snapshot is being classified,
+    /// [`Self::take_listen_event`]'s same-snapshot clear is the API —
+    /// there is deliberately no generic clear.
+    pub(super) fn clear_stale_events(&self) {
+        let mut v = Ssr(0);
+        v.set_rsf(true);
+        v.set_sdf(true);
+        v.set_bef(true);
+        v.set_fef(true);
+        self.regs.ssr.set(v.0);
+    }
+
+    /// Take one classified listen event: reads ONE status snapshot,
+    /// clears only the W1C flags that snapshot observed (a constant-
+    /// mask clear would erase a flag latching between read and write,
+    /// unseen), and — for address-class events — consumes SASR, which
+    /// releases an ADRSTALL stretch. The whole protocol action, in the
+    /// single priority order: faults, then the address family (GCF and
+    /// SARF are classification tags on address-valid), then transmit-
+    /// ACK, repeated START, STOP.
+    pub(super) fn take_listen_event(&self) -> ListenEvent {
+        let ssr = self.ssr();
+        let mut w = Ssr(0);
+        w.set_rsf(ssr.rsf());
+        w.set_sdf(ssr.sdf());
+        w.set_bef(ssr.bef());
+        w.set_fef(ssr.fef());
+        self.regs.ssr.set(w.0);
+
+        if ssr.bef() {
+            ListenEvent::Fault(TargetFault::Bit)
+        } else if ssr.fef() {
+            ListenEvent::Fault(TargetFault::Fifo)
+        } else if ssr.avf() || ssr.gcf() || ssr.sarf() {
+            // Read SASR to consume the address-valid state regardless
+            // of which classification tag triggered the match.
+            let addr = Sasr(self.regs.sasr.get()).raddr();
+            if ssr.gcf() {
+                ListenEvent::GeneralCall
+            } else if ssr.sarf() {
+                ListenEvent::SmbusAlert
+            } else {
+                ListenEvent::AddressValid(addr)
+            }
+        } else if ssr.taf() {
+            ListenEvent::TransmitAck
+        } else if ssr.rsf() {
+            ListenEvent::RepeatedStart(Sasr(self.regs.sasr.get()).raddr())
+        } else if ssr.sdf() {
+            ListenEvent::Stop(Sasr(self.regs.sasr.get()).raddr())
+        } else {
+            ListenEvent::None
+        }
     }
 
     pub(super) fn reset_fifos(&self) {

@@ -64,6 +64,17 @@ MANIFEST = [
     ("scr", "ReadWrite", ["Target Control Register. PAC type: `Scr`."]),
     ("ssr", "ReadWrite", ["Target Status Register (W1C flags). PAC type: `Ssr`."]),
     ("sier", "ReadWrite", ["Target Interrupt Enable Register. PAC type: `Sier`."]),
+    ("sder", "ReadWrite", ["Target DMA Enable Register. PAC type: `Sder`."]),
+    (
+        "sasr",
+        "ReadOnly",
+        [
+            "Target Address Status Register. Read-only, and a read",
+            "*consumes* the address-valid state (releasing an ADRSTALL",
+            "stretch), so reading it is a protocol action. PAC type:",
+            "`Sasr`.",
+        ],
+    ),
     ("stdr", "WriteOnly", ["Target Transmit Data Register. Write-only. PAC type: `Stdr`."]),
     (
         "srdr",

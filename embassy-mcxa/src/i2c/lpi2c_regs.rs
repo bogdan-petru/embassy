@@ -66,10 +66,18 @@ register_structs! {
         (0x114 => pub ssr: ReadWrite<u32>),
         /// Target Interrupt Enable Register. PAC type: `Sier`.
         (0x118 => pub sier: ReadWrite<u32>),
-        (0x11c => _reserved6),
+        /// Target DMA Enable Register. PAC type: `Sder`.
+        (0x11c => pub sder: ReadWrite<u32>),
+        (0x120 => _reserved6),
+        /// Target Address Status Register. Read-only, and a read
+        /// *consumes* the address-valid state (releasing an ADRSTALL
+        /// stretch), so reading it is a protocol action. PAC type:
+        /// `Sasr`.
+        (0x150 => pub sasr: ReadOnly<u32>),
+        (0x154 => _reserved7),
         /// Target Transmit Data Register. Write-only. PAC type: `Stdr`.
         (0x160 => pub stdr: WriteOnly<u32>),
-        (0x164 => _reserved7),
+        (0x164 => _reserved8),
         /// Target Receive Data Register. Read-only, and a read *pops*
         /// the RX FIFO. PAC type: `Srdr`.
         (0x170 => pub srdr: ReadOnly<u32>),
@@ -126,6 +134,8 @@ pub(super) fn check_layout(regs: crate::pac::lpi2c::Lpi2c) {
     check!(scr, scr);
     check!(ssr, ssr);
     check!(sier, sier);
+    check!(sder, sder);
+    check!(sasr, sasr);
     check!(stdr, stdr);
     check!(srdr, srdr);
     // END GENERATED: layout checks
@@ -148,6 +158,8 @@ const _: () = {
     assert!(offset_of!(LpI2cRegisters, scr) == 0x110);
     assert!(offset_of!(LpI2cRegisters, ssr) == 0x114);
     assert!(offset_of!(LpI2cRegisters, sier) == 0x118);
+    assert!(offset_of!(LpI2cRegisters, sder) == 0x11c);
+    assert!(offset_of!(LpI2cRegisters, sasr) == 0x150);
     assert!(offset_of!(LpI2cRegisters, stdr) == 0x160);
     assert!(offset_of!(LpI2cRegisters, srdr) == 0x170);
 };

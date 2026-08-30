@@ -13,6 +13,14 @@
 //! forever on a halted transfer — the bug class the two-board hardware
 //! tests found in all three read paths — cannot be expressed against
 //! this interface.
+//!
+//! Scope: every PROTOCOL register — status, interrupts, DMA enables,
+//! commands, data, FIFO status — is reachable only through this
+//! facade; the driver holds no generic read/write/modify on any of
+//! them. The one deliberate exception is `set_configuration`, which
+//! touches init-only configuration registers (MCR/MCFGR*/MCCR0)
+//! through the PAC: they are outside the hot-path map, written once at
+//! construction, and never part of a transfer-time sequence.
 
 use tock_registers::interfaces::{Readable, Writeable};
 

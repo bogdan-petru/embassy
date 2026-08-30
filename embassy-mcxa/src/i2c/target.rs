@@ -73,7 +73,9 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::target_registers::{ChunkEnd, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
+use super::target_registers::{
+    ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep,
+};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -504,13 +506,9 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Enable the target.
             self.info.regs().scr().modify(|w| w.set_sen(true));
 
-            // Clear all flags
-            self.info.regs().ssr().write(|w| {
-                w.set_rsf(true);
-                w.set_sdf(true);
-                w.set_bef(true);
-                w.set_fef(true);
-            });
+            // Clear stale event flags left from before this
+            // (re)configuration.
+            self.registers().clear_stale_events();
 
             Ok(())
         })
@@ -532,63 +530,23 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// snapshot is being classified, clear through the snapshot instead
     /// — see `status`.
     fn clear_status(&self) {
-        self.info.regs().ssr().write(|w| {
-            w.set_rsf(true);
-            w.set_sdf(true);
-            w.set_bef(true);
-            w.set_fef(true);
-        });
+        self.registers().clear_stale_events();
     }
 
-    /// Reads and parses the target status producing an
-    /// appropriate `Result<(), Error>` variant.
-    ///
-    /// Clears ONLY the W1C flags this snapshot observed — the same
-    /// same-snapshot pattern as the controller's `take_status`. A
-    /// constant-mask clear here would erase a flag that latched between
-    /// the read and the write (a STOP landing in that window, say)
-    /// without anyone ever having seen it.
+    /// Take and classify one listen event through the register
+    /// facade ([`TargetRegisters::take_listen_event`], which owns the
+    /// same-snapshot W1C clear and the SASR consumption), mapping it
+    /// to the driver's `Event`/`IOError` surface.
     fn status(&self) -> Result<Event, IOError> {
-        let ssr = self.info.regs().ssr().read();
-        self.info.regs().ssr().write(|w| {
-            w.set_rsf(ssr.rsf());
-            w.set_sdf(ssr.sdf());
-            w.set_bef(ssr.bef());
-            w.set_fef(ssr.fef());
-        });
-
-        if ssr.bef() {
-            Err(IOError::BitError)
-        } else if ssr.fef() {
-            Err(IOError::FifoError)
-        } else if ssr.avf() || ssr.gcf() || ssr.sarf() {
-            // GCF/SARF are address-classification tags on the
-            // address-valid event. We must read SASR to consume
-            // the address-valid state regardless of which tag
-            // triggered the match.
-            let is_gc = ssr.gcf();
-            let is_alert = ssr.sarf();
-            let sasr = self.info.regs().sasr().read();
-            let addr = sasr.raddr();
-            if is_gc {
-                Ok(Event::GeneralCall)
-            } else if is_alert {
-                Ok(Event::SmbusAlert)
-            } else {
-                Ok(Event::AddressValid(addr))
-            }
-        } else if ssr.taf() {
-            Ok(Event::TransmitAck)
-        } else if ssr.rsf() {
-            let sasr = self.info.regs().sasr().read();
-            let addr = sasr.raddr();
-            Ok(Event::RepeatedStart(addr))
-        } else if ssr.sdf() {
-            let sasr = self.info.regs().sasr().read();
-            let addr = sasr.raddr();
-            Ok(Event::Stop(addr))
-        } else {
-            Err(IOError::Other)
+        match self.registers().take_listen_event() {
+            ListenEvent::Fault(f) => Err(f.into()),
+            ListenEvent::AddressValid(addr) => Ok(Event::AddressValid(addr)),
+            ListenEvent::GeneralCall => Ok(Event::GeneralCall),
+            ListenEvent::SmbusAlert => Ok(Event::SmbusAlert),
+            ListenEvent::TransmitAck => Ok(Event::TransmitAck),
+            ListenEvent::RepeatedStart(addr) => Ok(Event::RepeatedStart(addr)),
+            ListenEvent::Stop(addr) => Ok(Event::Stop(addr)),
+            ListenEvent::None => Err(IOError::Other),
         }
     }
 
@@ -907,11 +865,30 @@ impl<'d> I2c<'d, Dma<'d>> {
         )
     }
 
+    /// One operation owns the RX DMA handoff: peripheral request off,
+    /// channel quiesced (provably idle before the buffer borrow ends),
+    /// DMA writes made visible. Returns whether the major loop had
+    /// completed. The register layer provides the primitives; this
+    /// compound sequence is the driver's protocol, in one place.
+    fn finish_rx_dma(&self) -> bool {
+        self.registers().set_rx_dma(false);
+        let filled = self.mode.rx_dma.quiesce();
+        fence(Ordering::Acquire);
+        filled
+    }
+
+    /// TX twin of [`Self::finish_rx_dma`] (no acquire fence needed:
+    /// the DMA read from the buffer, nothing to make visible to us).
+    fn finish_tx_dma(&self) -> bool {
+        self.registers().set_tx_dma(false);
+        self.mode.tx_dma.quiesce()
+    }
+
     // Takes `&self`: every DMA setup call is `&self`, and the caller's
     // cancellation `OnDrop` closure holds the channel by shared
     // reference to quiesce it.
     async fn read_dma_chunk(&self, data: &mut [u8]) -> Result<RxChunkOutcome, IOError> {
-        let peri_addr = self.info.regs().srdr().as_ptr() as *const u8;
+        let peri_addr = self.registers().rx_data_ptr();
         let chunk_len = data.len();
 
         // NOTE: deliberately no entry `clear_status()` here. The
@@ -937,7 +914,7 @@ impl<'d> I2c<'d, Dma<'d>> {
                 .setup_read_from_peripheral(peri_addr, data, false, TransferOptions::COMPLETE_INTERRUPT)?;
 
             // Enable I2C RX DMA request
-            self.info.regs().sder().modify(|w| w.set_rdde(true));
+            self.registers().set_rx_dma(true);
 
             // Enable DMA channel request
             self.mode.rx_dma.enable_request();
@@ -977,11 +954,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // idle first, and reports whether the major loop had completed
         // (after which CITER has auto-reloaded and `transferred_bytes`
         // would read zero).
-        self.info.regs().sder().modify(|w| w.set_rdde(false));
-        let filled = self.mode.rx_dma.quiesce();
-
-        // Ensure all writes by DMA are visible to the CPU
-        fence(Ordering::Acquire);
+        let filled = self.finish_rx_dma();
 
         let moved = if filled {
             chunk_len
@@ -1046,7 +1019,7 @@ impl<'d> I2c<'d, Dma<'d>> {
 
     // Takes `&self` — see `read_dma_chunk`.
     async fn write_dma_chunk(&self, data: &[u8]) -> Result<TxChunkOutcome, IOError> {
-        let peri_addr = self.info.regs().stdr().as_ptr() as *mut u8;
+        let peri_addr = self.registers().tx_data_ptr();
         let chunk_len = data.len();
 
         // NOTE: deliberately no entry `clear_status()` here. The
@@ -1078,7 +1051,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             fence(Ordering::Release);
 
             // Enable I2C TX DMA request
-            self.info.regs().sder().modify(|w| w.set_tdde(true));
+            self.registers().set_tx_dma(true);
 
             // Enable DMA channel request
             self.mode.tx_dma.enable_request();
@@ -1109,8 +1082,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         // buffer contents: an in-flight minor loop is still consuming
         // `data` and advancing CITER while the caller's borrow ends
         // and the count is read.
-        self.info.regs().sder().modify(|w| w.set_tdde(false));
-        let exhausted = self.mode.tx_dma.quiesce();
+        let exhausted = self.finish_tx_dma();
 
         let bytes = if exhausted {
             chunk_len
@@ -1177,16 +1149,8 @@ where
     /// quietly during the listen is fine: `status` observes and clears
     /// it alongside the address event it belongs to.
     fn enable_listen_ints(&self) {
-        self.info.regs().sier().write(|w| {
-            w.set_sarie(self.smbus_alert.clone().into());
-            w.set_gcie(self.general_call.clone().into());
-            w.set_am1ie(true);
-            w.set_am0ie(true);
-            w.set_feie(true);
-            w.set_beie(true);
-            w.set_sdie(true);
-            w.set_avie(true);
-        });
+        self.registers()
+            .enable_listen_interrupts(self.general_call.clone().into(), self.smbus_alert.clone().into());
     }
 
     /// Arm the listen interrupt set and evaluate its wake condition as
@@ -1452,8 +1416,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // Disabling the peripheral request is not enough: an
             // in-flight minor loop would keep reading the caller's
             // buffer after this future unwound.
-            self.info.regs().sder().modify(|w| w.set_tdde(false));
-            self.mode.tx_dma.quiesce();
+            self.finish_tx_dma();
         });
 
         let total = buf.len();
@@ -1513,8 +1476,7 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             // Disabling the peripheral request is not enough: an
             // in-flight minor loop would keep writing into the caller's
             // buffer after this future unwound.
-            self.info.regs().sder().modify(|w| w.set_rdde(false));
-            self.mode.rx_dma.quiesce();
+            self.finish_rx_dma();
         });
 
         let total = buf.len();
