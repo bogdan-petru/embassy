@@ -1640,12 +1640,24 @@ pub mod tests {
         // runs.)
         const DEADLINES_US: &[u64] = &[30, 80, 150, 300, 700, 1500, 2400, 2900, 3200, 3800, 4500, 7000];
         const REPS: usize = 3;
+        /// Deadlines at or below this must always beat a 32-byte
+        /// transfer on this rig (measured ≥ ~4.3 ms for both kinds):
+        /// a completion there means the race never actually raced.
+        const SHORT_MAX_US: u64 = 3200;
 
         let mut cancelled = 0u32;
         let mut completed = 0u32;
         let mut faulted = 0u32;
+        // Deterministic per-band bookkeeping — the test's claims are
+        // asserted, not just logged: writes are immune to the
+        // spurious-ALF read quirk, so a short-deadline WRITE race has
+        // exactly one legal outcome (cancel), checked per deadline;
+        // reads may legitimately fault first, so their short-band
+        // claim is "never completes".
+        let mut short_completed = 0u32;
+        let mut write_cancels = [0u32; DEADLINES_US.len()];
         for _rep in 0..REPS {
-            for &d in DEADLINES_US {
+            for (di, &d) in DEADLINES_US.iter().enumerate() {
                 // Read race, anchored so a completed read is exactly
                 // checkable.
                 resync(ctrl, model).await?;
@@ -1654,6 +1666,9 @@ pub mod tests {
                 match select(ctrl.read(TARGET_ADDR, &mut buf), Timer::after_micros(d)).await {
                     Either::First(Ok(())) => {
                         completed += 1;
+                        if d <= SHORT_MAX_US {
+                            short_completed += 1;
+                        }
                         if !model.check_read(&buf) {
                             return Err("cancellation: completed read mismatch");
                         }
@@ -1700,10 +1715,16 @@ pub mod tests {
                 match select(ctrl.write(TARGET_ADDR, &w), Timer::after_micros(d)).await {
                     Either::First(Ok(())) => {
                         completed += 1;
+                        if d <= SHORT_MAX_US {
+                            short_completed += 1;
+                        }
                         model.write(&w);
                     }
                     Either::First(Err(_)) => faulted += 1,
-                    Either::Second(()) => cancelled += 1,
+                    Either::Second(()) => {
+                        cancelled += 1;
+                        write_cancels[di] += 1;
+                    }
                 }
                 defmt::debug!(
                     "[c] d={=u64} write race+recovery took {=u64}us",
@@ -1723,14 +1744,104 @@ pub mod tests {
                     );
                     return Err("cancellation: post-write-cancel verify mismatch");
                 }
+
+                // Repeated-START race: write_read's read half rides a
+                // repeated START on the write half's open transaction,
+                // so the drop can land in the write, in the continue
+                // transition itself, or in the read half — the paths
+                // the plain races above never touch. ~4–5 ms total on
+                // this rig, so the ladder spans it like the others.
+                resync(ctrl, model).await?;
+                let wr_w = [0x11u8, 0x22];
+                let mut wr_r = [0u8; 24];
+                match select(ctrl.write_read(TARGET_ADDR, &wr_w, &mut wr_r), Timer::after_micros(d)).await {
+                    Either::First(Ok(())) => {
+                        completed += 1;
+                        // The write half committed and rewound the
+                        // cursor; the read half served from zero.
+                        model.write(&wr_w);
+                        if !model.check_read(&wr_r) {
+                            return Err("cancellation: completed write_read mismatch");
+                        }
+                    }
+                    Either::First(Err(_)) => faulted += 1,
+                    Either::Second(()) => cancelled += 1,
+                }
+
+                // Recovery proof for the repeated-START race.
+                let mut verify = [0u8; 32];
+                op_read(ctrl, &mut verify, model, stats).await?;
+                if !model.check_read(&verify) {
+                    defmt::error!(
+                        "cancellation d={=u64}us post-write_read: got={:02x} want={:02x}",
+                        d,
+                        verify[..8],
+                        model.buf[..8]
+                    );
+                    return Err("cancellation: post-write_read-cancel verify mismatch");
+                }
             }
         }
 
-        // The short deadlines cannot lose to a multi-millisecond
-        // transfer; zero cancellations means the race never actually
-        // exercised the drop path.
-        if cancelled == 0 {
-            return Err("cancellation: no future was ever cancelled");
+        // Long chained-read races: a >256-byte read puts multiple
+        // RECEIVE commands in flight/pending at once, so cancellation
+        // aborts a session holding a live command PIPELINE — recovery
+        // must run it out (draining RX the whole way) and close behind
+        // its auto-NACK, the path a 32-byte race can never reach.
+        // Recovery costs the remaining pipeline on the wire (tens of
+        // ms), so this ladder is short. 300 bytes chains on every
+        // engine without the chunking opt-in.
+        const LONG_DEADLINES_US: &[u64] = &[400, 5000, 20_000];
+        for &d in LONG_DEADLINES_US {
+            resync(ctrl, model).await?;
+            let mut big = [0u8; 300];
+            match select(ctrl.read(TARGET_ADDR, &mut big), Timer::after_micros(d)).await {
+                Either::First(Ok(())) => {
+                    completed += 1;
+                    if !model.check_read(&big) {
+                        return Err("cancellation: completed long read mismatch");
+                    }
+                }
+                Either::First(Err(_)) => faulted += 1,
+                Either::Second(()) => cancelled += 1,
+            }
+
+            let mut verify = [0u8; 32];
+            op_read(ctrl, &mut verify, model, stats).await?;
+            if !model.check_read(&verify) {
+                defmt::error!(
+                    "cancellation long d={=u64}us: got={:02x} want={:02x}",
+                    d,
+                    verify[..8],
+                    model.buf[..8]
+                );
+                return Err("cancellation: post-long-cancel verify mismatch");
+            }
+        }
+
+        // Deterministic claims, asserted rather than logged:
+        // * neither 32-byte race may complete under SHORT_MAX (those
+        //   transfers take ≥ ~4.3 ms here — a completion there means
+        //   the race never actually raced; the shorter write_read
+        //   race is deliberately outside this claim);
+        // * EVERY short-deadline write race must have cancelled, per
+        //   deadline band (writes cannot fault spuriously and cannot
+        //   complete that fast, so cancel is the only legal outcome —
+        //   this pins each band's drop to a distinct transaction
+        //   phase instead of settling for "something cancelled").
+        if short_completed != 0 {
+            return Err("cancellation: a transfer completed before it physically could");
+        }
+        for (di, &d) in DEADLINES_US.iter().enumerate() {
+            if d <= SHORT_MAX_US && write_cancels[di] != REPS as u32 {
+                defmt::error!(
+                    "cancellation: d={=u64}us write races cancelled {=u32}/{=u32}",
+                    d,
+                    write_cancels[di],
+                    REPS as u32
+                );
+                return Err("cancellation: a short-deadline write race did not cancel");
+            }
         }
         defmt::info!(
             "[cancellation] {=u32} dropped mid-flight, {=u32} completed, {=u32} faulted",

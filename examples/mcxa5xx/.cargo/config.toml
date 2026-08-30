@@ -14,4 +14,11 @@ rustflags = [
 target = "thumbv8m.main-none-eabihf" # Cortex-M33
 
 [env]
-DEFMT_LOG = "trace"
+# `info` is the validated default for this crate. `trace` (and even
+# per-race `debug` logs in the two-board suite) push enough RTT volume
+# to fault the MCU-Link debug connection mid-session ("Target device
+# responded with a FAULT response" / DAP DRW errors) — the exact
+# builds used for hardware validation are DEFMT_LOG=info. Cargo [env]
+# is non-forcing, so a real environment variable still overrides this
+# for targeted telemetry runs.
+DEFMT_LOG = "info"

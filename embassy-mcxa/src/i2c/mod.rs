@@ -42,6 +42,15 @@ pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
 pub(crate) struct Info {
     pub(crate) regs: pac::lpi2c::Lpi2c,
     pub(crate) wait_cell: WaitCell,
+    /// Whether a controller transaction session is currently live on
+    /// this peripheral. The session type is linear on every public
+    /// path by construction, but nothing at compile time stops a
+    /// module-internal caller from minting a second session while one
+    /// exists — this flag turns that mistake into a deterministic
+    /// panic at the mint (set there, cleared on defuse and on the
+    /// drop-recovery path). Lives here rather than on the driver so
+    /// `Session`'s drop can clear it without borrowing the driver.
+    pub(crate) session_open: core::sync::atomic::AtomicBool,
 }
 
 impl Info {
@@ -68,6 +77,7 @@ macro_rules! impl_lpi2c_instance {
                     static INFO: crate::i2c::Info = crate::i2c::Info {
                         regs: crate::pac::[<LPI2C $n>],
                         wait_cell: maitake_sync::WaitCell::new(),
+                        session_open: core::sync::atomic::AtomicBool::new(false),
                     };
                     &INFO
                 }

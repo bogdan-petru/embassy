@@ -359,6 +359,30 @@ impl ControllerRegisters {
         self.mfsr().txcount() as usize
     }
 
+    /// One step of the trailing-STOP completion wait: `Some(Ok(()))`
+    /// when the STOP has PHYSICALLY completed — command FIFO empty AND
+    /// the bus engine idle — `Some(Err(..))` when a fault latched (the
+    /// transaction's last chance to classify it as its own), `None` to
+    /// keep waiting (the STOP is still queued, still forming, or the
+    /// target is stretching the clock).
+    ///
+    /// "Pulled from the FIFO" is NOT completion: the wire condition
+    /// follows later, and a fault in that window belongs to the
+    /// transaction that requested the STOP — a wait that ends at FIFO
+    /// drain hands such faults to whoever runs next, with no recovery
+    /// owner. Deliberately not SDF-based either: this silicon raises
+    /// SDF spuriously mid-transfer (see `transfer_ended`), while
+    /// MBF reflects the engine actually going idle.
+    pub(super) fn stop_step(&self) -> Option<Result<(), ControllerStatusError>> {
+        if let Some(e) = self.read_status().error() {
+            return Some(Err(e));
+        }
+        if self.mfsr().txcount() == 0 && self.msr().mbf() == Mbf::Idle {
+            return Some(Ok(()));
+        }
+        None
+    }
+
     /// Recovery helper: discard everything currently in the RX FIFO.
     ///
     /// An aborted read's in-flight RECEIVE — which a FIFO reset

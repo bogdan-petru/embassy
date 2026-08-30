@@ -25,6 +25,9 @@
 //! Bring the target board up first, otherwise the initial sync write
 //! NACKs. Exits via semihosting, so `probe-rs run` returns 0 when every
 //! test passed and nonzero (panic → HardFault) on any failure.
+//! `run-two-board.ps1` in this crate captures the validated run
+//! procedure (probe roles, target-reset timing, SWD speed, build
+//! recipe).
 
 #![no_std]
 #![no_main]

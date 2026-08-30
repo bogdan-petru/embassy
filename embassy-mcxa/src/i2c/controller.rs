@@ -288,11 +288,13 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 /// recovery.
 ///
 /// Produced only by the `start_fresh`/`start_continue` transitions;
-/// consumed by `stop`/`async_stop` or by the next `start_continue`
-/// (a repeated START takes the predecessor over on the wire). The
-/// engines are split into `*_txn_*` operations, which leave the
-/// session open and hand it back, and `*_close*` operations, which
-/// consume it with a trailing STOP.
+/// consumed by `stop`/`async_stop` — only AFTER their STOP physically
+/// completes, so a fault or stretch during the close still has a
+/// recovery owner — or by the next `start_continue` (a repeated START
+/// takes the predecessor over on the wire). The engines are split
+/// into `*_txn_*` operations, which leave the session open and hand
+/// it back, and `*_close*` operations, which consume it with a
+/// trailing STOP.
 ///
 /// What each tier enforces:
 ///
@@ -303,7 +305,9 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 ///   (no `Copy`/`Clone`); and there is no fresh-start entry point that
 ///   accepts an optional continuation — continuing and starting fresh
 ///   are different functions, so "pass nothing while holding a live
-///   session" is not an expressible call.
+///   session" is not an expressible call. (Full linearity is NOT
+///   compile-enforced: within this module a second session could be
+///   minted while one lives — that is the runtime tier's job.)
 /// - **Drop-enforced**: ABANDONMENT IS RECOVERY. A session dropped on
 ///   any path — an error unwind, a cancelled future, plain forgetting
 ///   to thread it — runs the same self-contained remediation the
@@ -314,7 +318,10 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 ///   which drop before the session by declaration order.)
 /// - **Runtime-enforced**: the session carries its controller's shared
 ///   state and every consumption asserts identity, so a session from
-///   another instance fails deterministically.
+///   another instance fails deterministically — and `Info` carries a
+///   liveness flag so minting a second session while one exists
+///   (which would split recovery ownership of one wire transaction)
+///   panics at the mint instead of corrupting the bus.
 #[must_use]
 struct Session {
     /// The owning controller's shared state — enough to recover
@@ -332,8 +339,12 @@ struct Session {
 
 impl Session {
     /// Consume without recovery: the transaction reached its defined
-    /// end (a STOP was issued, or a successor START took it over).
+    /// end (a STOP physically completed, or a successor START took it
+    /// over on the wire).
     fn defuse(self) {
+        self.info
+            .session_open
+            .store(false, core::sync::atomic::Ordering::Relaxed);
         core::mem::forget(self);
     }
 }
@@ -355,6 +366,9 @@ impl Drop for Session {
             Abort::General
         };
         remediate(&ControllerRegisters::new(self.info.regs()), self.timeout, abort);
+        self.info
+            .session_open
+            .store(false, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -406,13 +420,21 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     // (hardware-observed: the closing STOP then forms on the wire,
     // EPF/SDF latch, yet MBF/BBF stick busy forever and later
     // commands are ignored — a state not even an engine reset fully
-    // unwinds). So the entry reset runs only when the engine is idle
-    // or halted on a latched fault; an active abort keeps its queued
-    // commands and lets the pipeline run out under the drain below,
-    // which is bounded: at most a FIFO's worth of commands.
+    // unwinds). So the entry reset runs ONLY when the engine is idle.
+    // A latched fault is deliberately NOT accepted as proof of a
+    // halted engine: the spurious-ALF quirk latches "arbitration
+    // loss" on a transfer that is still running, and gating the reset
+    // on it would land exactly the corruption above. The cost falls
+    // on the genuinely-halted-while-busy case instead: its stale
+    // pipeline is not dropped here but scrubbed-and-run-out by the
+    // drain below (the fault clear un-halts the engine, its leftover
+    // commands drain — at most a FIFO's worth, each re-NACK re-halts
+    // and is re-scrubbed — and the close queues once room appears).
+    // Wire-visible cost: up to a FIFO's worth of already-NACKed bytes
+    // re-offered to a target that refuses them; bounded and protocol-
+    // tolerable, unlike a wedged engine.
     let busy = regs.master_busy();
-    let halted = regs.read_status().error().is_some();
-    if !busy || halted {
+    if !busy {
         regs.reset_fifos();
     }
     regs.clear_all_status();
@@ -787,7 +809,18 @@ impl<'d, M: Mode> I2c<'d, M> {
     }
 
     /// Mint the session for a transaction this controller just opened.
+    ///
+    /// Runtime linearity backstop: the session type is threaded
+    /// linearly on every public path by construction, but nothing at
+    /// compile time stops a module-internal caller from minting a
+    /// second session while one is live — that would split recovery
+    /// ownership of a single wire transaction. The mint fails
+    /// deterministically instead.
     fn open_session(&self, read: bool) -> Session {
+        assert!(
+            !self.info.session_open.swap(true, core::sync::atomic::Ordering::Relaxed),
+            "i2c: a transaction session opened while another is live"
+        );
         Session {
             info: self.info,
             timeout: self.timeout,
@@ -849,16 +882,24 @@ impl<'d, M: Mode> I2c<'d, M> {
     }
 
     /// Take-and-classify the status, then recover for the classes a
-    /// START/STOP transition must not leave behind. ONLY for
-    /// `start`/`stop` (before a session exists / after it is defused)
-    /// — everywhere else the live [`Session`]'s drop owns recovery.
+    /// START transition must not leave behind. ONLY for the start
+    /// transitions (no session exists yet) — everywhere else the live
+    /// [`Session`]'s drop owns recovery, and `stop` classifies without
+    /// recovering (its error returns drop the session).
     ///
     /// On a NACK: per RM 40.7.1.5, the controller auto-STOPs only with
     /// MCFGR1[AUTOSTOP] or a non-empty transmit FIFO; otherwise the
-    /// recovery STOP is ours to send. Arbitration loss / FIFO error /
-    /// pin-low timeout leave aborted commands queued for the next
-    /// transaction to trip over, so they recover too.
-    fn take_status_and_recover(&self) -> Result<(), IOError> {
+    /// recovery STOP is ours to send — and an address NACK means the
+    /// target never ACKed, so nobody is driving SDA and the General
+    /// close is always right for it. The fault classes (arbitration
+    /// loss / FIFO error / pin-low timeout) leave aborted commands
+    /// queued for the next transaction to trip over, so they recover
+    /// too — and they take the CALLER's abort shape: the spurious-ALF
+    /// silicon quirk raises "arbitration loss" on a transfer that is
+    /// still running, so a fault after a read's address phase can be
+    /// sitting on exactly the target-drives-SDA wire state whose bare
+    /// STOP wedges the engine (see [`Abort::ReadAddressed`]).
+    fn take_status_and_recover(&self, abort: Abort) -> Result<(), IOError> {
         let status = self.parse_status(self.registers().take_status());
         match status {
             Err(IOError::AddressNack) => {
@@ -867,7 +908,7 @@ impl<'d, M: Mode> I2c<'d, M> {
                 }
             }
             Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout) => {
-                self.remediation();
+                remediate(&self.registers(), self.timeout, abort);
             }
             _ => {}
         }
@@ -943,34 +984,44 @@ impl<'d, M: Mode> I2c<'d, M> {
             return Err(e);
         }
 
-        self.take_status_and_recover().map(|()| self.open_session(read))
+        self.take_status_and_recover(if read { Abort::ReadAddressed } else { Abort::General })
+            .map(|()| self.open_session(read))
     }
 
-    /// Prepares a Stop condition on the bus.
+    /// Prepares a Stop condition on the bus and waits for it to
+    /// PHYSICALLY complete: command FIFO empty AND the bus engine
+    /// idle. "Pulled from the FIFO" is not completion — the wire
+    /// condition follows later (a bit-time normally, a whole clock
+    /// stretch pathologically), and a fault in that window belongs to
+    /// THIS transaction.
     ///
-    /// Analogous to `start`, this blocks waiting for space in the
-    /// FIFO to become available, then sends the command and blocks
-    /// waiting for the FIFO to become empty ensuring the command was
-    /// sent.
+    /// The session stays live until that completion succeeds: every
+    /// error return — no FIFO room, a fault while the STOP formed, a
+    /// stretched STOP that never completed within the timeout — drops
+    /// the session, whose recovery closes the transaction. Nothing
+    /// here recovers explicitly, so recovery stays exactly-once.
     fn stop(&self, open: Session) -> Result<(), IOError> {
-        // The session reaches its defined end here; every failure
-        // below recovers directly (`stop` owns its own failures).
-        self.consume_session(open);
-        if let Err(e) = self.wait_tx_room() {
-            self.remediation();
-            return Err(e);
-        }
+        self.wait_tx_room()?;
 
         self.send_cmd(ControllerCommand::STOP, 0);
 
-        // Wait for TxFIFO to be drained; on timeout the STOP is still
-        // queued behind a stretched clock — drop it.
-        if let Err(e) = self.wait_tx_settled() {
-            self.remediation();
-            return Err(e);
+        let deadline = embassy_time::Instant::now() + self.timeout;
+        loop {
+            match self.registers().stop_step() {
+                Some(Ok(())) => break,
+                Some(Err(e)) => return Err(e.into()),
+                None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
+                None => {}
+            }
         }
 
-        self.take_status_and_recover()
+        // Completion is not a status read: one final snapshot both
+        // classifies a fault that latched in the last poll gap as this
+        // transaction's own, and clears the STOP's residual flags so
+        // the next START does not misattribute them.
+        self.parse_status(self.registers().take_status())?;
+        self.consume_session(open);
+        Ok(())
     }
 
     /// Read on a FRESH transaction, leaving it OPEN (no trailing
@@ -1384,52 +1435,58 @@ where
 
         // Note: the START + ACK/NACK have not necessarily been finished here.
         // thus this might return Ok(()), but might at a later state result in NAK or FifoError.
-        self.take_status_and_recover().map(|()| self.open_session(read))
+        self.take_status_and_recover(abort).map(|()| self.open_session(read))
     }
 
-    /// Schedule a STOP command and await it being pulled from the FIFO.
+    /// Schedule a STOP command and wait for it to PHYSICALLY complete
+    /// — see [`Self::stop`] for the completion condition and the
+    /// session contract: the session stays live across every wait, so
+    /// an error return OR a drop-cancellation recovers via the
+    /// session itself, exactly once. The old internal cancellation
+    /// guard is gone — the session IS the guard now.
     ///
-    /// Bounded like [`Self::async_start_raw`], and like it fully
-    /// self-recovering: a timeout means the STOP is stuck behind a
-    /// stretched clock and remediation drops it, and the fault classes
-    /// (arbitration loss, FIFO error, pin-low timeout) can leave the
-    /// aborted STOP queued — `tx_settled` also exits on an error flag
-    /// — so they remediate too. The session is consumed (defused) at
-    /// entry, so recovery for a failed stop runs exactly once, here —
-    /// nothing else holds a claim on the transaction. The awaited wait
-    /// is guarded against drop-cancellation for the same reason — see
-    /// `async_start_raw`.
+    /// The interrupt wake fires when the STOP is pulled from the FIFO
+    /// (there is deliberately no EPF/SDF wake — spurious-flag
+    /// pollution, see `enable_error_interrupts`), so the tail from
+    /// "pulled" to "bus idle" is a bounded poll: a bit-time normally,
+    /// a clock stretch capped by the deadline pathologically.
     async fn async_stop(&self, open: Session) -> Result<(), IOError> {
-        // The session reaches its defined end here; every failure
-        // below recovers directly (`async_stop` owns its own
-        // failures).
-        self.consume_session(open);
         // send the stop command
         self.send_cmd(ControllerCommand::STOP, 0);
 
-        // Cancellation guard for THIS await — see `async_start`. A
-        // dropped stop mostly self-heals (the queued STOP executes
-        // autonomously), but one stuck behind a stretched clock would
-        // otherwise stay queued for the next transaction to trip over.
-        let on_drop = OnDrop::new(|| self.remediation());
-
+        let deadline = embassy_time::Instant::now() + self.timeout;
         let waited = embassy_time::with_timeout(
             self.timeout,
             self.info.wait_cell().wait_for(|| self.registers().tx_settle_wake()),
         )
         .await;
-        on_drop.defuse();
 
         match waited {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(IOError::Other),
-            Err(_) => {
-                self.remediation();
-                return Err(IOError::Timeout);
+            Err(_) => return Err(IOError::Timeout),
+        }
+
+        loop {
+            match self.registers().stop_step() {
+                Some(Ok(())) => break,
+                Some(Err(e)) => return Err(e.into()),
+                None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
+                // Cooperative: the tail from "pulled" to "bus idle" has
+                // no interrupt to sleep on, but it must neither starve
+                // the executor for a clock stretch nor pin this future
+                // uncancellable (no await point = no drop) — and a
+                // drop landing here is already safe, the live session
+                // recovers. A yield, not a timer: the normal tail is a
+                // bit-time, well under any tick.
+                None => embassy_futures::yield_now().await,
             }
         }
 
-        self.take_status_and_recover()
+        // See `stop`: classify-and-clear as this transaction's own.
+        self.parse_status(self.registers().take_status())?;
+        self.consume_session(open);
+        Ok(())
     }
 
     // Public API: Async
