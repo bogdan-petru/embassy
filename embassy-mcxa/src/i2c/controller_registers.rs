@@ -28,8 +28,7 @@ use super::lpi2c_regs::{self, LpI2cRegisters};
 use crate::pac;
 pub(super) use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
-    Alf, Dmf, Epf, Mbf, Mcfgr1, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param,
-    Pltf, Stf,
+    Alf, Dmf, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param, Pltf, Stf,
 };
 
 /// A typed snapshot of the controller error flags relevant to transfers.
@@ -255,6 +254,51 @@ impl ControllerRegisters {
         ControllerStatus::from_snapshot(&msr)
     }
 
+    /// [`Self::take_status`], except a latched NDF/FEF is returned
+    /// STILL LATCHED (the write-back masks those two bits off).
+    ///
+    /// The halting flags are load-bearing: while one is latched the
+    /// engine fetches nothing, so whatever the aborted transfer left
+    /// queued stays frozen. Clearing them as a side effect of
+    /// classification un-halts the engine in the gap before recovery
+    /// acts — and a stale queued command (the continue shape queues
+    /// its repeated START while the write half is still draining)
+    /// then fetches and REPLAYS on the wire with no owner. Recovery
+    /// paths classify with this and let `remediate` observe and clear
+    /// the halt itself, with the pipeline still frozen.
+    pub(super) fn take_status_preserving_halts(&self) -> ControllerStatus {
+        let msr = self.msr();
+        let mut wb = msr;
+        wb.set_ndf(Ndf::IntNo);
+        wb.set_fef(MsrFef::IntNo);
+        self.write_msr(wb);
+        ControllerStatus::from_snapshot(&msr)
+    }
+
+    /// One fault step for the recovery drain, honest under races:
+    /// classify and (maybe) clear from a SINGLE MSR snapshot. The
+    /// scrub-safe classes (ALF/PLTF — possibly spurious on this
+    /// silicon, latched on a transfer that is still running) are
+    /// cleared by writing the snapshot back with the halting bits
+    /// masked off, which can touch neither a fault that latched after
+    /// the read (the `take_status` write-back rule) nor a co-latched
+    /// NDF/FEF. The halting classes are returned still latched — what
+    /// to do about a frozen pipeline is the caller's decision.
+    pub(super) fn recovery_fault_step(&self) -> Option<ControllerStatusError> {
+        let msr = self.msr();
+        let err = ControllerStatus::from_snapshot(&msr).error();
+        if matches!(
+            err,
+            Some(ControllerStatusError::ArbitrationLoss) | Some(ControllerStatusError::PinLowTimeout)
+        ) {
+            let mut wb = msr;
+            wb.set_ndf(Ndf::IntNo);
+            wb.set_fef(MsrFef::IntNo);
+            self.write_msr(wb);
+        }
+        err
+    }
+
     pub(super) fn read_status(&self) -> ControllerStatus {
         ControllerStatus::from_snapshot(&self.msr())
     }
@@ -262,13 +306,6 @@ impl ControllerRegisters {
     pub(super) fn clear_current_status(&self) {
         let msr = self.msr();
         self.write_msr(msr);
-    }
-
-    /// Reference Manual 40.7.1.5: after an address NACK, a STOP must be
-    /// sent by software when automatic STOP generation is disabled and
-    /// nothing else is queued that would terminate the transfer.
-    pub(super) fn needs_manual_stop_after_nack(&self) -> bool {
-        !Mcfgr1(self.regs.mcfgr1.get()).autostop() && self.mfsr().txcount() == 0
     }
 
     /// One step of receive progress: a received byte (popped from the RX

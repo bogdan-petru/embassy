@@ -404,6 +404,35 @@ enum Abort {
 /// leave a clean slate. Free-standing so [`Session`]'s drop can run it
 /// without borrowing the controller; `I2c::remediation` is the same
 /// code.
+/// A halting fault (NDF/FEF) latched on a busy engine. With commands
+/// still queued the hardware auto-STOP ends the transaction (RM
+/// 40.7.1.5: a NACK with a non-empty command FIFO auto-STOPs): wait
+/// it out — never clear first, or the un-halted engine fetches the
+/// stale pipeline and REPLAYS it (a stale queued repeated START goes
+/// out as a fresh transaction). With an empty FIFO no auto-STOP is
+/// coming and there is nothing to replay: clear the halt so the
+/// caller can queue and run the manual close instead of burning the
+/// deadline on a wait that cannot end.
+///
+/// Returns whether the abort is fully resolved (transaction ended by
+/// the auto-STOP; only the trailing cleanup remains).
+fn wait_out_halting_fault(regs: &ControllerRegisters, deadline: embassy_time::Instant) -> bool {
+    if regs.tx_pending() == 0 {
+        regs.clear_all_status();
+        return false;
+    }
+    while regs.master_busy() {
+        regs.discard_rx();
+        if embassy_time::Instant::now() > deadline {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("recovery: auto-STOP did not finish; resetting the engine");
+            regs.reset_engine();
+            break;
+        }
+    }
+    true
+}
+
 fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort) {
     #[cfg(feature = "defmt")]
     defmt::trace!("Recovering controller",);
@@ -424,20 +453,32 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     // A latched fault is deliberately NOT accepted as proof of a
     // halted engine: the spurious-ALF quirk latches "arbitration
     // loss" on a transfer that is still running, and gating the reset
-    // on it would land exactly the corruption above. The cost falls
-    // on the genuinely-halted-while-busy case instead: its stale
-    // pipeline is not dropped here but scrubbed-and-run-out by the
-    // drain below (the fault clear un-halts the engine, its leftover
-    // commands drain — at most a FIFO's worth, each re-NACK re-halts
-    // and is re-scrubbed — and the close queues once room appears).
-    // Wire-visible cost: up to a FIFO's worth of already-NACKed bytes
-    // re-offered to a target that refuses them; bounded and protocol-
-    // tolerable, unlike a wedged engine.
+    // on it would land exactly the corruption above.
+    //
+    // The busy entry must ALSO not clear flags blindly: a latched
+    // NDF/FEF is what holds a halted engine off its stale pipeline
+    // (see `take_status_preserving_halts`), so the halting classes
+    // are recognized FIRST — the auto-STOP is waited out and the
+    // pipeline discarded, or (empty FIFO: nothing to replay, no
+    // auto-STOP coming) the halt is cleared for the drain's manual
+    // close. Everything else is scrubbed snapshot-honestly, which
+    // cannot erase a halting fault racing in.
+    let deadline = embassy_time::Instant::now() + timeout;
     let busy = regs.master_busy();
+    let mut resolved = false;
     if !busy {
+        // Idle entry: nothing is running — dropping the stale
+        // pipeline and clearing everything is unconditionally safe.
         regs.reset_fifos();
+        regs.clear_all_status();
+    } else {
+        match regs.recovery_fault_step() {
+            Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
+                resolved = wait_out_halting_fault(regs, deadline);
+            }
+            _ => {}
+        }
     }
-    regs.clear_all_status();
 
     // The recovery STOP is meaningful ONLY while a transfer is open
     // on the wire. Queued onto an idle controller (a NACK the
@@ -457,8 +498,7 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
     // engine reset — a bounded ending instead of a silent skip. (The
     // opposite staleness, busy→idle, is the drain's 500 µs
     // idle-with-close-pending break below.)
-    if busy || regs.master_busy() {
-        let deadline = embassy_time::Instant::now() + timeout;
+    if !resolved && (busy || regs.master_busy()) {
         // The closing sequence is shape-specific — see [`Abort`] —
         // and is queued once there is room behind whatever the abort
         // left pending (those commands run out first; a read
@@ -513,13 +553,34 @@ fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort:
             }
 
             // The master HALTS on a latched fault and consumes no
-            // further commands until it is cleared — so a fault
-            // observed mid-drain is scrubbed (only when actually
-            // latched: a tight unconditional clear loop hammering MSR
-            // disturbed otherwise-clean drains on hardware) and the
-            // wait continues; recovery has no caller to classify for.
-            if regs.read_status().error().is_some() {
-                regs.clear_all_status();
+            // further commands until it is cleared. What happens next
+            // is CLASS-specific (recovery has no caller to classify
+            // for, but it must still read the flags honestly — one
+            // snapshot, clearing only what that snapshot's class
+            // permits; see `recovery_fault_step`):
+            //
+            // * ALF/PLTF may be SPURIOUS on this silicon — latched on
+            //   a transfer that is still running — so the step scrubs
+            //   them (only when actually latched: a tight
+            //   unconditional clear loop hammering MSR disturbed
+            //   otherwise-clean drains on hardware) and the run-out
+            //   continues; a GENUINE arbitration loss idles the
+            //   engine, which the idle-with-close-pending break above
+            //   then ends.
+            // * NDF/FEF are real sequencing verdicts, and the latched
+            //   flag is what keeps the stale pipeline frozen —
+            //   `wait_out_halting_fault` waits out the hardware
+            //   auto-STOP and the abort is done (trailing reset
+            //   discards everything, the close included), or, with an
+            //   empty FIFO, clears the halt and the drain runs the
+            //   manual close.
+            match regs.recovery_fault_step() {
+                Some(ControllerStatusError::AddressNack) | Some(ControllerStatusError::Fifo) => {
+                    if wait_out_halting_fault(regs, deadline) {
+                        break;
+                    }
+                }
+                _ => {}
             }
 
             // A target holding SCL low satisfies no exit condition,
@@ -808,19 +869,35 @@ impl<'d, M: Mode> I2c<'d, M> {
         open.defuse();
     }
 
-    /// Mint the session for a transaction this controller just opened.
+    /// Reserve the single-session slot BEFORE any wire traffic.
     ///
     /// Runtime linearity backstop: the session type is threaded
     /// linearly on every public path by construction, but nothing at
-    /// compile time stops a module-internal caller from minting a
-    /// second session while one is live — that would split recovery
-    /// ownership of a single wire transaction. The mint fails
-    /// deterministically instead.
-    fn open_session(&self, read: bool) -> Session {
+    /// compile time stops a module-internal caller from starting a
+    /// second transaction while one is live — that would split
+    /// recovery ownership of a single wire transaction. The
+    /// reservation, not the mint, is the mutual-exclusion point: a
+    /// second start must fail BEFORE its START touches the bus, not
+    /// after. Every start-transition failure path releases it; the
+    /// mint converts it into the [`Session`], whose defuse/drop
+    /// releases it.
+    fn reserve_session(&self) {
         assert!(
             !self.info.session_open.swap(true, core::sync::atomic::Ordering::Relaxed),
-            "i2c: a transaction session opened while another is live"
+            "i2c: a transaction started while another session is live"
         );
+    }
+
+    /// Release a reservation whose start failed before the mint.
+    fn unreserve_session(&self) {
+        self.info
+            .session_open
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mint the session for the reservation taken at the start
+    /// transition — see [`Self::reserve_session`].
+    fn open_session(&self, read: bool) -> Session {
         Session {
             info: self.info,
             timeout: self.timeout,
@@ -862,7 +939,10 @@ impl<'d, M: Mode> I2c<'d, M> {
             match self.registers().tx_room_step() {
                 Some(TxStep::Room) => return Ok(()),
                 Some(TxStep::Fault(_)) => {
-                    if let Err(e) = self.parse_status(self.registers().take_status()) {
+                    // Halt-preserving: a latched NDF/FEF keeps the
+                    // engine frozen off any queued commands until the
+                    // recovery owner (the caller's context) acts.
+                    if let Err(e) = self.parse_status(self.registers().take_status_preserving_halts()) {
                         return Err(e);
                     }
                     // The flag cleared concurrently; keep waiting.
@@ -900,12 +980,23 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// sitting on exactly the target-drives-SDA wire state whose bare
     /// STOP wedges the engine (see [`Abort::ReadAddressed`]).
     fn take_status_and_recover(&self, abort: Abort) -> Result<(), IOError> {
-        let status = self.parse_status(self.registers().take_status());
+        // Halt-preserving take: a latched NDF/FEF keeps the engine
+        // frozen off whatever is still queued until `remediate` — the
+        // continue shape queues its repeated START while the write
+        // half is still draining, and a plain take's clear would let
+        // that stale START fetch and replay on the wire in the gap.
+        let status = self.parse_status(self.registers().take_status_preserving_halts());
         match status {
             Err(IOError::AddressNack) => {
-                if self.registers().needs_manual_stop_after_nack() {
-                    self.remediation();
-                }
+                // Either the bus is still held (the RM 40.7.1.5
+                // manual STOP is due) or the hardware auto-STOPped
+                // with the aborted commands still queued (where doing
+                // nothing lets a stale command replay later).
+                // `remediate` resolves both: a held bus gets the
+                // close, a stale pipeline gets discarded. A NACK
+                // means nobody ACKed — nothing drives SDA — so the
+                // General close always forms.
+                remediate(&self.registers(), self.timeout, Abort::General);
             }
             Err(IOError::ArbitrationLoss) | Err(IOError::FifoError) | Err(IOError::PinLowTimeout) => {
                 remediate(&self.registers(), self.timeout, abort);
@@ -955,12 +1046,17 @@ impl<'d, M: Mode> I2c<'d, M> {
     }
 
     fn start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
+        // The reservation precedes the START going on the wire — see
+        // `reserve_session` — so every failure below must release it.
+        self.reserve_session();
+
         // Wait until we have space in the TxFIFO. No session exists
         // yet, so every failure class recovers HERE (`wait_tx_room` is
         // classification-only). The START is not on the wire yet, so
         // this is not a read abort.
         if let Err(e) = self.wait_tx_room() {
             self.remediation();
+            self.unreserve_session();
             return Err(e);
         }
 
@@ -981,11 +1077,15 @@ impl<'d, M: Mode> I2c<'d, M> {
         if let Err(e) = self.wait_tx_settled() {
             let abort = if read { Abort::ReadAddressed } else { Abort::General };
             remediate(&self.registers(), self.timeout, abort);
+            self.unreserve_session();
             return Err(e);
         }
 
-        self.take_status_and_recover(if read { Abort::ReadAddressed } else { Abort::General })
-            .map(|()| self.open_session(read))
+        let res = self.take_status_and_recover(if read { Abort::ReadAddressed } else { Abort::General });
+        if res.is_err() {
+            self.unreserve_session();
+        }
+        res.map(|()| self.open_session(read))
     }
 
     /// Prepares a Stop condition on the bus and waits for it to
@@ -1392,6 +1492,11 @@ where
     }
 
     async fn async_start_raw(&self, address: u8, read: bool) -> Result<Session, IOError> {
+        // The reservation precedes the START going on the wire — see
+        // `reserve_session` — so every failure below (the cancellation
+        // guard included) must release it.
+        self.reserve_session();
+
         // send the start command
         let addr_rw = address << 1 | if read { 1 } else { 0 };
         self.send_cmd(
@@ -1412,7 +1517,10 @@ where
         // Defused the moment the wait resolves — the arms below own
         // their remediation, so recovery stays exactly-once.
         let abort = if read { Abort::ReadAddressed } else { Abort::General };
-        let on_drop = OnDrop::new(|| remediate(&self.registers(), self.timeout, abort));
+        let on_drop = OnDrop::new(|| {
+            remediate(&self.registers(), self.timeout, abort);
+            self.unreserve_session();
+        });
 
         let waited = embassy_time::with_timeout(
             self.timeout,
@@ -1423,19 +1531,27 @@ where
 
         match waited {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(IOError::Other),
+            Ok(Err(_)) => {
+                self.unreserve_session();
+                return Err(IOError::Other);
+            }
             Err(_) => {
                 // The START never drained: drop it, or the next
                 // transaction trips over the stale queued command —
                 // and the address may still complete mid-recovery.
                 remediate(&self.registers(), self.timeout, abort);
+                self.unreserve_session();
                 return Err(IOError::Timeout);
             }
         }
 
         // Note: the START + ACK/NACK have not necessarily been finished here.
         // thus this might return Ok(()), but might at a later state result in NAK or FifoError.
-        self.take_status_and_recover(abort).map(|()| self.open_session(read))
+        let res = self.take_status_and_recover(abort);
+        if res.is_err() {
+            self.unreserve_session();
+        }
+        res.map(|()| self.open_session(read))
     }
 
     /// Schedule a STOP command and wait for it to PHYSICALLY complete
@@ -1467,19 +1583,26 @@ where
             Err(_) => return Err(IOError::Timeout),
         }
 
+        let mut spins = 0u32;
         loop {
             match self.registers().stop_step() {
                 Some(Ok(())) => break,
                 Some(Err(e)) => return Err(e.into()),
                 None if embassy_time::Instant::now() > deadline => return Err(IOError::Timeout),
-                // Cooperative: the tail from "pulled" to "bus idle" has
-                // no interrupt to sleep on, but it must neither starve
-                // the executor for a clock stretch nor pin this future
-                // uncancellable (no await point = no drop) — and a
-                // drop landing here is already safe, the live session
-                // recovers. A yield, not a timer: the normal tail is a
-                // bit-time, well under any tick.
-                None => embassy_futures::yield_now().await,
+                // Cooperative AND cancellable: the tail from "pulled"
+                // to "bus idle" has no interrupt to sleep on, and with
+                // no await point the future could neither yield nor be
+                // dropped (a drop landing here is safe — the live
+                // session recovers). The first yields cover the normal
+                // tail (a bit-time) with no added latency; past them
+                // the wait is a clock stretch, so back off onto the
+                // timer and let the executor actually sleep instead of
+                // self-waking through the run queue.
+                None if spins < 64 => {
+                    spins += 1;
+                    embassy_futures::yield_now().await;
+                }
+                None => embassy_time::Timer::after_micros(100).await,
             }
         }
 
