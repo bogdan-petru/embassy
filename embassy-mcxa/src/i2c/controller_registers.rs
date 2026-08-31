@@ -196,10 +196,18 @@ impl HaltSlot {
 /// Its fault arm carries the same [`TransferFault`] as every active
 /// transfer path. In particular, NDF/FEF cannot be flattened to an
 /// `IOError` before the live session owns the corresponding halt proof.
+///
+/// The byte arm also carries [`RxProgress`], minted only after this facade
+/// has popped MRDR. This keeps the CPU read state's transition coupled to
+/// actual FIFO consumption rather than a caller's interpretation of a
+/// readiness flag.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub(in crate::i2c) enum RxStep {
-    Byte(u8),
+    Byte {
+        byte: u8,
+        progress: RxProgress,
+    },
     Fault(TransferFault),
     /// The transfer terminated with no data pending and no fault
     /// flagged. Observed on FRDM-MCXA577 during chained multi-command
@@ -208,6 +216,59 @@ pub(in crate::i2c) enum RxStep {
     /// quirk family as the spurious arbitration loss. Without this
     /// variant the reader waits forever for bytes that never arrive.
     Ended,
+}
+
+/// Evidence that the first queued RECEIVE executed for one controller.
+///
+/// This is intentionally neither `Copy` nor `Clone`. Only the register
+/// facade can mint it, immediately after its read-only popping access to
+/// MRDR or a non-empty FIFO observation. Consuming it is the only CPU or
+/// recovery path that may advance a session into its read-streaming cleanup
+/// state. The controller identity prevents evidence observed on one instance
+/// from being applied to another.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(in crate::i2c) struct RxProgress {
+    owner: usize,
+    #[cfg(debug_assertions)]
+    armed: bool,
+}
+
+impl RxProgress {
+    fn observed(owner: usize) -> Self {
+        Self {
+            owner,
+            #[cfg(debug_assertions)]
+            armed: true,
+        }
+    }
+
+    /// Consume this evidence for its owning controller. The constructor is
+    /// private to this facade; the identity check rejects cross-instance
+    /// evidence reuse, while the debug-only drop guard catches ordinary
+    /// accidental discards. Session adapters pair this consumption with the
+    /// corresponding state transition.
+    pub(in crate::i2c) fn consume_for(self, owner: usize) {
+        assert_eq!(
+            self.owner, owner,
+            "i2c: RX progress evidence was applied to a different controller"
+        );
+        #[cfg(debug_assertions)]
+        {
+            let mut progress = self;
+            progress.armed = false;
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for RxProgress {
+    fn drop(&mut self) {
+        assert!(
+            !self.armed,
+            "i2c: RX progress evidence was dropped without required owner-side handling"
+        );
+    }
 }
 
 /// An ordinary non-START command whose wire-level shape has been checked by
@@ -545,7 +606,7 @@ impl RxDmaLease<'_, '_, '_, '_> {
             self.channel.transferred_bytes()
         };
         if moved != 0 || self.regs.rx_pending() {
-            self.permit.note_read_progress();
+            self.permit.note_read_progress(FacadeSeal::new());
         }
         complete
     }
@@ -661,6 +722,11 @@ impl ControllerRegisters {
     /// cross from the session layer into this facade.
     pub(in crate::i2c) fn identity(&self) -> usize {
         self.register_address()
+    }
+
+    /// Mint first-RECEIVE execution evidence for this controller only.
+    fn rx_progress(&self) -> RxProgress {
+        RxProgress::observed(self.identity())
     }
 
     fn write_mier(&self, f: impl FnOnce(&mut Mier)) {
@@ -1043,7 +1109,13 @@ impl ControllerRegisters {
         let now = embassy_time::Instant::now();
         let grace_end = core::cmp::min(now + grace_len, deadline);
         while self.master_busy() {
-            let _ = self.discard_rx();
+            if let Some(progress) = self.discard_rx() {
+                // This helper has no live session phase to advance: it is
+                // waiting for an already-halted engine's autonomous
+                // auto-STOP. Still consume the proof explicitly so a future
+                // caller cannot silently discard RX execution evidence.
+                progress.consume_for(self.identity());
+            }
             if embassy_time::Instant::now() > grace_end {
                 self.discard_frozen_halt(halt);
                 return false;
@@ -1088,7 +1160,10 @@ impl ControllerRegisters {
     /// data-only variant of this wait — see the module docs.
     pub(in crate::i2c) fn rx_step(&self) -> Option<RxStep> {
         if self.mfsr().rxcount() != 0 {
-            return Some(RxStep::Byte(Mrdr(self.regs.mrdr.get()).data()));
+            return Some(RxStep::Byte {
+                byte: Mrdr(self.regs.mrdr.get()).data(),
+                progress: self.rx_progress(),
+            });
         }
         let msr = self.msr();
         // A final byte can arrive between the first FIFO observation and
@@ -1096,7 +1171,10 @@ impl ControllerRegisters {
         // checking once more before consuming that snapshot: the next
         // step will classify its still-latched fault or termination.
         if self.mfsr().rxcount() != 0 {
-            return Some(RxStep::Byte(Mrdr(self.regs.mrdr.get()).data()));
+            return Some(RxStep::Byte {
+                byte: Mrdr(self.regs.mrdr.get()).data(),
+                progress: self.rx_progress(),
+            });
         }
         if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
             return Some(RxStep::Fault(fault));
@@ -1120,6 +1198,18 @@ impl ControllerRegisters {
     /// not memory still proves that the first RECEIVE executed.
     pub(in crate::i2c) fn rx_pending(&self) -> bool {
         self.mfsr().rxcount() != 0
+    }
+
+    /// Non-consuming proof that a first RECEIVE executed. This captures the
+    /// same hardware fact as [`Self::rx_pending`] but prevents a recovery or
+    /// fault path from turning a bare boolean into a read-streaming session
+    /// transition.
+    pub(in crate::i2c) fn observe_rx_progress(&self) -> Option<RxProgress> {
+        if self.rx_pending() {
+            Some(self.rx_progress())
+        } else {
+            None
+        }
     }
 
     /// True when this controller has ended the packet (EPF) and gone
@@ -1252,16 +1342,17 @@ impl ControllerRegisters {
     /// recovery drain must keep popping to let it run to its
     /// auto-NACKed end.
     ///
-    /// Returns whether at least one byte was removed. A recovery owner uses
-    /// that fact to retain proof that a pending first RECEIVE executed even
-    /// when the byte is intentionally discarded rather than delivered.
-    pub(in crate::i2c) fn discard_rx(&self) -> bool {
+    /// Returns execution evidence when at least one byte was removed. A
+    /// recovery owner consumes that evidence before retaining the first-
+    /// RECEIVE phase transition, even though it intentionally discards the
+    /// byte rather than delivering it.
+    pub(in crate::i2c) fn discard_rx(&self) -> Option<RxProgress> {
         let mut discarded = false;
         while self.mfsr().rxcount() != 0 {
             let _ = self.regs.mrdr.get();
             discarded = true;
         }
-        discarded
+        if discarded { Some(self.rx_progress()) } else { None }
     }
 
     /// Last-resort recovery escalation: reset the master engine by

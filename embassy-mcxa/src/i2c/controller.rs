@@ -69,7 +69,7 @@ use embassy_hal_internal::drop::OnDrop;
 
 use super::controller_registers::{
     CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, HaltedFault,
-    RecoveryClose, RxStep, StartAction, StartDrainStep, StopAction, StopStep, TransferFault,
+    RecoveryClose, RxProgress, RxStep, StartAction, StartDrainStep, StopAction, StopStep, TransferFault,
 };
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -343,6 +343,17 @@ struct Session {
     halt: HaltSlot,
 }
 
+/// Receive progress after a [`Session`] has consumed the facade's opaque
+/// first-RECEIVE witness. CPU transfer loops deliberately see this simplified
+/// result rather than the witness itself, so popping MRDR and updating the
+/// session phase are one internal operation.
+#[must_use]
+enum SessionRxStep {
+    Byte(u8),
+    Fault(TransferFault),
+    Ended,
+}
+
 impl Session {
     /// Mint the only capability that may emit a first read-data command.
     /// Its constructor is private to this module, and the facade consumes it
@@ -418,8 +429,32 @@ impl Session {
     /// A received byte proves the first queued RECEIVE executed. Later
     /// cleanup may now rely on its auto-NACK rather than inject a release
     /// command after a fault-frozen FIFO.
-    fn note_read_progress(&mut self) {
-        self.phase = self.phase.after_read_progress();
+    fn note_read_progress(&mut self, progress: RxProgress) {
+        let owner = ControllerRegisters::new(self.info.regs()).identity();
+        self.phase = self.phase.after_read_progress(progress, owner);
+    }
+
+    /// DMA can establish the same progress fact only after its register
+    /// facade has disabled the request, quiesced the channel, and observed
+    /// its transfer state. The private seal prevents a caller from claiming
+    /// that proof without the paired MMIO cleanup.
+    fn note_dma_read_progress(&mut self, _seal: FacadeSeal) {
+        self.phase = self.phase.after_dma_read_progress();
+    }
+
+    /// Pop and classify one receive-side controller event. The raw facade
+    /// result carries opaque evidence whenever it popped MRDR; consume that
+    /// evidence here before exposing the byte, so ordinary CPU loops cannot
+    /// forget the matching first-RECEIVE phase transition.
+    fn rx_step(&mut self) -> Option<SessionRxStep> {
+        match ControllerRegisters::new(self.info.regs()).rx_step()? {
+            RxStep::Byte { byte, progress } => {
+                self.note_read_progress(progress);
+                Some(SessionRxStep::Byte(byte))
+            }
+            RxStep::Fault(fault) => Some(SessionRxStep::Fault(fault)),
+            RxStep::Ended => Some(SessionRxStep::Ended),
+        }
     }
 
     /// Mint the only capability that may enqueue a START for this session.
@@ -478,9 +513,10 @@ impl Session {
         // may not yet have moved that byte to memory. Classify this before
         // choosing the halted-fault recovery side so every CPU/DMA caller
         // shares the same proof rule.
-        self.phase = self
-            .phase
-            .with_rx_fifo_progress(&ControllerRegisters::new(self.info.regs()));
+        let regs = ControllerRegisters::new(self.info.regs());
+        if let Some(progress) = regs.observe_rx_progress() {
+            self.note_read_progress(progress);
+        }
         let error = self.halt.capture(fault);
         if !self.halt.is_empty() {
             self.phase = SessionPhase::Stable(recovery_abort_for(error, self.phase.abort_for_halted_fault()));
@@ -588,22 +624,25 @@ impl SessionPhase {
         matches!(self, Self::Stable(Abort::General))
     }
 
-    /// Fold a non-consuming RX FIFO observation into the first-read phase.
-    /// This is safe to call repeatedly. A resident byte proves the first
-    /// RECEIVE executed even if a later fault is observed by a command or
-    /// recovery path before that byte reaches its normal consumer.
-    fn with_rx_fifo_progress(self, regs: &ControllerRegisters) -> Self {
-        if regs.rx_pending() {
-            self.after_read_progress()
-        } else {
-            self
-        }
+    /// Retain first-RECEIVE execution evidence from either an MRDR pop or a
+    /// resident-FIFO observation. The opaque proof is owner-branded by the
+    /// register facade, so a phase cannot be advanced with evidence from a
+    /// different controller.
+    fn after_read_progress(self, progress: RxProgress, owner: usize) -> Self {
+        progress.consume_for(owner);
+        self.after_read_progress_inner()
     }
 
-    /// Retain proof that at least one byte was received. Unlike the FIFO
-    /// observation above, this is used after recovery deliberately popped
-    /// the byte, so the phase cannot be reconstructed from hardware later.
-    const fn after_read_progress(self) -> Self {
+    /// RX DMA owns a stronger, facade-sealed proof: it has disabled MDER and
+    /// quiesced the channel before preserving this same phase transition.
+    const fn after_dma_read_progress(self) -> Self {
+        self.after_read_progress_inner()
+    }
+
+    /// Pure transition table shared by CPU/recovery proof consumption and
+    /// the RX-DMA lease. Keeping the unchecked table private means all live
+    /// callers must enter through one of those proof-carrying operations.
+    const fn after_read_progress_inner(self) -> Self {
         match self {
             Self::FirstReceivePending => Self::Stable(Abort::ReadStreaming),
             Self::Stable(_) | Self::StartPending { .. } | Self::StopPending { .. } | Self::StopFinalized => self,
@@ -864,7 +903,7 @@ const _: () = {
         Abort::General
     ));
     assert!(matches!(
-        SessionPhase::FirstReceivePending.after_read_progress(),
+        SessionPhase::FirstReceivePending.after_read_progress_inner(),
         SessionPhase::Stable(Abort::ReadStreaming)
     ));
     assert!(matches!(
@@ -1285,8 +1324,8 @@ impl<'a> RxDmaPermit<'a> {
     /// Preserve evidence that the first RECEIVE executed after the DMA
     /// channel is genuinely idle. This is intentionally unavailable to a
     /// caller before it has performed the lease's paired cleanup.
-    pub(in crate::i2c) fn note_read_progress(&mut self) {
-        self.session.note_read_progress();
+    pub(in crate::i2c) fn note_read_progress(&mut self, seal: FacadeSeal) {
+        self.session.note_dma_read_progress(seal);
     }
 }
 
@@ -1439,6 +1478,39 @@ fn remediate_halted(regs: &ControllerRegisters, timeout: embassy_time::Duration,
     remediate_inner(regs, timeout, abort, Some(halt), None);
 }
 
+/// Preserve first-RECEIVE evidence observed during recovery without exposing
+/// a boolean-to-phase transition. When no session phase is being recovered,
+/// do not observe or mint a proof at all.
+fn retain_recovery_rx_progress(phase: Option<SessionPhase>, regs: &ControllerRegisters) -> Option<SessionPhase> {
+    phase.map(|phase| match regs.observe_rx_progress() {
+        Some(progress) => phase.after_read_progress(progress, regs.identity()),
+        None => phase,
+    })
+}
+
+/// The discarded byte is intentionally not delivered, but it still proves a
+/// pending first RECEIVE executed and therefore must be threaded through the
+/// same typed phase transition as a normal read.
+fn retain_recovery_discarded_rx_progress(
+    phase: Option<SessionPhase>,
+    regs: &ControllerRegisters,
+) -> Option<SessionPhase> {
+    match regs.discard_rx() {
+        Some(progress) => match phase {
+            Some(phase) => Some(phase.after_read_progress(progress, regs.identity())),
+            // Recovery without a live session must still drain the FIFO to
+            // release SCL flow control. It has no phase to retain, but the
+            // owner-branded evidence is consumed explicitly rather than
+            // silently dropped.
+            None => {
+                progress.consume_for(regs.identity());
+                None
+            }
+        },
+        None => phase,
+    }
+}
+
 fn remediate_inner(
     regs: &ControllerRegisters,
     timeout: embassy_time::Duration,
@@ -1479,7 +1551,7 @@ fn remediate_inner(
     // A queued first RECEIVE may have executed before recovery began,
     // leaving its byte in the hardware FIFO. Retain that proof even if a
     // halting status is only observed later in the recovery drain.
-    late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
+    late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
     let busy = regs.master_busy();
     let mut resolved = false;
     if let Some(halt) = known_halt {
@@ -1496,7 +1568,7 @@ fn remediate_inner(
             // The halt freezes the engine, so this is the authoritative
             // FIFO observation for a first RECEIVE that raced recovery's
             // entry snapshot.
-            late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
+            late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
             if let Some(phase) = late_halt_phase {
                 abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
             }
@@ -1574,7 +1646,7 @@ fn remediate_inner(
             //   halt is observed, the FIFO snapshot is stable proof of
             //   whether a pending first RECEIVE executed.
             if let Some(halt) = regs.observe_recovery_halt() {
-                late_halt_phase = late_halt_phase.map(|phase| phase.with_rx_fifo_progress(regs));
+                late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
                 if let Some(phase) = late_halt_phase {
                     abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
                 }
@@ -1597,9 +1669,7 @@ fn remediate_inner(
                 // never finish — see `discard_rx`. Retain a byte that this
                 // drain consumes as first-RECEIVE execution evidence for a
                 // fault that may latch on a later iteration.
-                if regs.discard_rx() {
-                    late_halt_phase = late_halt_phase.map(SessionPhase::after_read_progress);
-                }
+                late_halt_phase = retain_recovery_discarded_rx_progress(late_halt_phase, regs);
             }
 
             let close = if abort == Abort::ReadAddressed {
@@ -2275,15 +2345,14 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Receive one byte, or bail out on a fault (NACK,
             // arbitration loss, FIFO error): no more data will
             // arrive, and a data-only wait would spin forever.
-            match self.registers().rx_step() {
-                Some(RxStep::Byte(b)) => {
-                    open.note_read_progress();
+            match open.rx_step() {
+                Some(SessionRxStep::Byte(b)) => {
                     read[drained] = b;
                     drained += 1;
                     deadline = embassy_time::Instant::now() + self.timeout;
                 }
-                Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
-                Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
+                Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // No progress for a full timeout window: the
                 // transfer died without a flag.
                 None if embassy_time::Instant::now() > deadline => {
@@ -2334,14 +2403,13 @@ impl<'d, M: Mode> I2c<'d, M> {
         let mut deadline = embassy_time::Instant::now() + self.timeout;
         for byte in chunk.iter_mut() {
             *byte = loop {
-                match self.registers().rx_step() {
-                    Some(RxStep::Byte(b)) => {
-                        open.note_read_progress();
+                match open.rx_step() {
+                    Some(SessionRxStep::Byte(b)) => {
                         deadline = embassy_time::Instant::now() + self.timeout;
                         break b;
                     }
-                    Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
-                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                    Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
+                    Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                     // No progress for a full timeout window: Timeout,
                     // like the chained and async paths —
                     // UnexpectedStop is reserved for an observed
@@ -3061,16 +3129,15 @@ impl<'d> I2c<'d, Async> {
                 Err(_) => true,
             };
 
-            match self.registers().rx_step() {
-                Some(RxStep::Byte(b)) => {
-                    open.note_read_progress();
+            match open.rx_step() {
+                Some(SessionRxStep::Byte(b)) => {
                     read[drained] = b;
                     drained += 1;
                 }
                 // Surface the fault that woke us. If the flag cleared
                 // in between, loop back and wait again.
-                Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
-                Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
+                Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // Nothing pending after a full timeout window: the
                 // transfer stalled or died without a flag.
                 None if timed_out => return Err(IOError::Timeout),
@@ -3125,14 +3192,13 @@ impl<'d> I2c<'d, Async> {
                     Err(_) => true,
                 };
 
-                match self.registers().rx_step() {
-                    Some(RxStep::Byte(b)) => {
-                        open.note_read_progress();
+                match open.rx_step() {
+                    Some(SessionRxStep::Byte(b)) => {
                         *byte = b;
                         break;
                     }
-                    Some(RxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
-                    Some(RxStep::Ended) => return Err(IOError::UnexpectedStop),
+                    Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
+                    Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                     None if timed_out => return Err(IOError::Timeout),
                     None => {}
                 }
