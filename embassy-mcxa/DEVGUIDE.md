@@ -724,6 +724,22 @@ fn info() -> &'static crate::i2c::Info {
 This keeps the mutable global surface small and tied to the instance the
 `Peri<'d, T>` token represents.
 
+#### Put transactional state in a private child module
+
+For a peripheral protocol with runtime phases (for example, an I2C START,
+first RECEIVE, STOP, and cancellation recovery), keep the session object and
+its phase enum in a private child module. Let the outer driver orchestrate
+opaque sessions and expose only capability types that the register facade must
+consume. This turns a future outer-driver edit such as `session.phase = ...`
+or a forged session literal into a compile error, while keeping the dynamic
+state table and recovery behavior local to the code that owns it.
+
+Use this alongside, not instead of, typed MMIO operations: the register facade
+should mint the evidence that permits a phase transition, and the private
+session module should consume it. Rust's ownership system can prevent an
+accidental API misuse; it cannot prove timing or electrical facts about the
+bus, so retain bounded waits, hardware tests, and cancellation cleanup.
+
 #### Module-global mutable state must be reset at construction
 
 Some controllers (notably DMA-driven ones with descriptor rings or bounce

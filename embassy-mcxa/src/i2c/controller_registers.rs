@@ -141,8 +141,8 @@ impl Drop for HaltedFault {
 ///
 /// Ordinary errors are cleared from the snapshot that observed them.
 /// NDF/FEF instead produce a non-copyable [`HaltedFault`]: they freeze
-/// the queued command pipeline, so a live [`super::controller::Session`]
-/// must receive the proof before it can return an `IOError`.
+/// the queued command pipeline, so the owning controller session must receive
+/// the proof before it can return an `IOError`.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub(in crate::i2c) struct TransferFault(TransferFaultKind);
@@ -1302,7 +1302,7 @@ impl ControllerRegisters {
         );
         let msr = self.msr();
         if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
-            return StopStep::Fault(StopFault::new(stop, fault));
+            return StopStep::Fault(StopFault::new(stop, fault, FacadeSeal::new()));
         }
         if self.mfsr().txcount() == 0 && msr.mbf() == Mbf::Idle {
             return StopStep::Completed(stop.into_completed(FacadeSeal::new()));
@@ -1324,7 +1324,7 @@ impl ControllerRegisters {
         );
         let msr = self.msr();
         if let Some(fault) = self.take_active_fault_from_snapshot(&msr) {
-            return Err(StopFinalizeFault::new(completed.into_wait(), fault));
+            return Err(StopFinalizeFault::new(completed.into_wait(), fault, FacadeSeal::new()));
         }
         self.write_msr(msr);
         Ok(completed.commit_finalized(FacadeSeal::new()))
