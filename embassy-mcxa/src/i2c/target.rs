@@ -99,6 +99,11 @@ pub(in crate::i2c) use registers::TargetRegisters;
 pub enum SetupError {
     /// Clock configuration error.
     ClockSetup(ClockError),
+    /// The selected LPI2C source provides no functional clock.
+    ///
+    /// This rejects `Lpi2cClockSel::None` before the constructor changes
+    /// DMA, interrupt, pin, or target-controller state.
+    NoFunctionalClock,
     /// Address is out of range, mixes address widths, or describes an empty
     /// or reversed range.
     InvalidAddress,
@@ -436,13 +441,50 @@ pub struct I2c<'d, M: Mode> {
     _wg: Option<WakeGuard>,
 }
 
+/// Validated target clock input prepared before constructor side effects.
+///
+/// The target only derives its data-valid delay from this frequency, but a
+/// zero clock would otherwise be silently clamped into a plausible register
+/// value and leave a nonfunctional target on the bus.
+#[derive(Clone, Copy)]
+struct TargetSetup {
+    frequency: u32,
+}
+
+impl TargetSetup {
+    fn new(frequency: u32) -> Result<Self, SetupError> {
+        if frequency == 0 {
+            return Err(SetupError::NoFunctionalClock);
+        }
+        Ok(Self { frequency })
+    }
+}
+
 impl<'d, M: Mode> I2c<'d, M> {
+    /// Validate the complete target clock configuration without programming
+    /// MRCC or touching the peripheral. Async/DMA constructors call this
+    /// before claiming channels or enabling their NVIC lines.
+    fn construction_setup<T: Instance>(config: &Config) -> Result<TargetSetup, SetupError> {
+        let ClockConfig { power, source, div } = config.clock_config;
+        let clock = Lpi2cConfig {
+            power,
+            source,
+            div,
+            instance: T::CLOCK_INSTANCE,
+        };
+        let frequency = crate::clocks::with_clocks(|clocks| clock.functional_clock_hz(clocks))
+            .ok_or(SetupError::ClockSetup(ClockError::NeverInitialized))?
+            .map_err(SetupError::ClockSetup)?;
+        TargetSetup::new(frequency)
+    }
+
     fn new_inner<T: Instance>(
         _peri: Peri<'d, T>,
         scl: Peri<'d, impl SclPin<T>>,
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
         address: ValidatedAddress,
+        setup: TargetSetup,
         mode: M,
     ) -> Result<Self, SetupError> {
         let ClockConfig { power, source, div } = config.clock_config;
@@ -465,7 +507,7 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         let inst = Self {
             info: T::info(),
-            freq: parts.freq,
+            freq: setup.frequency,
             _scl,
             _sda,
             smbus_alert: config.smbus_alert.clone(),
@@ -715,7 +757,8 @@ impl<'d> I2c<'d, Blocking> {
         config: Config,
     ) -> Result<Self, SetupError> {
         let address = config.address.validate()?;
-        Self::new_inner(peri, scl, sda, config, address, Blocking)
+        let setup = Self::construction_setup::<T>(&config)?;
+        Self::new_inner(peri, scl, sda, config, address, setup, Blocking)
     }
 }
 
@@ -746,7 +789,8 @@ impl<'d> I2c<'d, Async> {
         config: Config,
     ) -> Result<Self, SetupError> {
         let address = config.address.validate()?;
-        let inst = Self::new_inner(peri, scl, sda, config, address, Async)?;
+        let setup = Self::construction_setup::<T>(&config)?;
+        let inst = Self::new_inner(peri, scl, sda, config, address, setup, Async)?;
 
         T::Interrupt::unpend();
 
@@ -917,6 +961,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         config: Config,
     ) -> Result<Self, SetupError> {
         let address = config.address.validate()?;
+        let setup = Self::construction_setup::<T>(&config)?;
 
         // enable this channel's interrupt
         let tx_dma = DmaChannel::new(tx_dma);
@@ -931,6 +976,7 @@ impl<'d> I2c<'d, Dma<'d>> {
             sda,
             config,
             address,
+            setup,
             Dma {
                 tx_dma,
                 rx_dma,
@@ -1486,6 +1532,11 @@ impl<'d, M: Mode> Drop for I2c<'d, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_setup_rejects_a_zero_functional_clock() {
+        assert!(matches!(TargetSetup::new(0), Err(SetupError::NoFunctionalClock)));
+    }
 
     fn is_valid(address: Address) -> bool {
         address.validate().is_ok()

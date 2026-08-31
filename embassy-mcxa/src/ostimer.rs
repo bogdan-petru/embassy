@@ -13,6 +13,8 @@ use crate::clocks::{PoweredClock, enable_and_reset};
 use crate::interrupt;
 use crate::interrupt::InterruptExt;
 use crate::pac::OSTIMER0;
+#[cfg(target_arch = "arm")]
+use crate::pac::interrupt as interrupt_attr;
 use crate::peripherals::OSTIMER0;
 
 struct AlarmState {
@@ -182,7 +184,7 @@ impl Driver for OsTimer {
 }
 
 #[allow(non_snake_case)]
-#[interrupt]
+#[cfg_attr(target_arch = "arm", interrupt_attr)]
 fn OS_EVENT() {
     DRIVER.on_interrupt()
 }

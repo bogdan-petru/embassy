@@ -23,6 +23,7 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
 
     // Initialize embassy-time global driver backed by OSTIMER0
     // NOTE: As early as possible, but MUST be AFTER clocks!
+    #[cfg(not(feature = "test"))]
     crate::ostimer::init(cfg.time_interrupt_priority);
 
     // Initialize the INPUTMUX peripheral

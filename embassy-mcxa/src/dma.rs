@@ -2282,7 +2282,8 @@ unsafe fn on_interrupt(ch_index: usize) {
 /// Macro to generate DMA channel interrupt handlers.
 macro_rules! impl_dma_interrupt_handler {
     ($irq:ident, $ch:expr) => {
-        #[interrupt]
+        #[allow(non_snake_case)]
+        #[cfg_attr(target_arch = "arm", interrupt)]
         fn $irq() {
             // SAFETY: The correct $ch is called as generated, We check that
             // the given callback is non-null before calling.
@@ -2300,6 +2301,7 @@ macro_rules! impl_dma_interrupt_handler {
     };
 }
 
+#[cfg(target_arch = "arm")]
 use crate::pac::interrupt;
 
 impl_dma_interrupt_handler!(DMA0_CH0, 0);

@@ -29,8 +29,9 @@ flavors = [
 
 [dependencies]
 bbqueue = { version = "0.7.0", features = ["disable-cache-padding"] }
-cortex-m = { version = "0.7", features = ["critical-section-single-core", "inline-asm"] }
-# If you would like "device" to be an optional feature, please open an issue.
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+# The generated interrupt module re-exports this macro even for host checks.
+# The actual device vector table remains target-specific through nxp-pac/rt.
 cortex-m-rt = { version = "0.7", features = ["device"] }
 critical-section = "1.2.0"
 tock-registers = "0.9"
@@ -67,12 +68,20 @@ nb = "1.1.0"
 # adds the MCXA577 USBHS/USBPHY register blocks this driver needs. Those registers
 # only exist on that branch until the PR merges. Switch both nxp-pac entries back to
 # a released/main rev of `https://github.com/embassy-rs/nxp-pac.git` once #108 merges.
-nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0", features = ["rt"] }
+nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0" }
 paste = "1.0.15"
 
 rand-core-06 = { package = "rand_core", version = "0.6" }
 rand-core-09 = { package = "rand_core", version = "0.9" }
 rand-core-10 = { package = "rand_core", version = "0.10" }
+
+# Host unit tests exercise pure decision logic. Keep interrupt-vector support
+# target-specific so an embedded `--no-default-features` build retains the
+# original PAC/runtime behavior while the host test build does not link an ARM
+# vector table or critical-section implementation.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0", features = ["rt"] }
 
 [build-dependencies]
 # TEMPORARY: see the note on the `[dependencies]` nxp-pac entry above. Switch back
@@ -149,10 +158,17 @@ dangerous-reset-as-gpio = []
 # This can either be another (trustzone secure) binary or from IFR0 CFPA Trustzone presets.
 dma-ipd-req = []
 
-# dummy feature to silence embassy-hal-internal lint
-#
-# This feature makes no change to embassy-mcxa's operation.
+# Dummy feature required by an embassy-hal-internal lint. Interrupt-vector
+# support is selected from the actual target architecture above, so embedded
+# `--no-default-features` builds retain the same behavior as before.
 rt = []
+
+## Enable host execution of pure HAL decision tests.
+##
+## This substitutes the std critical-section and time-driver implementations
+## for the MCU-only OSTIMER/vector setup. It is intentionally test-only: run
+## it with `--no-default-features`, and never select it for firmware.
+test = ["critical-section/std", "embassy-time/std", "embassy-time/generic-queue-8"]
 
 # Enable perf counters
 perf = []
@@ -175,7 +191,10 @@ mcxa2xx = ["nxp-pac/mcxa256"]
 mcxa5xx = ["nxp-pac/mcxa577"]
 
 [dev-dependencies]
-embassy-executor = { version = "0.10.0", path = "../embassy-executor", features = ["platform-cortex-m", "executor-interrupt", "executor-thread"] }
+# The HAL's normal executor dependency is sufficient for its host unit tests.
+# Do not add the Cortex-M executor platform here: it emits ARM-only
+# instructions and would prevent the pure I2C decision tests from running on
+# the host.
 embedded-storage = "0.3.1"
 panic-halt = "1.0.0"
 static_cell = "2.1.1"

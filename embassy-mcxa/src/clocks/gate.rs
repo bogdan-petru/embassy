@@ -95,6 +95,11 @@ pub unsafe fn enable<G: Gate>(cfg: &G::MrccPeriphConfig) -> Result<PreEnablePart
 
         G::enable_clock();
         while !G::is_clock_enabled() {}
+        // The barrier orders peripheral clock-gate visibility on Cortex-M.
+        // Host-only unit tests exercise pure I2C configuration decisions and
+        // cannot assemble ARM instructions, so omit this target-specific
+        // instruction there rather than making those tests unbuildable.
+        #[cfg(target_arch = "arm")]
         core::arch::asm!("dsb sy; isb sy", options(nomem, nostack, preserves_flags));
 
         Ok(freq)

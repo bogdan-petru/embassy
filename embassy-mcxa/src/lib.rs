@@ -6,6 +6,9 @@
 // Allow functions with too many args - we have a lot of HAL constructors like this for now
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(all(feature = "test", feature = "rt"))]
+compile_error!("embassy-mcxa's host `test` feature requires `--no-default-features`; it replaces MCU runtime services");
+
 /// Module for MCXA2xx-specific HAL drivers
 ///
 /// NOTE: *for now*, some items are here because we haven't validated them on the MCXA5xx yet.
@@ -56,7 +59,7 @@ pub mod i3c;
 pub mod inputmux;
 #[cfg(mcxa_lpuart)]
 pub mod lpuart;
-#[cfg(mcxa_ostimer)]
+#[cfg(all(mcxa_ostimer, not(feature = "test")))]
 pub mod ostimer;
 pub mod perf_counters;
 #[cfg(mcxa_cmc)]

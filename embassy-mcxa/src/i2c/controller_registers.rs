@@ -38,7 +38,7 @@ use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
     Alf, Dmf, Dozen, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param,
-    Pltf, Prescale, Stf,
+    Pltf, Prescale, Stf, Timecfg,
 };
 use tock_registers::interfaces::{Readable, Writeable};
 
@@ -63,21 +63,18 @@ struct ControllerStatus {
 
 impl ControllerStatus {
     fn from_snapshot(msr: &Msr) -> Self {
-        // Priority mirrors the hardware relevance order: an address NACK
-        // explains everything after it, arbitration loss next, FIFO
-        // error last.
-        let error = if msr.ndf() == Ndf::IntYes {
+        // PLTF invalidates the command/FIFO inference used by every other
+        // fault, so it must win even in wake predicates that only report an
+        // error class. The typed transfer classifier below preserves the same
+        // priority while attaching terminal recovery ownership.
+        let error = if msr.pltf() == Pltf::IntYes {
+            Some(ControllerStatusError::PinLowTimeout)
+        } else if msr.ndf() == Ndf::IntYes {
             Some(ControllerStatusError::AddressNack)
         } else if msr.alf() == Alf::IntYes {
             Some(ControllerStatusError::ArbitrationLoss)
         } else if msr.fef() == MsrFef::IntYes {
             Some(ControllerStatusError::Fifo)
-        } else if msr.pltf() == Pltf::IntYes {
-            // Fires only when MCFGR3[PINLOW] is configured, but the
-            // interrupt masks enable PLTIE, so it must be part of the
-            // fault set: an unsurfaced wake-without-error would loop
-            // the waiter forever.
-            Some(ControllerStatusError::PinLowTimeout)
         } else {
             None
         };
@@ -87,6 +84,31 @@ impl ControllerStatus {
 
     fn error(self) -> Option<ControllerStatusError> {
         self.error
+    }
+}
+
+/// The recovery consequence of one sampled status word.
+///
+/// This small pure classifier is deliberately separate from the facade-owned
+/// proofs below. It keeps the priority rule executable in host tests: a
+/// pin-low timeout wins even when it co-latches with the NDF/FEF bits whose
+/// normal recovery would otherwise inspect FIFO state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotFault {
+    PinLowTimeout,
+    Halted(ControllerStatusError),
+    Error(ControllerStatusError),
+}
+
+fn snapshot_fault_from(msr: &Msr) -> Option<SnapshotFault> {
+    if msr.pltf() == Pltf::IntYes {
+        Some(SnapshotFault::PinLowTimeout)
+    } else if msr.ndf() == Ndf::IntYes {
+        Some(SnapshotFault::Halted(ControllerStatusError::AddressNack))
+    } else if msr.fef() == MsrFef::IntYes {
+        Some(SnapshotFault::Halted(ControllerStatusError::Fifo))
+    } else {
+        ControllerStatus::from_snapshot(msr).error().map(SnapshotFault::Error)
     }
 }
 
@@ -142,12 +164,71 @@ impl Drop for HaltedFault {
     }
 }
 
+/// Proof that the pin-low watchdog fired for this controller.
+///
+/// Unlike NDF/FEF, PLTF does not document a frozen command FIFO or an
+/// automatic STOP that recovery may rely on. The LPI2C contract instead
+/// requires software to terminate the master before another START. This
+/// non-copyable proof therefore has a distinct terminal recovery operation;
+/// it must never be converted into an ordinary scrub-and-continue error.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) struct PinLowTimeoutFault {
+    owner: usize,
+    #[cfg(debug_assertions)]
+    armed: bool,
+}
+
+impl PinLowTimeoutFault {
+    fn resolve(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for PinLowTimeoutFault {
+    fn drop(&mut self) {
+        assert!(
+            !self.armed,
+            "i2c: a pin-low-timeout proof was dropped without terminal controller recovery"
+        );
+    }
+}
+
+/// A retained controller fault whose cleanup has architectural consequences.
+///
+/// NDF/FEF freeze an existing pipeline; PLTF makes that pipeline unspecified
+/// and requires master termination. Keeping both non-copyable cases in this
+/// private vocabulary makes the session choose the corresponding recovery
+/// operation before it can release a public I/O error.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RetainedFault {
+    Halted(HaltedFault),
+    PinLowTimeout(PinLowTimeoutFault),
+}
+
+/// How a retained NDF/FEF proof left the controller.
+///
+/// This is not a simple boolean because pin-low termination must skip the
+/// ordinary recovery tail entirely: that tail resets FIFOs and clears status
+/// only after a known normal/halting command sequence, an inference that PLTF
+/// deliberately invalidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HaltResolution {
+    Settled,
+    NeedsManualClose,
+    PinLowTerminated,
+}
+
 /// A transfer-time fault classified from one status snapshot.
 ///
-/// Ordinary errors are cleared from the snapshot that observed them.
-/// NDF/FEF instead produce a non-copyable [`HaltedFault`]: they freeze
-/// the queued command pipeline, so the owning controller session must receive
-/// the proof before it can return an `IOError`.
+/// Ordinary errors are cleared from the snapshot that observed them. NDF/FEF
+/// instead produce a non-copyable [`HaltedFault`], while PLTF produces a
+/// [`PinLowTimeoutFault`]. Both retained cases must reach their distinct
+/// recovery owner before the caller can receive an `IOError`.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub(super) struct TransferFault(TransferFaultKind);
@@ -158,15 +239,17 @@ pub(super) struct TransferFault(TransferFaultKind);
 enum TransferFaultKind {
     Error(ControllerStatusError),
     Halted(HaltedFault),
+    PinLowTimeout(PinLowTimeoutFault),
 }
 
 /// The only container allowed to extract a public error from a
-/// [`TransferFault`]. It owns a halt until session drop or start recovery
-/// consumes it; no borrowed `error()` accessor exists on the carrier.
+/// [`TransferFault`]. It owns any recovery-sensitive fault until session
+/// drop or start recovery consumes it; no borrowed `error()` accessor exists
+/// on the carrier.
 #[must_use]
-pub(super) struct HaltSlot(Option<HaltedFault>);
+pub(super) struct FaultSlot(Option<RetainedFault>);
 
-impl HaltSlot {
+impl FaultSlot {
     pub(super) const fn empty() -> Self {
         Self(None)
     }
@@ -175,22 +258,36 @@ impl HaltSlot {
         self.0.is_none()
     }
 
+    /// True only for an NDF/FEF proof. A pin-low timeout must terminate the
+    /// engine rather than choosing a frozen-pipeline close shape.
+    pub(super) fn has_halted_fault(&self) -> bool {
+        matches!(self.0, Some(RetainedFault::Halted(_)))
+    }
+
     pub(super) fn capture(&mut self, fault: TransferFault) -> ControllerStatusError {
         match fault.0 {
             TransferFaultKind::Error(error) => error,
             TransferFaultKind::Halted(proof) => {
                 assert!(
                     self.0.is_none(),
-                    "i2c: a transfer fault was bound while another halt proof was unresolved"
+                    "i2c: a transfer fault was bound while another recovery proof was unresolved"
                 );
                 let error = proof.error();
-                self.0 = Some(proof);
+                self.0 = Some(RetainedFault::Halted(proof));
                 error
+            }
+            TransferFaultKind::PinLowTimeout(proof) => {
+                assert!(
+                    self.0.is_none(),
+                    "i2c: a transfer fault was bound while another recovery proof was unresolved"
+                );
+                self.0 = Some(RetainedFault::PinLowTimeout(proof));
+                ControllerStatusError::PinLowTimeout
             }
         }
     }
 
-    pub(super) fn take(&mut self) -> Option<HaltedFault> {
+    pub(super) fn take(&mut self) -> Option<RetainedFault> {
         self.0.take()
     }
 }
@@ -713,6 +810,20 @@ impl PinLowCycles {
     const fn raw(self) -> u16 {
         self.0
     }
+
+    const fn monitors_both_lines(self) -> bool {
+        self.0 != 0
+    }
+
+    /// The watchdog's line-selection policy, kept pure so host tests cover
+    /// the public `PinLowTimeout` contract without touching MMIO.
+    const fn timecfg(self) -> Timecfg {
+        if self.monitors_both_lines() {
+            Timecfg::IfSclOrSdaLow
+        } else {
+            Timecfg::IfSclLow
+        }
+    }
 }
 
 /// Complete, validated controller configuration prepared before the facade
@@ -739,6 +850,13 @@ impl ControllerSetup {
         speed: SupportedSpeed,
         pin_low_timeout: PinLowTimeout,
     ) -> Result<Self, SetupError> {
+        // `Lpi2cClockSel::None` intentionally reports a zero functional
+        // clock to clock-gate users. It is never a usable controller clock:
+        // baud derivation would otherwise manufacture a zeroed register
+        // plan that only fails much later as a transfer timeout.
+        if input_hz == 0 {
+            return Err(SetupError::NoFunctionalClock);
+        }
         let (prescale, clklo, clkhi, sethold, datavd) = super::compute_baud_params(input_hz, speed.hertz());
         let pin_low_cycles = PinLowCycles::from_timeout(pin_low_timeout, input_hz, prescale)?;
 
@@ -797,7 +915,13 @@ impl ControllerRegisters {
             // final write, so the watchdog and baud setup become visible as
             // one ordered configuration sequence.
             self.pac.mcfgr3().modify(|w| w.set_pinlow(setup.pin_low_cycles.raw()));
-            self.pac.mcfgr1().modify(|w| w.set_prescale(setup.prescale));
+            self.pac.mcfgr1().modify(|w| {
+                w.set_prescale(setup.prescale);
+                // The public watchdog is defined for either bus line.
+                // Keep the reset SCL-only mode when disabled, but make a
+                // nonzero PINLOW threshold cover both SCL and SDA.
+                w.set_timecfg(setup.pin_low_cycles.timecfg());
+            });
             self.pac.mccr0().modify(|w| {
                 w.set_clklo(setup.clklo);
                 w.set_clkhi(setup.clkhi);
@@ -964,13 +1088,45 @@ impl ControllerRegisters {
         });
     }
 
-    /// Clear every controller status flag.
+    /// Clear every non-terminal controller status flag.
     ///
-    /// This is intentionally private: clearing NDF/FEF while commands
-    /// remain queued resumes a halted controller. Public callers must
-    /// prove the phase in which that is safe through one of the narrow
-    /// semantic operations below.
-    fn clear_all_status(&self) {
+    /// This is intentionally private: clearing NDF/FEF while commands remain
+    /// queued resumes a halted controller. PLTF is deliberately *not* in this
+    /// W1C set: a pin-low timeout can arrive after an NDF/FEF proof was
+    /// captured, and ordinary cleanup must leave it visible to the next
+    /// typed recovery observation instead of treating the pipeline as known.
+    /// Only [`Self::terminate_pin_low_timeout`] may clear PLTF, after it has
+    /// disabled MEN.
+    fn clear_nonterminal_status(&self) {
+        self.write_msr(Self::nonterminal_status_w1c());
+    }
+
+    /// The ordinary recovery W1C mask, factored as a pure constructor so its
+    /// terminal-bit exclusion is directly testable on the host.
+    fn nonterminal_status_w1c() -> Msr {
+        let mut v = Msr(0);
+        v.set_epf(Epf::IntYes);
+        v.set_sdf(MsrSdf::IntYes);
+        v.set_ndf(Ndf::IntYes);
+        v.set_alf(Alf::IntYes);
+        v.set_fef(MsrFef::IntYes);
+        v.set_dmf(Dmf::IntYes);
+        v.set_stf(Stf::IntYes);
+        v
+    }
+
+    /// Clear every controller status flag after terminal master shutdown.
+    ///
+    /// This is the sole W1C write that includes PLTF. Its caller must have
+    /// disabled MEN, so no unknown command suffix can resume as the timeout
+    /// latch is released.
+    fn clear_status_after_terminal_shutdown(&self) {
+        self.write_msr(Self::terminal_status_w1c());
+    }
+
+    /// The terminal shutdown W1C mask. This is intentionally the only status
+    /// mask in this facade that contains PLTF.
+    fn terminal_status_w1c() -> Msr {
         let mut v = Msr(0);
         v.set_epf(Epf::IntYes);
         v.set_sdf(MsrSdf::IntYes);
@@ -980,23 +1136,27 @@ impl ControllerRegisters {
         v.set_pltf(Pltf::IntYes);
         v.set_dmf(Dmf::IntYes);
         v.set_stf(Stf::IntYes);
-        self.write_msr(v);
+        v
     }
 
-    /// Clear the power-on/configuration residue before any transaction
-    /// has been opened.
+    /// Clear non-terminal power-on/configuration residue before any
+    /// transaction has been opened.
+    ///
+    /// PLTF remains visible: if the watchdog latched while the controller
+    /// was enabled, the first typed transfer must take the same terminal
+    /// recovery path as a timeout that arrived during an active session.
     fn clear_after_init(&self) {
-        self.clear_all_status();
+        self.clear_nonterminal_status();
     }
 
     /// Discard state for a controller that was observed idle before
     /// recovery began.
     ///
-    /// An idle master owns no live command pipeline, so resetting the
-    /// FIFOs and clearing every W1C flag cannot release stale work.
+    /// An idle master owns no live command pipeline, so resetting the FIFOs
+    /// and clearing the non-terminal W1C flags cannot release stale work.
     pub(super) fn discard_idle_recovery_state(&self) {
         self.reset_fifos();
-        self.clear_all_status();
+        self.clear_nonterminal_status();
     }
 
     /// Discard the terminal state of a halt whose controller already
@@ -1008,7 +1168,7 @@ impl ControllerRegisters {
             "i2c: an idle-halt proof was discarded while the controller was busy"
         );
         self.reset_fifos();
-        self.clear_all_status();
+        self.clear_nonterminal_status();
         halt.resolve();
         halt.resolve();
     }
@@ -1017,7 +1177,7 @@ impl ControllerRegisters {
     /// no command remains queued.
     fn release_halted_empty_fifo(&self, mut halt: HaltedFault) {
         self.assert_halt_owner(&halt);
-        self.clear_all_status();
+        self.clear_nonterminal_status();
         halt.resolve();
         halt.resolve();
     }
@@ -1027,7 +1187,7 @@ impl ControllerRegisters {
     fn discard_frozen_halt(&self, mut halt: HaltedFault) {
         self.assert_halt_owner(&halt);
         self.reset_fifos();
-        self.clear_all_status();
+        self.clear_nonterminal_status();
         halt.resolve();
         halt.resolve();
     }
@@ -1050,23 +1210,33 @@ impl ControllerRegisters {
         self.clear_current_status();
     }
 
-    fn halted_from_snapshot(&self, msr: &Msr) -> Option<HaltedFault> {
-        if msr.ndf() == Ndf::IntYes {
-            Some(HaltedFault {
-                owner: self.register_address(),
-                error: ControllerStatusError::AddressNack,
-                #[cfg(debug_assertions)]
-                armed: true,
-            })
-        } else if msr.fef() == MsrFef::IntYes {
-            Some(HaltedFault {
-                owner: self.register_address(),
-                error: ControllerStatusError::Fifo,
-                #[cfg(debug_assertions)]
-                armed: true,
-            })
-        } else {
-            None
+    fn pin_low_timeout_fault(&self) -> PinLowTimeoutFault {
+        PinLowTimeoutFault {
+            owner: self.register_address(),
+            #[cfg(debug_assertions)]
+            armed: true,
+        }
+    }
+
+    /// Observe, but never W1C-clear, a pin-low timeout.
+    ///
+    /// A retained NDF/FEF proof can outlive the status snapshot that minted
+    /// it. This fresh probe prevents a later PLTF from being hidden by the
+    /// NDF/FEF resolver's otherwise-valid cleanup.
+    fn pending_pin_low_timeout(&self) -> Option<PinLowTimeoutFault> {
+        (self.msr().pltf() == Pltf::IntYes).then(|| self.pin_low_timeout_fault())
+    }
+
+    fn halted_fault(&self, error: ControllerStatusError) -> HaltedFault {
+        assert!(
+            matches!(error, ControllerStatusError::AddressNack | ControllerStatusError::Fifo),
+            "i2c: an ordinary status error was turned into a halted-fault proof"
+        );
+        HaltedFault {
+            owner: self.register_address(),
+            error,
+            #[cfg(debug_assertions)]
+            armed: true,
         }
     }
 
@@ -1077,37 +1247,46 @@ impl ControllerRegisters {
         );
     }
 
-    /// Clear only non-halting W1C flags from a sampled status word.
+    /// Clear only non-retained W1C flags from a sampled status word.
     ///
-    /// NDF/FEF are deliberately masked out: either one freezes the
-    /// command pipeline, and recovery must consume a [`HaltedFault`]
-    /// before releasing or discarding it.
+    /// NDF/FEF are deliberately masked out: either one freezes the command
+    /// pipeline, and recovery must consume a [`HaltedFault`] before releasing
+    /// or discarding it. PLTF is likewise never cleared on an active path:
+    /// its [`PinLowTimeoutFault`] requires terminal master recovery.
     fn clear_snapshot_preserving_halts(&self, msr: Msr) {
         let mut wb = msr;
         wb.set_ndf(Ndf::IntNo);
         wb.set_fef(MsrFef::IntNo);
+        wb.set_pltf(Pltf::IntNo);
         self.write_msr(wb);
     }
 
     /// Take a transfer fault from an already-sampled status word.
     ///
-    /// A halt wins over every ordinary-error priority, including a
-    /// co-latched ALF. The snapshot clear intentionally leaves NDF/FEF
-    /// latched; their proof is transferred to recovery through the
-    /// returned [`TransferFault`]. A clean snapshot is left untouched so
-    /// event state such as EPF remains available to the caller.
+    /// PLTF wins over every other fault: its command/FIFO outcome is not a
+    /// safe inference, so the returned proof requires terminal recovery.
+    /// A NDF/FEF halt wins over ordinary errors next. The snapshot clear
+    /// intentionally leaves retained flags latched; their proof is
+    /// transferred to recovery through the returned [`TransferFault`]. A
+    /// clean snapshot is left untouched so event state such as EPF remains
+    /// available to the caller.
     fn take_active_fault_from_snapshot(&self, msr: &Msr) -> Option<TransferFault> {
-        if let Some(halt) = self.halted_from_snapshot(msr) {
-            self.clear_snapshot_preserving_halts(Msr(msr.0));
-            Some(TransferFault(TransferFaultKind::Halted(halt)))
-        } else if let Some(error) = ControllerStatus::from_snapshot(msr).error() {
-            // Writing the sampled snapshot clears only flags observed by
-            // this read, so a fault that races in afterward remains
-            // available to the next observation.
-            self.write_msr(Msr(msr.0));
-            Some(TransferFault(TransferFaultKind::Error(error)))
-        } else {
-            None
+        match snapshot_fault_from(msr) {
+            Some(SnapshotFault::PinLowTimeout) => Some(TransferFault(TransferFaultKind::PinLowTimeout(
+                self.pin_low_timeout_fault(),
+            ))),
+            Some(SnapshotFault::Halted(error)) => {
+                self.clear_snapshot_preserving_halts(Msr(msr.0));
+                Some(TransferFault(TransferFaultKind::Halted(self.halted_fault(error))))
+            }
+            Some(SnapshotFault::Error(error)) => {
+                // Writing the sampled snapshot clears only flags observed by
+                // this read, so a fault that races in afterward remains
+                // available to the next observation.
+                self.write_msr(Msr(msr.0));
+                Some(TransferFault(TransferFaultKind::Error(error)))
+            }
+            None => None,
         }
     }
 
@@ -1164,27 +1343,86 @@ impl ControllerRegisters {
         }
     }
 
-    /// Observe a halting fault during the recovery drain.
+    /// Observe a recovery-sensitive fault during the recovery drain.
     ///
-    /// This deliberately reports NDF/FEF before any ordinary error
-    /// priority. Scrub-safe ALF/PLTF bits from the same snapshot are
-    /// cleared, but the halting bits stay latched until a recovery
-    /// operation consumes the returned proof.
-    pub(super) fn observe_recovery_halt(&self) -> Option<HaltedFault> {
+    /// PLTF cannot be scrubbed and continued: the documented controller
+    /// response is to terminate the master. NDF/FEF retain their existing
+    /// frozen-pipeline proof. ALF remains the only scrub-safe error here;
+    /// this controller has a hardware-observed spurious-ALF quirk.
+    pub(super) fn observe_recovery_fault(&self) -> Option<RetainedFault> {
         let msr = self.msr();
-        if let Some(halt) = self.halted_from_snapshot(&msr) {
-            self.clear_snapshot_preserving_halts(msr);
-            return Some(halt);
+        match snapshot_fault_from(&msr) {
+            Some(SnapshotFault::PinLowTimeout) => Some(RetainedFault::PinLowTimeout(self.pin_low_timeout_fault())),
+            Some(SnapshotFault::Halted(error)) => {
+                self.clear_snapshot_preserving_halts(msr);
+                Some(RetainedFault::Halted(self.halted_fault(error)))
+            }
+            Some(SnapshotFault::Error(ControllerStatusError::ArbitrationLoss)) => {
+                self.write_msr(msr);
+                None
+            }
+            Some(SnapshotFault::Error(error)) => {
+                unreachable!("i2c: recovery classifier surfaced unsupported ordinary error {error:?}")
+            }
+            None => None,
         }
+    }
 
-        if matches!(
-            ControllerStatus::from_snapshot(&msr).error(),
-            Some(ControllerStatusError::ArbitrationLoss) | Some(ControllerStatusError::PinLowTimeout)
-        ) {
-            self.write_msr(msr);
-        }
+    /// Terminate the master after a pin-low timeout.
+    ///
+    /// PLTF does not promise either a frozen FIFO or an automatic STOP, so a
+    /// recovery command cannot safely be placed behind the interrupted
+    /// transfer. Disabling MEN is the LPI2C-defined clean termination path;
+    /// only once the master is disabled is it safe to discard the FIFO and
+    /// clear status. If a peer still holds a line low, PLTF can remain
+    /// latched despite its W1C write; re-enabling MEN leaves the next caller
+    /// able to observe the same explicit `PinLowTimeout` rather than silently
+    /// accepting or replaying an old command.
+    fn terminal_shutdown(&self) {
+        critical_section::with(|_| {
+            self.write_mier(|_| {});
+            self.modify_mcr(|w| w.set_men(false));
+            // Keep shutdown one critical section: this is equivalent to
+            // `reset_fifos`, but avoids nesting a critical-section entry
+            // while the pin-low proof owns terminal recovery.
+            self.modify_mcr(|w| {
+                w.set_rtf(McrRtf::Reset);
+                w.set_rrf(McrRrf::Reset);
+            });
+            self.clear_status_after_terminal_shutdown();
+            self.modify_mcr(|w| w.set_men(true));
+        });
+    }
 
-        None
+    pub(super) fn terminate_pin_low_timeout(&self, mut timeout: PinLowTimeoutFault) {
+        assert!(
+            self.register_address() == timeout.owner,
+            "i2c: a pin-low-timeout proof was resolved through a different controller"
+        );
+        self.terminal_shutdown();
+        timeout.resolve();
+    }
+
+    /// Terminate an NDF/FEF recovery after a later pin-low timeout.
+    ///
+    /// The old halt is still an owned proof, but PLTF supersedes its
+    /// frozen-pipeline recovery contract. Resolve both only after MEN is
+    /// disabled and the engine state is discarded, so neither proof can fall
+    /// through into an ordinary close sequence.
+    fn terminate_pin_low_timeout_during_halt(
+        &self,
+        mut timeout: PinLowTimeoutFault,
+        mut halt: HaltedFault,
+    ) -> HaltResolution {
+        self.assert_halt_owner(&halt);
+        assert!(
+            self.register_address() == timeout.owner,
+            "i2c: a pin-low-timeout proof was resolved through a different controller"
+        );
+        self.terminal_shutdown();
+        halt.resolve();
+        timeout.resolve();
+        HaltResolution::PinLowTerminated
     }
 
     /// Resolve an NDF/FEF halt without inferring the fault-time FIFO
@@ -1202,15 +1440,22 @@ impl ControllerRegisters {
         halt: HaltedFault,
         timeout: embassy_time::Duration,
         deadline: embassy_time::Instant,
-    ) -> bool {
+    ) -> HaltResolution {
         self.assert_halt_owner(&halt);
+
+        if let Some(timeout) = self.pending_pin_low_timeout() {
+            return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+        }
 
         // Empty NOW means no command can be replayed if the halt is
         // cleared, regardless of the auto-STOP condition at the fault
         // instant. Let the recovery drain form a manual close.
         if self.tx_pending() == 0 {
+            if let Some(timeout) = self.pending_pin_low_timeout() {
+                return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+            }
             self.release_halted_empty_fifo(halt);
-            return false;
+            return HaltResolution::NeedsManualClose;
         }
 
         // A STOP is normally a bit-time. The grace is deliberately
@@ -1220,6 +1465,9 @@ impl ControllerRegisters {
         let now = embassy_time::Instant::now();
         let grace_end = core::cmp::min(now + grace_len, deadline);
         while self.master_busy() {
+            if let Some(timeout) = self.pending_pin_low_timeout() {
+                return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+            }
             if let Some(progress) = self.discard_rx() {
                 // This helper has no live session phase to advance: it is
                 // waiting for an already-halted engine's autonomous
@@ -1228,13 +1476,19 @@ impl ControllerRegisters {
                 progress.consume_for(self.identity());
             }
             if embassy_time::Instant::now() > grace_end {
+                if let Some(timeout) = self.pending_pin_low_timeout() {
+                    return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+                }
                 self.discard_frozen_halt(halt);
-                return false;
+                return HaltResolution::NeedsManualClose;
             }
         }
 
+        if let Some(timeout) = self.pending_pin_low_timeout() {
+            return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+        }
         self.confirm_auto_stopped_halt(halt);
-        true
+        HaltResolution::Settled
     }
 
     /// Resolve a halt which was observed by the transaction owner
@@ -1247,12 +1501,18 @@ impl ControllerRegisters {
         halt: HaltedFault,
         timeout: embassy_time::Duration,
         deadline: embassy_time::Instant,
-    ) -> bool {
+    ) -> HaltResolution {
+        if let Some(timeout) = self.pending_pin_low_timeout() {
+            return self.terminate_pin_low_timeout_during_halt(timeout, halt);
+        }
         if self.master_busy() {
             self.resolve_halted_fault(halt, timeout, deadline)
         } else {
+            if let Some(timeout_fault) = self.pending_pin_low_timeout() {
+                return self.terminate_pin_low_timeout_during_halt(timeout_fault, halt);
+            }
             self.discard_idle_halt(halt);
-            true
+            HaltResolution::Settled
         }
     }
 
@@ -1261,7 +1521,11 @@ impl ControllerRegisters {
     }
 
     fn clear_current_status(&self) {
-        let msr = self.msr();
+        // As with `clear_nonterminal_status`, a recovery tail must not erase
+        // a PLTF that arrived after its preceding fault observation. Keep the
+        // terminal latch visible for the next typed recovery entry.
+        let mut msr = self.msr();
+        msr.set_pltf(Pltf::IntNo);
         self.write_msr(msr);
     }
 
@@ -1777,6 +2041,44 @@ impl ControllerRegisters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_setup_rejects_a_zero_functional_clock() {
+        assert!(matches!(
+            ControllerSetup::new(0, SupportedSpeed(100_000), PinLowTimeout::Disabled),
+            Err(SetupError::NoFunctionalClock)
+        ));
+    }
+
+    #[test]
+    fn pin_low_timeout_is_terminal_even_when_other_faults_co_latch() {
+        let mut msr = Msr(0);
+        msr.set_ndf(Ndf::IntYes);
+        msr.set_fef(MsrFef::IntYes);
+        msr.set_pltf(Pltf::IntYes);
+        assert_eq!(snapshot_fault_from(&msr), Some(SnapshotFault::PinLowTimeout));
+        assert_eq!(
+            ControllerStatus::from_snapshot(&msr).error(),
+            Some(ControllerStatusError::PinLowTimeout)
+        );
+    }
+
+    #[test]
+    fn enabled_pin_low_watchdog_monitors_both_bus_lines() {
+        assert_eq!(PinLowCycles(0).timecfg(), Timecfg::IfSclLow);
+        assert_eq!(PinLowCycles(1).timecfg(), Timecfg::IfSclOrSdaLow);
+    }
+
+    #[test]
+    fn ordinary_status_cleanup_cannot_acknowledge_pin_low_timeout() {
+        let ordinary = ControllerRegisters::nonterminal_status_w1c();
+        assert_eq!(ordinary.ndf(), Ndf::IntYes);
+        assert_eq!(ordinary.fef(), MsrFef::IntYes);
+        assert_eq!(ordinary.pltf(), Pltf::IntNo);
+
+        let terminal = ControllerRegisters::terminal_status_w1c();
+        assert_eq!(terminal.pltf(), Pltf::IntYes);
+    }
 
     #[test]
     fn pin_low_timeout_is_rounded_up_and_never_silently_truncated() {

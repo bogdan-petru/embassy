@@ -103,6 +103,12 @@ use session::{Session, SessionRxStep, StartReservation};
 pub enum SetupError {
     /// Clock configuration error.
     ClockSetup(ClockError),
+    /// The selected LPI2C source provides no functional clock.
+    ///
+    /// This rejects `Lpi2cClockSel::None` before the driver changes DMA,
+    /// interrupt, pin, or controller state. A zero clock cannot produce a
+    /// meaningful baud or pin-low watchdog configuration.
+    NoFunctionalClock,
     /// The requested bus speed needs a controller mode this driver does not
     /// yet implement.
     UnsupportedSpeed,

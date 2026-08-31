@@ -2239,6 +2239,32 @@ pub mod tests {
         Ok(())
     }
 
+    /// Blocking absent-address NACK with no deliberate write suffix.
+    ///
+    /// The queued-suffix probe below drives the frozen-pipeline recovery arm.
+    /// Keep this short shape too: the NACK reaches the START terminal wait
+    /// before the write body can enqueue another command, so recovery must
+    /// perform its own close instead of relying on an auto-STOP behind data.
+    fn b_empty_fifo_address_nack(
+        ctrl: &mut ControllerI2c<'_, Blocking>,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        match ctrl.blocking_write(BAD_ADDR, &[0x00]) {
+            Err(ControllerIOError::AddressNack) => {}
+            Ok(()) => return Err("blocking empty_fifo_address_nack: write to an absent address succeeded"),
+            Err(_) => return Err("blocking empty_fifo_address_nack: wrong error class for the NACK"),
+        }
+
+        let mut verify = [0u8; 32];
+        b_read(ctrl, &mut verify, model, stats)?;
+        if !model.check_read(&verify) {
+            return Err("blocking empty_fifo_address_nack: post-NACK verify mismatch");
+        }
+
+        Ok(())
+    }
+
     /// Blocking-phase settle audit — same protocol as
     /// [`t_settle_audit`] over the blocking API. Also prevents
     /// blocking-phase boundary reads from leaking their counts into a
@@ -2466,8 +2492,8 @@ pub mod tests {
 
     /// Blocking-path condensation of the async suite: short W/R traffic,
     /// every long read length, consecutive reads, repeated-START into a
-    /// long read, multi-byte NACK recovery into a long read, and a 512-byte
-    /// write.
+    /// long read, both empty-FIFO and queued-suffix NACK recovery into a
+    /// long read, and a 512-byte write.
     pub fn t_blocking_battery(
         ctrl: &mut ControllerI2c<'_, Blocking>,
         model: &mut Model,
@@ -2519,6 +2545,7 @@ pub mod tests {
             return Err("wr long read mismatch");
         }
 
+        b_empty_fifo_address_nack(ctrl, model, stats)?;
         b_queued_suffix_address_nack(ctrl, model, stats)?;
         b_read(ctrl, &mut big[..257], model, stats)?;
         if !model.check_read(&big[..257]) {

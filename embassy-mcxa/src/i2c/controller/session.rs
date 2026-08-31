@@ -8,8 +8,8 @@ use core::marker::PhantomData;
 
 use super::IOError;
 use super::registers::{
-    ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, HaltedFault, RecoveryClose, RxProgress, RxStep,
-    StartAction, TransferFault,
+    ControllerRegisters, ControllerStatusError, FacadeSeal, FaultSlot, HaltResolution, HaltedFault, RecoveryClose,
+    RetainedFault, RxProgress, RxStep, StartAction, TransferFault,
 };
 use crate::i2c::Info;
 
@@ -19,9 +19,12 @@ use crate::i2c::Info;
 const fn recovery_abort_for(error: ControllerStatusError, abort: Abort) -> Abort {
     match error {
         ControllerStatusError::AddressNack => Abort::General,
-        ControllerStatusError::ArbitrationLoss | ControllerStatusError::Fifo | ControllerStatusError::PinLowTimeout => {
-            abort
-        }
+        ControllerStatusError::ArbitrationLoss | ControllerStatusError::Fifo => abort,
+        // PLTF is retained as a terminal proof and never reaches this
+        // selector in a well-typed call path. Retaining `abort` here keeps
+        // this total `const fn` conservative if a future fault carrier is
+        // refactored before its terminal proof is consumed.
+        ControllerStatusError::PinLowTimeout => abort,
     }
 }
 
@@ -35,12 +38,14 @@ pub(super) fn recover_before_session_fault(
     timeout: embassy_time::Duration,
     fault: TransferFault,
 ) -> IOError {
-    let mut halt = HaltSlot::empty();
-    let error = halt.capture(fault);
-    let abort = recovery_abort_for(error, Abort::General);
-    match halt.take() {
-        Some(halt) => remediate_halted(regs, timeout, abort, halt),
-        None => remediate(regs, timeout, abort),
+    let mut retained = FaultSlot::empty();
+    let error = retained.capture(fault);
+    match retained.take() {
+        Some(RetainedFault::Halted(halt)) => {
+            remediate_halted(regs, timeout, recovery_abort_for(halt.error(), Abort::General), halt)
+        }
+        Some(RetainedFault::PinLowTimeout(timeout_fault)) => regs.terminate_pin_low_timeout(timeout_fault),
+        None => remediate(regs, timeout, recovery_abort_for(error, Abort::General)),
     }
     error.into()
 }
@@ -118,21 +123,37 @@ fn remediate_inner(
         // The transaction owner observed this exact NDF/FEF before
         // returning its error. Resolve that proof directly instead of
         // relying on the drop path to rediscover a latched bit.
-        resolved = regs.resolve_owned_halt(halt, timeout, deadline);
+        match regs.resolve_owned_halt(halt, timeout, deadline) {
+            HaltResolution::Settled => resolved = true,
+            HaltResolution::NeedsManualClose => {}
+            HaltResolution::PinLowTerminated => return,
+        }
     } else if !busy {
         // Idle entry: nothing is running — dropping the stale
         // pipeline and clearing everything is unconditionally safe.
         regs.discard_idle_recovery_state();
     } else {
-        if let Some(halt) = regs.observe_recovery_halt() {
-            // The halt freezes the engine, so this is the authoritative
-            // FIFO observation for a first RECEIVE that raced recovery's
-            // entry snapshot.
-            late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
-            if let Some(phase) = late_halt_phase {
-                abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+        if let Some(fault) = regs.observe_recovery_fault() {
+            match fault {
+                RetainedFault::Halted(halt) => {
+                    // The halt freezes the engine, so this is the authoritative
+                    // FIFO observation for a first RECEIVE that raced recovery's
+                    // entry snapshot.
+                    late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
+                    if let Some(phase) = late_halt_phase {
+                        abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+                    }
+                    match regs.resolve_halted_fault(halt, timeout, deadline) {
+                        HaltResolution::Settled => resolved = true,
+                        HaltResolution::NeedsManualClose => {}
+                        HaltResolution::PinLowTerminated => return,
+                    }
+                }
+                RetainedFault::PinLowTimeout(timeout_fault) => {
+                    regs.terminate_pin_low_timeout(timeout_fault);
+                    return;
+                }
             }
-            resolved = regs.resolve_halted_fault(halt, timeout, deadline);
         }
     }
 
@@ -190,46 +211,57 @@ fn remediate_inner(
             // is CLASS-specific (recovery has no caller to classify
             // for, but it must still read the flags honestly — one
             // snapshot, clearing only what that snapshot's class
-            // permits; see `observe_recovery_halt`):
+            // permits; see `observe_recovery_fault`):
             //
-            // * ALF/PLTF may be SPURIOUS on this silicon — latched on
-            //   a transfer that is still running — so the step scrubs
-            //   them (only when actually latched: a tight
-            //   unconditional clear loop hammering MSR disturbed
-            //   otherwise-clean drains on hardware) and the run-out
-            //   continues; a GENUINE arbitration loss idles the
-            //   engine, which the idle-with-close-pending break above
-            //   then ends.
+            // * ALF may be SPURIOUS on this silicon — latched on a
+            //   transfer that is still running — so the step scrubs it
+            //   (only when actually latched: a tight unconditional
+            //   clear loop hammering MSR disturbed otherwise-clean
+            //   drains on hardware) and the run-out continues. A
+            //   GENUINE arbitration loss idles the engine, which the
+            //   idle-with-close-pending break above then ends.
+            // * PLTF is different: the command/FIFO outcome is not
+            //   documented, so it immediately disables MEN and drops
+            //   the controller state rather than queuing this close.
             // * NDF/FEF are real sequencing verdicts, and the latched
             //   flag is what keeps the stale pipeline frozen. Observe
             //   them BEFORE choosing this iteration's close: once the
             //   halt is observed, the FIFO snapshot is stable proof of
             //   whether a pending first RECEIVE executed.
-            if let Some(halt) = regs.observe_recovery_halt() {
-                late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
-                if let Some(phase) = late_halt_phase {
-                    abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+            match regs.observe_recovery_fault() {
+                Some(RetainedFault::Halted(halt)) => {
+                    late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
+                    if let Some(phase) = late_halt_phase {
+                        abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+                    }
+                    match regs.resolve_halted_fault(halt, timeout, deadline) {
+                        HaltResolution::Settled => break,
+                        HaltResolution::NeedsManualClose => {}
+                        HaltResolution::PinLowTerminated => return,
+                    }
+                    // Unresolved: the no-auto-STOP path just discarded
+                    // the frozen pipeline — the drain's own queued
+                    // close included. Re-queue it, or every exit
+                    // condition goes dead (settled needs the close to
+                    // run; the idle-pending break needs something
+                    // pending) and the loop would burn the deadline
+                    // into the engine reset.
+                    queued = false;
+                    idle_since = None;
                 }
-                if regs.resolve_halted_fault(halt, timeout, deadline) {
-                    break;
+                Some(RetainedFault::PinLowTimeout(timeout_fault)) => {
+                    regs.terminate_pin_low_timeout(timeout_fault);
+                    return;
                 }
-                // Unresolved: the no-auto-STOP path just discarded
-                // the frozen pipeline — the drain's own queued
-                // close included. Re-queue it, or every exit
-                // condition goes dead (settled needs the close to
-                // run; the idle-pending break needs something
-                // pending) and the loop would burn the deadline
-                // into the engine reset.
-                queued = false;
-                idle_since = None;
-            } else {
-                // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
-                // stalls the engine in SCL flow control (no fault!) the
-                // moment the un-popped FIFO fills, and would otherwise
-                // never finish — see `discard_rx`. Retain a byte that this
-                // drain consumes as first-RECEIVE execution evidence for a
-                // fault that may latch on a later iteration.
-                late_halt_phase = retain_recovery_discarded_rx_progress(late_halt_phase, regs);
+                None => {
+                    // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
+                    // stalls the engine in SCL flow control (no fault!) the
+                    // moment the un-popped FIFO fills, and would otherwise
+                    // never finish — see `discard_rx`. Retain a byte that this
+                    // drain consumes as first-RECEIVE execution evidence for a
+                    // fault that may latch on a later iteration.
+                    late_halt_phase = retain_recovery_discarded_rx_progress(late_halt_phase, regs);
+                }
             }
 
             let close = if abort == Abort::ReadAddressed {
@@ -320,11 +352,12 @@ pub(super) struct Session {
     /// and a captured halted fault can select their separately proven
     /// recovery policies.
     phase: SessionPhase,
-    /// A transfer-time NDF/FEF observation that must be resolved by
-    /// this session's cleanup, rather than rediscovered from a later
-    /// status read. It is populated immediately before the error path
-    /// drops the session.
-    halt: HaltSlot,
+    /// A transfer-time recovery-sensitive observation that must be resolved
+    /// by this session's cleanup, rather than rediscovered from a later
+    /// status read. It is populated immediately before the error path drops
+    /// the session: NDF/FEF retain a frozen-pipeline proof, while PLTF
+    /// retains terminal shutdown ownership.
+    fault: FaultSlot,
 }
 
 /// Receive progress after a [`Session`] has consumed the facade's opaque
@@ -359,7 +392,7 @@ impl Session {
     /// appending data while a START or STOP still owns the command pipeline.
     pub(super) fn command_permit(&mut self) -> CommandPermit<'_> {
         assert!(
-            self.halt.is_empty(),
+            self.fault.is_empty(),
             "i2c: a session with an unresolved halt was handed a transmit permit"
         );
         assert!(
@@ -390,7 +423,7 @@ impl Session {
     /// been quiesced.
     pub(super) fn rx_dma_permit(&mut self) -> RxDmaPermit<'_> {
         assert!(
-            self.halt.is_empty(),
+            self.fault.is_empty(),
             "i2c: a session with an unresolved halt was handed to RX DMA"
         );
         let owner = self.info.controller_registers().identity();
@@ -402,7 +435,7 @@ impl Session {
     /// ordinary wire state.
     pub(super) fn tx_dma_permit(&mut self) -> TxDmaPermit<'_> {
         assert!(
-            self.halt.is_empty(),
+            self.fault.is_empty(),
             "i2c: a session with an unresolved halt was handed to TX DMA"
         );
         assert!(
@@ -451,8 +484,8 @@ impl Session {
     /// a Full/fault result leaves the predecessor phase untouched.
     pub(super) fn start_transition_permit(&mut self) -> StartTransitionPermit<'_> {
         assert!(
-            self.halt.is_empty(),
-            "i2c: a session with an unresolved halt was continued"
+            self.fault.is_empty(),
+            "i2c: a session with an unresolved recovery fault was continued"
         );
         StartTransitionPermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
@@ -463,8 +496,8 @@ impl Session {
     /// drain witness cannot be replayed against a later transaction.
     pub(super) fn start_status_permit(&mut self) -> StartStatusPermit<'_> {
         assert!(
-            self.halt.is_empty(),
-            "i2c: a session with an unresolved halt was settled as a START"
+            self.fault.is_empty(),
+            "i2c: a session with an unresolved recovery fault was settled as a START"
         );
         StartStatusPermit::new(self.info.controller_registers().identity(), self)
     }
@@ -474,8 +507,8 @@ impl Session {
     /// only after this session actually queued one.
     pub(super) fn stop_transition_permit(&mut self) -> StopTransitionPermit<'_> {
         assert!(
-            self.halt.is_empty(),
-            "i2c: a session with an unresolved halt was closed normally"
+            self.fault.is_empty(),
+            "i2c: a session with an unresolved recovery fault was closed normally"
         );
         StopTransitionPermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
@@ -490,11 +523,12 @@ impl Session {
     }
 
     /// Convert a classified fault to the public error only after a
-    /// halting observation has been made this session's cleanup proof.
-    /// An ordinary ALF/PLTF intentionally leaves a pending command phase
-    /// intact: a later NDF/FEF in cleanup still needs that predecessor
-    /// policy. A halting NDF/FEF freezes its queued suffix immediately,
-    /// so only that class collapses the phase to its fault recovery shape.
+    /// retained observation has been made this session's cleanup proof.
+    /// An ordinary ALF leaves a pending command phase intact: a later
+    /// NDF/FEF in cleanup still needs that predecessor policy. A halting
+    /// NDF/FEF freezes its queued suffix immediately, so only that class
+    /// collapses the phase to its fault recovery shape. PLTF instead stays
+    /// as a terminal proof and will disable MEN on this session's drop.
     pub(super) fn bind_fault(&mut self, fault: TransferFault) -> IOError {
         // A fault may be observed by a command/top-up path before the RX
         // consumer gets its next turn. If the first RECEIVE has already
@@ -506,8 +540,8 @@ impl Session {
         if let Some(progress) = regs.observe_rx_progress() {
             self.note_read_progress(progress);
         }
-        let error = self.halt.capture(fault);
-        if !self.halt.is_empty() {
+        let error = self.fault.capture(fault);
+        if self.fault.has_halted_fault() {
             self.phase = SessionPhase::Stable(recovery_abort_for(error, self.phase.abort_for_halted_fault()));
         }
         error.into()
@@ -519,7 +553,7 @@ impl Session {
     /// through `StopPending -> StopFinalized`.
     fn defuse_after_stop(self) {
         assert!(
-            self.halt.is_empty(),
+            self.fault.is_empty(),
             "i2c: a session with an unresolved halt was marked complete"
         );
         assert!(
@@ -545,21 +579,28 @@ impl Drop for Session {
         // before selecting a pending-command close policy. In particular a
         // halted first RECEIVE must recover as ReadAddressed because its
         // frozen command will be discarded rather than auto-NACKing.
-        if self.halt.is_empty() {
+        if self.fault.is_empty() {
             if let Some(fault) = regs.take_active_fault() {
                 let _ = self.bind_fault(fault);
             }
         }
         let pending = PendingRecovery(self.phase);
-        if let Some(halt) = self.halt.take() {
-            let abort = pending.abort_for_cancellation();
-            remediate_halted(&regs, self.timeout, abort, halt);
-        } else {
-            // A NDF/FEF can latch after the snapshot above. Preserve the
-            // pending-command phase for the recovery loop so a late halt
-            // selects the frozen-pipeline close shape, not the ordinary
-            // cancellation/successor shape.
-            remediate_pending(&regs, self.timeout, pending);
+        match self.fault.take() {
+            Some(RetainedFault::Halted(halt)) => {
+                let abort = pending.abort_for_cancellation();
+                remediate_halted(&regs, self.timeout, abort, halt);
+            }
+            Some(RetainedFault::PinLowTimeout(timeout_fault)) => {
+                regs.terminate_pin_low_timeout(timeout_fault);
+            }
+            None => {
+                // A NDF/FEF can latch after the snapshot above. Preserve the
+                // pending-command phase for the recovery loop so a late halt
+                // selects the frozen-pipeline close shape, not the ordinary
+                // cancellation/successor shape. A late PLTF takes the terminal
+                // arm of `observe_recovery_fault` before any close is queued.
+                remediate_pending(&regs, self.timeout, pending);
+            }
         }
         self.info.release_session();
     }
@@ -1272,7 +1313,7 @@ impl StartReservation {
             info: self.info,
             timeout,
             phase,
-            halt: HaltSlot::empty(),
+            fault: FaultSlot::empty(),
         }
     }
 }
