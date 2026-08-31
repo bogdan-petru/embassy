@@ -740,6 +740,11 @@ the outer driver, rather than an abort-shape enum or a permit that can enqueue
 a raw recovery close. This makes a future orchestration edit choose a reviewed
 recovery path instead of accidentally emitting cleanup commands on its own.
 
+Likewise, when a register event requires session cleanup, bind it inside the
+session adapter and expose a public driver error rather than the raw fault
+witness. A receive loop may then return `IOError`, but it cannot forget the
+phase/halt bookkeeping that makes cancellation recovery correct.
+
 Use this alongside, not instead of, typed MMIO operations: the register facade
 should mint the evidence that permits a phase transition, and the private
 session module should consume it. Rust's ownership system can prevent an

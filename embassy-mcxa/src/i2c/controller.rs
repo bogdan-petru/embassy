@@ -1008,13 +1008,12 @@ impl<'d, M: Mode> I2c<'d, M> {
             // Receive one byte, or bail out on a fault (NACK,
             // arbitration loss, FIFO error): no more data will
             // arrive, and a data-only wait would spin forever.
-            match open.rx_step() {
+            match open.rx_step()? {
                 Some(SessionRxStep::Byte(b)) => {
                     read[drained] = b;
                     drained += 1;
                     deadline = embassy_time::Instant::now() + self.timeout;
                 }
-                Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                 Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // No progress for a full timeout window: the
                 // transfer died without a flag.
@@ -1066,12 +1065,11 @@ impl<'d, M: Mode> I2c<'d, M> {
         let mut deadline = embassy_time::Instant::now() + self.timeout;
         for byte in chunk.iter_mut() {
             *byte = loop {
-                match open.rx_step() {
+                match open.rx_step()? {
                     Some(SessionRxStep::Byte(b)) => {
                         deadline = embassy_time::Instant::now() + self.timeout;
                         break b;
                     }
-                    Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                     // No progress for a full timeout window: Timeout,
                     // like the chained and async paths —
@@ -1792,18 +1790,17 @@ impl<'d> I2c<'d, Async> {
                 Err(_) => true,
             };
 
-            match open.rx_step() {
+            match open.rx_step()? {
                 Some(SessionRxStep::Byte(b)) => {
                     read[drained] = b;
                     drained += 1;
                 }
-                // Surface the fault that woke us. If the flag cleared
-                // in between, loop back and wait again.
-                Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                 Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                 // Nothing pending after a full timeout window: the
                 // transfer stalled or died without a flag.
                 None if timed_out => return Err(IOError::Timeout),
+                // `rx_step()?` already returned a bound fault. A spurious
+                // wake that cleared before its snapshot simply waits again.
                 None => {}
             }
         }
@@ -1855,12 +1852,11 @@ impl<'d> I2c<'d, Async> {
                     Err(_) => true,
                 };
 
-                match open.rx_step() {
+                match open.rx_step()? {
                     Some(SessionRxStep::Byte(b)) => {
                         *byte = b;
                         break;
                     }
-                    Some(SessionRxStep::Fault(fault)) => return Err(open.bind_fault(fault)),
                     Some(SessionRxStep::Ended) => return Err(IOError::UnexpectedStop),
                     None if timed_out => return Err(IOError::Timeout),
                     None => {}

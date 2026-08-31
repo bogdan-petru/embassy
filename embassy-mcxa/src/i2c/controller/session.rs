@@ -330,11 +330,13 @@ pub(super) struct Session {
 /// Receive progress after a [`Session`] has consumed the facade's opaque
 /// first-RECEIVE witness. CPU transfer loops deliberately see this simplified
 /// result rather than the witness itself, so popping MRDR and updating the
-/// session phase are one internal operation.
+/// session phase are one internal operation. A raw controller fault is bound
+/// to this session before it is returned as an [`IOError`], so a loop cannot
+/// accidentally match a hardware observation without retaining its recovery
+/// owner.
 #[must_use]
 pub(super) enum SessionRxStep {
     Byte(u8),
-    Fault(TransferFault),
     Ended,
 }
 
@@ -430,14 +432,17 @@ impl Session {
     /// result carries opaque evidence whenever it popped MRDR; consume that
     /// evidence here before exposing the byte, so ordinary CPU loops cannot
     /// forget the matching first-RECEIVE phase transition.
-    pub(super) fn rx_step(&mut self) -> Option<SessionRxStep> {
-        match ControllerRegisters::new(self.info.regs()).rx_step()? {
+    pub(super) fn rx_step(&mut self) -> Result<Option<SessionRxStep>, IOError> {
+        let Some(step) = ControllerRegisters::new(self.info.regs()).rx_step() else {
+            return Ok(None);
+        };
+        match step {
             RxStep::Byte { byte, progress } => {
                 self.note_read_progress(progress);
-                Some(SessionRxStep::Byte(byte))
+                Ok(Some(SessionRxStep::Byte(byte)))
             }
-            RxStep::Fault(fault) => Some(SessionRxStep::Fault(fault)),
-            RxStep::Ended => Some(SessionRxStep::Ended),
+            RxStep::Fault(fault) => Err(self.bind_fault(fault)),
+            RxStep::Ended => Ok(Some(SessionRxStep::Ended)),
         }
     }
 
