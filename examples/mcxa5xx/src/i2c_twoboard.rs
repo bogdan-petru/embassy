@@ -71,13 +71,14 @@
 
 use embassy_embedded_hal::SetConfig;
 use embassy_mcxa as hal;
-use embassy_time::Instant;
+use embassy_time::{Delay, Instant};
 use hal::Peri;
-use hal::i2c::Blocking;
 use hal::i2c::controller::{
-    Config as CtrlConfig, I2c as ControllerI2c, IOError as ControllerIOError, PinLowTimeout, SetupError, Speed,
+    BusClearError, Config as CtrlConfig, I2c as ControllerI2c, IOError as ControllerIOError, PinLowTimeout, SetupError,
+    Speed,
 };
 use hal::i2c::target::{self, Address, Config as TargetConfig, InterruptHandler, ReadStatus, Request, WriteStatus};
+use hal::i2c::{Async, Blocking, Dma};
 use hal::interrupt::typelevel::Binding;
 use hal::peripherals::{DMA0_CH0, DMA0_CH1, LPI2C3, P3_20, P3_21};
 
@@ -271,6 +272,7 @@ pub trait TargetPort {
     async fn listen(&mut self) -> Result<Request, target::IOError>;
     async fn respond_read(&mut self, buf: &[u8]) -> Result<ReadStatus, target::IOError>;
     async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError>;
+    fn abort_response(&mut self);
 }
 
 impl TargetPort for target::I2c<'static, hal::i2c::Async> {
@@ -283,6 +285,9 @@ impl TargetPort for target::I2c<'static, hal::i2c::Async> {
     async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError> {
         self.async_respond_to_write(buf).await
     }
+    fn abort_response(&mut self) {
+        target::I2c::abort_response(self)
+    }
 }
 
 impl TargetPort for target::I2c<'static, hal::i2c::Dma<'static>> {
@@ -294,6 +299,9 @@ impl TargetPort for target::I2c<'static, hal::i2c::Dma<'static>> {
     }
     async fn respond_write(&mut self, buf: &mut [u8]) -> Result<WriteStatus, target::IOError> {
         self.async_respond_to_write(buf).await
+    }
+    fn abort_response(&mut self) {
+        target::I2c::abort_response(self)
     }
 }
 
@@ -480,7 +488,7 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 // serve loop waits forever for a termination that is
                 // never coming — the target respond paths have no
                 // deadline of their own.
-                let (_served, ()) = embassy_futures::join::join(
+                let (served, ()) = embassy_futures::join::join(
                     embassy_futures::select::select(
                         tgt.respond_read(&view),
                         embassy_time::Timer::after_millis(PIN_LOW_RESPOND_BOUND_MS),
@@ -488,6 +496,20 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                     stall,
                 )
                 .await;
+                // The interrupt target's response remains pending until the
+                // bound, so dropping it runs the driver's cancellation guard.
+                // DMA can autonomously serve this first view and report
+                // NeedMore before the CPU stall ends; that is a normal return,
+                // so the application must explicitly resolve its open
+                // continuation before it goes back to listen. Otherwise its
+                // TXDSTALL is exactly the peer-held SCL that GPIO clear
+                // cannot force high.
+                if matches!(
+                    served,
+                    embassy_futures::select::Either::First(Ok(ReadStatus::NeedMore(_)))
+                ) {
+                    tgt.abort_response();
+                }
                 // Nothing commits and the cursor is left alone: the
                 // controller-side test anchors (rewrites the buffer)
                 // before it verifies.
@@ -622,11 +644,21 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
 pub trait Controller:
     embedded_hal_async::i2c::I2c<Error = ControllerIOError> + SetConfig<Config = CtrlConfig, ConfigError = SetupError>
 {
+    /// Reclaim the controller and pads after an explicitly diagnosed bus
+    /// fault. This remains synchronous because standard GPIO bus clear uses
+    /// a short, bounded waveform rather than an executor wake source.
+    fn clear_bus(&mut self, delay: &mut Delay) -> Result<(), BusClearError>;
 }
-impl<
-    T: embedded_hal_async::i2c::I2c<Error = ControllerIOError> + SetConfig<Config = CtrlConfig, ConfigError = SetupError>,
-> Controller for T
-{
+impl<'d> Controller for ControllerI2c<'d, Async> {
+    fn clear_bus(&mut self, delay: &mut Delay) -> Result<(), BusClearError> {
+        ControllerI2c::clear_bus(self, delay)
+    }
+}
+
+impl<'d> Controller for ControllerI2c<'d, Dma<'d>> {
+    fn clear_bus(&mut self, delay: &mut Delay) -> Result<(), BusClearError> {
+        ControllerI2c::clear_bus(self, delay)
+    }
 }
 
 /// Exact shadow of the target's RAM buffer.
@@ -848,9 +880,10 @@ pub mod harness {
 
     /// Run the pin-low watchdog probe as an isolated final step.
     ///
-    /// Separate from [`run`] because it can leave the bus held by the
-    /// stalled target (see [`tests::t_pin_low_timeout`]), so nothing may
-    /// follow it. Panics on failure, like the other entry points.
+    /// Separate from [`run`] because it deliberately exercises terminal
+    /// controller and target recovery. It remains final: a physical failure
+    /// that prevents recovery must not contaminate the ordinary diagnostics
+    /// that precede it. Panics on failure, like the other entry points.
     pub async fn run_pin_low<C: Controller>(mode: &str, ctrl: &mut C) {
         defmt::info!("== pin-low watchdog probe [{=str}] start ==", mode);
 
@@ -2320,22 +2353,19 @@ pub mod tests {
     /// the read is sized past one served view so the stall bites at the
     /// handover — the one point even the DMA target needs firmware. Its
     /// TXDSTALL stretch then holds SCL low far past the 1.5 ms watchdog
-    /// configured here. `MCFGR3[PINLOW]`
-    /// then fires, and the driver's terminal recovery — interrupts off,
-    /// MEN off, FIFOs discarded, the one W1C that may acknowledge PLTF,
-    /// MEN back on — is the only path that can clear it.
+    /// configured here. `MCFGR3[PINLOW]` then fires. The controller terminal
+    /// recovery turns off MEN and discards its unknown command state; the
+    /// cancelled target response now performs the matching target-side SEN
+    /// reset, releasing TXDSTALL rather than waiting forever for a STOP that
+    /// MEN-off cannot generate. Finally, the controller's GPIO bus-clear API
+    /// reclaims the pads, verifies an idle bus, and restores LPI2C ownership.
     ///
     /// Asserted: the transfer fails as exactly `PinLowTimeout`, never
-    /// succeeds and never reports another class, and the terminal
-    /// recovery returns rather than hanging. The watchdog is disabled
-    /// again before any assert can return, so a failure cannot leak a
-    /// 1.5 ms bound into whatever runs next.
-    ///
-    /// NOT asserted: that the bus is usable afterwards — see the comment
-    /// at the recovery probe below. This test therefore runs LAST, after
-    /// every phase, because it can legitimately leave the bus held; the
-    /// runner resets the target board at the start of every run, which
-    /// clears it.
+    /// succeeds and never reports another class; terminal recovery returns;
+    /// and, after the target's bounded cancellation cleanup, an explicit GPIO
+    /// bus clear plus a byte-exact transfer succeeds. The watchdog is
+    /// disabled again before any assert can return, so a failure cannot leak
+    /// a 1.5 ms bound into whatever runs next.
     ///
     /// Not covered: a stuck-SDA line. TXDSTALL gives us SCL from
     /// firmware alone; holding SDA low needs a jumper to ground.
@@ -2389,37 +2419,53 @@ pub mod tests {
 
         // The controller aborts the moment its watchdog fires (~5 ms in),
         // but the target stays unresponsive well past that: its CPU is
-        // still blocked, and the respond it can never finish only unwinds
-        // at its own bound. Wait that out before asking anything of it.
+        // still blocked, and its response only unwinds at its own bound.
+        // Wait until that response-scoped cancellation cleanup has released
+        // TXDSTALL before taking the controller's GPIO bus-clear lease.
         embassy_time::Timer::after_millis(PIN_LOW_RESPOND_BOUND_MS + 20).await;
 
-        // BUS RECOVERY IS REPORTED, NOT ASSERTED — and that is a finding,
-        // not a convenience. Measured here: after the watchdog aborts a
-        // read mid-transfer, every subsequent transfer fails with
-        // `Timeout` (never `AddressNack`) for as long as it is retried.
-        // The controller half is fine — terminal recovery cycles MEN and
-        // the driver is usable — but the TARGET is left mid-transfer and
-        // never saw a STOP, so its hardware keeps stretching and the bus
-        // stays held. Releasing a peer in that state needs a bus-clear
-        // sequence (nine SCL pulses plus a STOP), which this driver does
-        // not implement; MEN off/on generates no clocks. Until it does,
-        // asserting recovery here would only pin a known-missing feature
-        // as a failure. Flip this to an assert the day bus-clear lands.
-        let snap = model.snapshot();
-        let mut recovered = false;
-        for _ in 0..4u32 {
-            if ctrl.write(TARGET_ADDR, &snap).await.is_ok() {
-                recovered = true;
-                break;
+        // In this firmware-only fault SCL was held by target TXDSTALL. A
+        // controller can never force that line high, so the target must
+        // release it first (the cancellation guard above does that). The
+        // explicit clear then proves both physical levels are high while
+        // re-owning the pads/engine. A separate jumper or target mode is
+        // still needed to exercise the nine-pulse SDA-held-low branch.
+        let mut delay = Delay;
+        let mut clear_attempts = 0;
+        loop {
+            match ctrl.clear_bus(&mut delay) {
+                Ok(()) => break,
+                // The target's timeout task can be ready just after the
+                // controller observed its watchdog fault. `clear_bus` leaves
+                // MEN off on this physical condition, so retrying after one
+                // response bound both proves that documented API contract and
+                // keeps this HIL assertion insensitive to executor jitter.
+                Err(BusClearError::SclHeldLow) if clear_attempts < 2 => {
+                    clear_attempts += 1;
+                    embassy_time::Timer::after_millis(PIN_LOW_RESPOND_BOUND_MS).await;
+                }
+                Err(BusClearError::SclHeldLow) => {
+                    return Err("pin_low: target still held SCL after cancellation");
+                }
+                Err(BusClearError::SdaHeldLow) => {
+                    return Err("pin_low: GPIO bus clear could not release SDA");
+                }
+                Err(_) => return Err("pin_low: GPIO bus clear returned an unknown error"),
             }
-            embassy_time::Timer::after_millis(20).await;
         }
-        if recovered {
-            model.write(&snap);
-            defmt::info!("[c] pin_low: bus recovered without a bus-clear sequence");
-        } else {
-            defmt::warn!("[c] pin_low: bus still held after the abort — needs bus-clear (expected today)");
+
+        // A successful clear is not merely a pad-level observation: prove a
+        // complete anchored read works again. `op_read` handles the board's
+        // known transient ALF retry class but treats every other error as a
+        // recovery failure, then the model checks each returned byte.
+        let snap = model.snapshot();
+        let mut verify = [0u8; BUF_LEN];
+        op_read(ctrl, &mut verify, model, stats).await?;
+        if !model.check_read(&verify) {
+            return Err("pin_low: post-clear transfer mismatch");
         }
+        model.write(&snap);
+        defmt::info!("[c] pin_low: target released and GPIO bus clear recovered traffic");
 
         Ok(())
     }

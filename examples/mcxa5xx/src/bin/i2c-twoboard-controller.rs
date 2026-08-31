@@ -156,12 +156,10 @@ async fn main(spawner: Spawner) {
         i2c_twoboard::harness::run_blocking("blocking", &mut ctrl);
     }
 
-    // LAST, deliberately: the pin-low probe stalls the target past the
-    // controller's watchdog, and the abort can leave the bus held by a
-    // target that never saw a STOP (releasing it needs a bus-clear
-    // sequence the driver does not implement yet). Nothing may run after
-    // it; the runner resets the target board at the start of every run,
-    // which clears the bus.
+    // LAST, deliberately: this probe takes the bus through a real terminal
+    // pin-low fault, then asserts target cancellation plus GPIO bus clear
+    // restore traffic. Keeping it final isolates a physical-fault regression
+    // from the ordinary phase diagnostics that precede it.
     if phase_enabled("pin_low") {
         let mut ccfg = controller::Config::default();
         ccfg.speed = Speed::Standard;

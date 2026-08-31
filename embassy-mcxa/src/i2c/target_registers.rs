@@ -425,6 +425,37 @@ impl TargetRegisters {
         true
     }
 
+    /// Abort a target response whose future was cancelled before the
+    /// controller supplied STOP or a repeated START.
+    ///
+    /// `TXDSTALL`/`RXSTALL` deliberately hold SCL while a response owns the
+    /// transfer. Rust cancellation used to drop only the waiter (and DMA
+    /// lease), leaving that hardware state live forever when a controller
+    /// disabled MEN mid-transfer. Turn SEN off only after all response-owned
+    /// DMA leases have quiesced; that releases any clock stretch, discards
+    /// transfer residue, and preserves the configured address/filter state
+    /// when SEN is re-enabled for the next `listen`.
+    pub(super) fn abort_active_response(&self) {
+        critical_section::with(|_| {
+            self.write_sier(|_| {});
+            self.modify_sder(|w| {
+                w.set_rdde(false);
+                w.set_tdde(false);
+            });
+
+            // Disabling SEN is the target-side counterpart to a controller
+            // MEN abort: it releases TXDSTALL/RXSTALL rather than waiting
+            // for a STOP the controller can no longer generate.
+            self.modify_scr(|w| w.set_sen(false));
+            self.modify_scr(|w| {
+                w.set_rtf(ScrRtf::NowEmpty);
+                w.set_rrf(ScrRrf::NowEmpty);
+            });
+            self.clear_stale_events();
+            self.modify_scr(|w| w.set_sen(true));
+        });
+    }
+
     /// Interrupts relevant while receiving data (respond_to_write).
     fn enable_receive_interrupts(&self) {
         self.write_sier(|w| {

@@ -70,6 +70,7 @@ use core::ops::Range;
 use core::task::Poll;
 
 use embassy_hal_internal::Peri;
+use embassy_hal_internal::drop::OnDrop;
 use maitake_sync::WaitCell;
 
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
@@ -1236,6 +1237,25 @@ where
         }
     }
 
+    /// Explicitly abandon a target response that still owns the bus.
+    ///
+    /// A response result that reports a full caller buffer —
+    /// [`ReadStatus::NeedMore`] or [`WriteStatus::BufferFull`] — is a
+    /// continuation boundary, not an idle target. The caller must either
+    /// provide another buffer with the corresponding response method or call
+    /// this method before returning to unrelated work. Merely dropping the
+    /// status leaves `TXDSTALL` or `RXSTALL` allowed to hold SCL while the
+    /// controller waits for service.
+    ///
+    /// This masks target requests, releases a possible clock stretch, discards
+    /// the unfinished transfer's FIFO residue, and re-arms the configured
+    /// target for a later [`Self::async_listen`]. A live response future holds
+    /// `&mut self`, so Rust prevents this operation from racing its DMA lease
+    /// or register state.
+    pub fn abort_response(&mut self) {
+        self.registers().abort_active_response();
+    }
+
     /// Asynchronously transmit data to the I2C controller.
     ///
     /// Sends the contents of the provided buffer to the I2C controller.
@@ -1247,8 +1267,9 @@ where
     /// block size larger than the prepared response), this call resolves
     /// with [`ReadStatus::NeedMore`] so the caller can decide what to do:
     /// call `async_respond_to_read` again with more bytes (or fill data),
-    /// or let the bus clock-stretch (with TXDSTALL enabled) until the
-    /// controller eventually terminates the transfer.
+    /// or call [`Self::abort_response`] to deliberately abandon the open
+    /// transfer. Letting the bus clock-stretch is valid only while the
+    /// application intentionally waits for the controller to terminate it.
     ///
     /// # Parameters
     ///
@@ -1264,7 +1285,18 @@ where
         &'a mut self,
         buf: &'a [u8],
     ) -> impl Future<Output = Result<ReadStatus, IOError>> + 'a {
-        <Self as AsyncEngine>::async_respond_to_read_internal(self, buf)
+        let registers = self.registers();
+        async move {
+            // Declare the response future AFTER this guard. Local values drop
+            // in reverse declaration order, so cancellation first quiesces
+            // any DMA lease that still borrows `buf`, then drops SEN to
+            // release TXDSTALL/RXSTALL and restore a listening target.
+            let abort = OnDrop::new(move || registers.abort_active_response());
+            let response = <Self as AsyncEngine>::async_respond_to_read_internal(self, buf);
+            let result = response.await;
+            abort.defuse();
+            result
+        }
     }
 
     /// Asynchronously receive data from the I2C controller.
@@ -1282,11 +1314,25 @@ where
     /// - `Ok(WriteStatus)` describing how the transfer ended and how many
     ///   bytes the target received.
     /// - `Err(IOError)` if an error occurs.
+    ///
+    /// If this returns [`WriteStatus::BufferFull`] and no follow-up receive
+    /// buffer will be supplied, call [`Self::abort_response`] to release the
+    /// target's receive-side clock stretch.
     pub fn async_respond_to_write<'a>(
         &'a mut self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = Result<WriteStatus, IOError>> + 'a {
-        <Self as AsyncEngine>::async_respond_to_write_internal(self, buf)
+        let registers = self.registers();
+        async move {
+            // See `async_respond_to_read`: the response future is declared
+            // after this guard so a live DMA lease is quiesced before target
+            // hardware is reset on cancellation.
+            let abort = OnDrop::new(move || registers.abort_active_response());
+            let response = <Self as AsyncEngine>::async_respond_to_write_internal(self, buf);
+            let result = response.await;
+            abort.defuse();
+            result
+        }
     }
 }
 

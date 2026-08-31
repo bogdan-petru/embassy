@@ -91,6 +91,8 @@ mod registers;
 // can construct it. Its operational methods remain `pub(super)` inside this
 // controller tree; target code cannot operate a controller facade.
 pub(in crate::i2c) use registers::ControllerRegisters;
+#[path = "controller/bus_clear.rs"]
+mod bus_clear;
 #[path = "controller/session.rs"]
 mod session;
 
@@ -173,6 +175,25 @@ pub enum IOError {
     InvalidReadBufferLength,
     /// Other internal errors or unexpected state.
     Other,
+}
+
+/// Why a GPIO I2C bus-clear attempt could not restore an idle bus.
+///
+/// The controller only ever drives an open-drain line low. It can release a
+/// line but cannot force a peer-held line high, so these errors describe the
+/// physical line that prevented the standard clock-pulse/STOP sequence from
+/// completing. The controller remains disabled after an error; wait for the
+/// peer or remove the external fault, then call [`I2c::clear_bus`] again.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum BusClearError {
+    /// SCL stayed low after the controller released it. This can be an
+    /// external short or a target that is still clock-stretching; GPIO bus
+    /// clear cannot create clock pulses while another device owns SCL low.
+    SclHeldLow,
+    /// SDA was still low after nine valid SCL pulses and an attempted STOP.
+    SdaHeldLow,
 }
 
 impl From<crate::dma::InvalidParameters> for IOError {
@@ -663,6 +684,37 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     fn set_configuration(&self, setup: ControllerSetup) {
         self.registers().configure(setup)
+    }
+
+    /// Recover a physically stuck I2C bus using the standard GPIO sequence.
+    ///
+    /// The driver first disables LPI2C ownership, then temporarily borrows
+    /// the existing SCL/SDA pads as open-drain GPIO. If SCL is released, it
+    /// clocks up to nine pulses while SDA is low and finishes with a GPIO
+    /// STOP. The exact original pad configuration is restored before LPI2C
+    /// is enabled again.
+    ///
+    /// This cannot force a target-held SCL high: open-drain GPIO can only
+    /// release the line. In that case it returns
+    /// [`BusClearError::SclHeldLow`] and deliberately leaves the controller
+    /// disabled. After the peer or physical fault releases the line, call
+    /// this method again. The same applies to SDA after nine pulses through
+    /// [`BusClearError::SdaHeldLow`].
+    ///
+    /// Use this after a [`IOError::PinLowTimeout`] when the application has
+    /// determined that recovering the shared bus is appropriate. It is an
+    /// explicit operation rather than an automatic side effect of every
+    /// timeout because generating clocks on a multi-controller bus is a
+    /// policy decision owned by the application.
+    pub fn clear_bus(&mut self, delay: &mut impl embedded_hal_1::delay::DelayNs) -> Result<(), BusClearError> {
+        let lease = self.registers().begin_bus_clear();
+        let result = bus_clear::clear(&self._scl, &self._sda, delay);
+
+        if result.is_ok() {
+            lease.finish();
+        }
+
+        result
     }
 
     /// Consume a session at its defined end, asserting it belongs to

@@ -660,6 +660,37 @@ pub(in crate::i2c) struct ControllerRegisters {
     regs: &'static LpI2cRegisters,
 }
 
+/// Exclusive controller-side authority while the I2C pads are temporarily
+/// borrowed as GPIO for a bus-clear sequence.
+///
+/// The lease owns the disabled controller state. It only re-enables MEN
+/// after the GPIO side proved both lines released; dropping it leaves MEN
+/// disabled, which is safer than allowing a later transfer to reuse an
+/// unproven physical bus.
+#[must_use]
+pub(super) struct BusClearLease {
+    regs: ControllerRegisters,
+    armed: bool,
+}
+
+impl BusClearLease {
+    /// Complete the GPIO bus-clear sequence after the pads have already been
+    /// restored to their LPI2C mux. A clear must never revive any prior
+    /// interrupt/DMA request; the next transfer arms exactly what it needs.
+    pub(super) fn finish(mut self) {
+        self.regs.finish_bus_clear();
+        self.armed = false;
+    }
+}
+
+impl Drop for BusClearLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.regs.leave_bus_clear_disabled();
+        }
+    }
+}
+
 /// A live RX DMA handoff to the controller's read-only FIFO port.
 ///
 /// It owns the pairing that raw pointer APIs cannot express: MDER is off
@@ -1381,6 +1412,10 @@ impl ControllerRegisters {
     fn terminal_shutdown(&self) {
         critical_section::with(|_| {
             self.write_mier(|_| {});
+            self.modify_mder(|w| {
+                w.set_rdde(false);
+                w.set_tdde(false);
+            });
             self.modify_mcr(|w| w.set_men(false));
             // Keep shutdown one critical section: this is equivalent to
             // `reset_fifos`, but avoids nesting a critical-section entry
@@ -1391,6 +1426,75 @@ impl ControllerRegisters {
             });
             self.clear_status_after_terminal_shutdown();
             self.modify_mcr(|w| w.set_men(true));
+        });
+    }
+
+    /// Relinquish the LPI2C engine before the controller temporarily borrows
+    /// both pads as GPIO for standard bus recovery.
+    ///
+    /// This is intentionally an owned lease rather than three independent
+    /// operations. Once the mux leaves LPI2C, the old interrupt/DMA state
+    /// must stay unable to drive a command or wake a discarded transaction;
+    /// only [`BusClearLease::finish`] may re-enable MEN after GPIO observed
+    /// an idle bus.
+    pub(super) fn begin_bus_clear(&self) -> BusClearLease {
+        critical_section::with(|_| {
+            self.write_mier(|_| {});
+            self.modify_mder(|w| {
+                w.set_rdde(false);
+                w.set_tdde(false);
+            });
+            self.modify_mcr(|w| w.set_men(false));
+            self.modify_mcr(|w| {
+                w.set_rtf(McrRtf::Reset);
+                w.set_rrf(McrRrf::Reset);
+            });
+            // MEN is already off, so this is the one permitted PLTF W1C
+            // cleanup. No unknown command suffix can resume behind it.
+            self.clear_status_after_terminal_shutdown();
+        });
+
+        BusClearLease {
+            regs: *self,
+            armed: true,
+        }
+    }
+
+    /// Complete a successful GPIO recovery after the pads are back on their
+    /// saved LPI2C mux. Leave interrupt/DMA requests disabled: the next
+    /// transfer's typed wake/lease path arms only the sources it owns.
+    fn finish_bus_clear(&self) {
+        critical_section::with(|_| {
+            self.write_mier(|_| {});
+            self.modify_mder(|w| {
+                w.set_rdde(false);
+                w.set_tdde(false);
+            });
+            self.modify_mcr(|w| {
+                w.set_rtf(McrRtf::Reset);
+                w.set_rrf(McrRrf::Reset);
+            });
+            self.clear_status_after_terminal_shutdown();
+            self.modify_mcr(|w| w.set_men(true));
+        });
+    }
+
+    /// Safe cancellation/panic fallback for an unfinished GPIO recovery.
+    /// Keeping MEN off makes the failure explicit; a later [`begin_bus_clear`]
+    /// can retry after the peer or physical fault has released the line.
+    fn leave_bus_clear_disabled(&self) {
+        critical_section::with(|_| {
+            self.write_mier(|_| {});
+            self.modify_mder(|w| {
+                w.set_rdde(false);
+                w.set_tdde(false);
+            });
+            self.modify_mcr(|w| w.set_men(false));
+            self.modify_mcr(|w| {
+                w.set_rtf(McrRtf::Reset);
+                w.set_rrf(McrRrf::Reset);
+            });
+            self.clear_status_after_terminal_shutdown();
         });
     }
 

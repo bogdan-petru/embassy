@@ -54,9 +54,9 @@ $outFile = [System.IO.Path]::GetTempFileName()
 $errFile = [System.IO.Path]::GetTempFileName()
 
 $args = @('run','--chip','MCXA577','--preverify','--verify','--protocol','swd','--speed',"$SpeedKhz",
-          '--probe',$ControllerProbe,'--non-interactive',$ctl)
+          '--probe',$ControllerProbe,'--non-interactive','--scan-region','ram',$ctl)
 $proc = Start-Process -FilePath 'probe-rs' -ArgumentList $args `
-    -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
+    -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -WindowStyle Hidden
 
 # Reset the target once the controller actually reaches its quiet
 # window — detected by its own log marker, not a fixed sleep, so a
@@ -109,10 +109,10 @@ if ($TargetElf -ne '') {
     $tgtOut = [System.IO.Path]::GetTempFileName()
     $tgtErr = [System.IO.Path]::GetTempFileName()
     $tgtArgs = @('attach','--chip','MCXA577','--protocol','swd','--speed',"$SpeedKhz",
-                 '--probe',$TargetProbe,'--non-interactive',$TargetElf)
+                 '--probe',$TargetProbe,'--non-interactive','--scan-region','ram',$TargetElf)
     $tgtProc = Start-Process -FilePath 'probe-rs' -ArgumentList $tgtArgs `
         -RedirectStandardOutput $tgtOut -RedirectStandardError $tgtErr `
-        -PassThru -NoNewWindow
+        -PassThru -WindowStyle Hidden
 }
 
 $timedOut = $false

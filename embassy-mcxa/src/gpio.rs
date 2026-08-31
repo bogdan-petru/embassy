@@ -416,6 +416,95 @@ impl SealedPin for AnyPin {
 
 impl GpioPin for AnyPin {}
 
+/// A temporary, borrowed open-drain GPIO view of a pin already owned by a
+/// peripheral driver.
+///
+/// This deliberately does not take a [`Peri`]: callers keep exclusive pin
+/// ownership, while this guard temporarily switches its pad to GPIO for a
+/// bounded recovery sequence. Construction preloads the output latch high
+/// before selecting GPIO, so changing the mux cannot create a spurious low
+/// pulse. Dropping the guard releases the line and restores the complete
+/// saved PCR value (mux plus every pad option).
+///
+/// It is crate-private because bypassing an active peripheral is only safe
+/// after that peripheral has explicitly relinquished the line.
+pub(crate) struct TemporaryOpenDrain<'a> {
+    pin: &'a AnyPin,
+    saved_pcr: Pcr,
+    saved_pid: Pid,
+}
+
+impl<'a> TemporaryOpenDrain<'a> {
+    /// Temporarily route `pin` through its GPIO block as an open-drain
+    /// output. The caller must have disabled the peripheral that normally
+    /// owns the pad before constructing this guard.
+    pub(crate) fn new(pin: &'a AnyPin) -> Self {
+        let saved_pcr = pin.pcr_reg().read();
+        let gpio = pin.gpio();
+        let index = pin.pin() as usize;
+        let saved_pid = gpio.pidr().read().pid(index);
+
+        // Prepare a released GPIO level before its mux owns the pad. This
+        // ordering is important for I2C recovery: a stale low latch must not
+        // look like a START when the mux changes.
+        gpio.psor().write(|w| w.set_ptso(index, Ptso::Ptso1));
+        gpio.pddr().modify(|w| w.set_pdd(index, Pdd::Pdd0));
+        gpio.pidr().modify(|w| w.set_pid(index, Pid::Pid0));
+        pin.pcr_reg().modify(|w| {
+            w.set_mux(Mux::Mux0);
+            w.set_ode(Ode::Ode1);
+            w.set_ibe(Ibe::Ibe1);
+        });
+        gpio.pddr().modify(|w| w.set_pdd(index, Pdd::Pdd1));
+
+        Self {
+            pin,
+            saved_pcr,
+            saved_pid,
+        }
+    }
+
+    /// Actively drive the open-drain line low.
+    #[inline]
+    pub(crate) fn drive_low(&mut self) {
+        self.pin
+            .gpio()
+            .pcor()
+            .write(|w| w.set_ptco(self.pin.pin() as usize, Ptco::Ptco1));
+    }
+
+    /// Release the open-drain line high. An external device may still keep
+    /// the physical bus level low, which [`Self::is_high`] reports.
+    #[inline]
+    pub(crate) fn release(&mut self) {
+        self.pin
+            .gpio()
+            .psor()
+            .write(|w| w.set_ptso(self.pin.pin() as usize, Ptso::Ptso1));
+    }
+
+    /// Sample the physical input level while the input buffer is enabled.
+    #[inline]
+    pub(crate) fn is_high(&self) -> bool {
+        self.pin.gpio().pdir().read().pdi(self.pin.pin() as usize)
+    }
+}
+
+impl Drop for TemporaryOpenDrain<'_> {
+    fn drop(&mut self) {
+        let gpio = self.pin.gpio();
+        let index = self.pin.pin() as usize;
+
+        // Return to high-impedance before handing the pad back to the
+        // peripheral. Restoring the complete PCR avoids duplicating the
+        // I2C pin macro's electrical configuration here.
+        gpio.psor().write(|w| w.set_ptso(index, Ptso::Ptso1));
+        gpio.pddr().modify(|w| w.set_pdd(index, Pdd::Pdd0));
+        self.pin.pcr_reg().write_value(self.saved_pcr);
+        gpio.pidr().modify(|w| w.set_pid(index, self.saved_pid));
+    }
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! impl_gpio_pin {
