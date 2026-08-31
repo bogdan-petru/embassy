@@ -749,7 +749,10 @@ pub mod harness {
         // design), and running it earlier would wipe the evidence the
         // phase-end audit exists to judge.
         run_test!("cancellation", tests::t_cancellation(ctrl, &mut model, &mut stats));
-        run_test!("data_nack", tests::t_data_nack(ctrl, &mut model, &mut stats));
+        run_test!(
+            "queued_suffix_address_nack",
+            tests::t_queued_suffix_address_nack(ctrl, &mut model, &mut stats)
+        );
 
         defmt::info!(
             "== two-board i2c suite [{=str}] ALL PASS ({=u32} ALF / {=u32} FEF / {=u32} END retries) ==",
@@ -2106,33 +2109,31 @@ pub mod tests {
         ctl_write(ctrl, &msg, stats).await.map_err(|_| "audit_reset: failed")
     }
 
-    /// Late-NACK (mid-write NDF) coverage — the halting-fault recovery
-    /// paths, exercised without target cooperation: a MULTI-BYTE write
-    /// to an absent address. The settle wake fires when the START is
-    /// pulled from the FIFO — a full address-time (~90 µs at the
-    /// suite's Standard speed) before the NACK bit — so under any
-    /// realistic scheduling the session mints and the write body
-    /// queues its first byte(s) before NDF latches MID-WRITE with a
-    /// queued suffix. (A margin, not an architectural guarantee: an
-    /// interleaving that loses it degrades this into a plain
-    /// address-NACK probe with identical assert outcomes — both
-    /// shapes classify AddressNack and both must recover clean — so
-    /// the late-NDF claim rests on the timing arithmetic, and the
-    /// asserts prove outcome-safety across ALL interleavings.)
-    /// From the driver's side that is exactly the data-phase-NACK
-    /// shape: the halt-preserving classify must freeze the suffix
-    /// (nothing may reach the wire after the failure returns), and
-    /// remediate must discriminate the auto-STOP sub-cases by
-    /// observation, since the fault instant's FIFO state varies with
-    /// byte timing.
+    /// Queued-suffix NACK recovery coverage — a MULTI-BYTE write to an
+    /// absent address exercises the halting-fault recovery path without
+    /// target cooperation. The settle wake fires when the START is pulled
+    /// from the FIFO — roughly one address time before NDF normally
+    /// latches — so a realistic schedule queues a payload suffix behind
+    /// the failed address. An interleaving that does not queue a suffix
+    /// degrades safely to an ordinary address-NACK probe: both shapes must
+    /// recover and both must return the same public error.
     ///
-    /// A true wire-level DATA NACK from the emulated target is not
-    /// producible — hardware-measured on FRDM-MCXA577: STAR[TXNACK]
-    /// raised from idle NACKs the next ADDRESS (the transaction never
-    /// matches), and raised at the address-release window or mid-data
-    /// it changes nothing (8 further bytes still ACKed). NXP-ticket
-    /// material; noted so nobody re-attempts it.
-    pub async fn t_data_nack<C: Controller>(ctrl: &mut C, model: &mut Model, stats: &mut RetryStats) -> TestResult {
+    /// The driver-side invariant under test is that a halted NDF freezes
+    /// any queued suffix and recovery observes the auto-STOP state before
+    /// reusing the bus. The target buffer cannot independently prove suffix
+    /// death for a bad address, so this suite verifies the observable
+    /// recovery result instead.
+    ///
+    /// This does not claim to emulate a target-originated data NACK.
+    /// FRDM-MCXA577 measurements show `STAR[TXNACK]` affects address
+    /// acknowledgement rather than producing that signal; the distinct
+    /// `SCFGR1[RXNACK]` / `ACKSTALL` controls have not yet been
+    /// characterized by this rig.
+    pub async fn t_queued_suffix_address_nack<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
         use embassy_futures::select::{Either, select};
         use embassy_time::Timer;
 
@@ -2150,20 +2151,20 @@ pub mod tests {
             *b = 0x50 + i as u8;
         }
 
-        // Straight late-NACK: exact class, then prove the bus fully
-        // recovered with an anchored byte-exact read.
+        // Straight absent-address NACK: exact class, then prove the bus
+        // fully recovered with an anchored byte-exact read.
         match ctrl.write(BAD_ADDR, &w).await {
             Err(ControllerIOError::AddressNack) => {}
-            Ok(()) => return Err("data_nack: write to an absent address succeeded"),
-            Err(_) => return Err("data_nack: wrong error class for the NACK"),
+            Ok(()) => return Err("queued_suffix_address_nack: write to an absent address succeeded"),
+            Err(_) => return Err("queued_suffix_address_nack: wrong error class for the NACK"),
         }
         let mut verify = [0u8; 32];
         op_read(ctrl, &mut verify, model, stats).await?;
         if !model.check_read(&verify) {
-            return Err("data_nack: post-NACK verify mismatch");
+            return Err("queued_suffix_address_nack: post-NACK verify mismatch");
         }
 
-        // Cancellation racing the late NACK: the drop lands before,
+        // Cancellation racing the absent-address NACK: the drop lands before,
         // around, and after NDF latches (~0.3-0.6 ms in), so recovery
         // variously runs with the fault already latched, latching
         // concurrently, or never — the wait_out_halting_fault
@@ -2174,20 +2175,20 @@ pub mod tests {
                 Either::First(Err(ControllerIOError::AddressNack)) => {}
                 Either::Second(()) => {}
                 Either::First(Ok(())) => {
-                    return Err("data_nack: raced write to an absent address succeeded");
+                    return Err("queued_suffix_address_nack: raced write to an absent address succeeded");
                 }
-                Either::First(Err(_)) => return Err("data_nack: raced write failed with wrong class"),
+                Either::First(Err(_)) => return Err("queued_suffix_address_nack: raced write failed with wrong class"),
             }
             let mut verify = [0u8; 32];
             op_read(ctrl, &mut verify, model, stats).await?;
             if !model.check_read(&verify) {
                 defmt::error!(
-                    "data_nack d={=u64}us: got={:02x} want={:02x}",
+                    "queued_suffix_address_nack d={=u64}us: got={:02x} want={:02x}",
                     d,
                     verify[..8],
                     model.buf[..8]
                 );
-                return Err("data_nack: post-race verify mismatch");
+                return Err("queued_suffix_address_nack: post-race verify mismatch");
             }
         }
 
@@ -2204,6 +2205,38 @@ pub mod tests {
             CTRL_RESET_STATS,
         ];
         b_ctl_write(ctrl, &msg, stats).map_err(|_| "audit_reset(b): failed")
+    }
+
+    /// Blocking counterpart of [`t_queued_suffix_address_nack`].
+    ///
+    /// The polled path has its own session and halted-fault recovery logic,
+    /// so a one-byte bad-address probe is not enough coverage. Drive a
+    /// multi-byte absent-address write, require the precise NACK class, then
+    /// use the existing anchored recovery helper to prove eventual byte-exact
+    /// traffic.
+    fn b_queued_suffix_address_nack(
+        ctrl: &mut ControllerI2c<'_, Blocking>,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        let mut write = [0u8; 12];
+        for (i, byte) in write.iter_mut().enumerate() {
+            *byte = 0x50 + i as u8;
+        }
+
+        match ctrl.blocking_write(BAD_ADDR, &write) {
+            Err(ControllerIOError::AddressNack) => {}
+            Ok(()) => return Err("blocking queued_suffix_address_nack: write to an absent address succeeded"),
+            Err(_) => return Err("blocking queued_suffix_address_nack: wrong error class for the NACK"),
+        }
+
+        let mut verify = [0u8; 32];
+        b_read(ctrl, &mut verify, model, stats)?;
+        if !model.check_read(&verify) {
+            return Err("blocking queued_suffix_address_nack: post-NACK verify mismatch");
+        }
+
+        Ok(())
     }
 
     /// Blocking-phase settle audit — same protocol as
@@ -2433,7 +2466,8 @@ pub mod tests {
 
     /// Blocking-path condensation of the async suite: short W/R traffic,
     /// every long read length, consecutive reads, repeated-START into a
-    /// long read, NACK recovery into a long read, and a 512-byte write.
+    /// long read, multi-byte NACK recovery into a long read, and a 512-byte
+    /// write.
     pub fn t_blocking_battery(
         ctrl: &mut ControllerI2c<'_, Blocking>,
         model: &mut Model,
@@ -2485,9 +2519,7 @@ pub mod tests {
             return Err("wr long read mismatch");
         }
 
-        if ctrl.blocking_write(BAD_ADDR, &[0x00]).is_ok() {
-            return Err("expected NACK");
-        }
+        b_queued_suffix_address_nack(ctrl, model, stats)?;
         b_read(ctrl, &mut big[..257], model, stats)?;
         if !model.check_read(&big[..257]) {
             return Err("post-NACK long read mismatch");
