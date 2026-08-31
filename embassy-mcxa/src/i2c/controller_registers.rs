@@ -17,10 +17,11 @@
 //! Scope: every PROTOCOL register — status, interrupts, DMA enables,
 //! commands, data, FIFO status — is reachable only through this
 //! facade; the driver holds no generic read/write/modify on any of
-//! them. The one deliberate exception is `set_configuration`, which
-//! touches init-only configuration registers (MCR/MCFGR*/MCCR0)
-//! through the PAC: they are outside the hot-path map, written once at
-//! construction, and never part of a transfer-time sequence.
+//! them. Initial configuration writes (MCR/MCFGR*/MCCR0) are likewise
+//! ordered by [`ControllerRegisters::configure`] inside this facade
+//! through the PAC: they are outside the hot-path map, used only during
+//! construction or controlled reconfiguration, and never part of a
+//! transfer-time sequence.
 
 #[path = "lpi2c_regs.rs"]
 mod lpi2c_regs;
@@ -33,10 +34,12 @@ use super::session::{
 };
 use super::{ControllerRxDma, ControllerTxDma};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
+use crate::i2c::Info;
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
-    Alf, Dmf, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param, Pltf, Stf,
+    Alf, Dmf, Dozen, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param,
+    Pltf, Stf,
 };
 use tock_registers::interfaces::{Readable, Writeable};
 
@@ -569,6 +572,7 @@ const _: () = {
 /// Safe controller-specific operations over the LPI2C register block.
 #[derive(Clone, Copy)]
 pub(super) struct ControllerRegisters {
+    pac: pac::lpi2c::Lpi2c,
     regs: &'static LpI2cRegisters,
 }
 
@@ -689,17 +693,67 @@ const _: () = {
 };
 
 impl ControllerRegisters {
-    pub(super) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    fn new(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
+            pac: regs,
             regs: lpi2c_regs::from_pac(regs),
         }
     }
 
+    /// Construct the controller facade from an instance's PAC handle. Outer
+    /// controller/session code deals only in this closed facade thereafter.
+    pub(super) fn from_info(info: &Info) -> Self {
+        Self::new(info.regs())
+    }
+
     /// Cross-check the hidden raw layout against the linked PAC before
-    /// a controller is configured. Keeping this entry point on the
-    /// facade means driver code never needs access to raw MMIO cells.
-    pub(super) fn check_layout(regs: pac::lpi2c::Lpi2c) {
-        lpi2c_regs::check_layout(regs);
+    /// a controller is configured.
+    fn check_layout(&self) {
+        lpi2c_regs::check_layout(self.pac);
+    }
+
+    /// Perform the complete, ordered controller setup sequence. The PAC-only
+    /// configuration registers stay inside the facade, next to the Tock
+    /// typed hot-path cells, so an outer driver cannot splice configuration
+    /// writes into a live transaction.
+    pub(super) fn configure(&self, input_hz: u32, target_hz: u32, ultra_fast: bool) {
+        self.check_layout();
+
+        critical_section::with(|_| self.modify_mcr(|w| w.set_men(false)));
+        self.reset_while_disabled();
+
+        critical_section::with(|_| {
+            self.modify_mcr(|w| w.set_rst(true));
+            // According to Reference Manual section 40.7.1.4, "There is no
+            // minimum delay required before clearing the software reset".
+            self.modify_mcr(|w| w.set_rst(false));
+            self.modify_mcr(|w| {
+                w.set_dozen(Dozen::Enabled);
+                w.set_dbgen(false);
+            });
+        });
+
+        // UltraFast (HS) mode requires programming MCCR1 and special START
+        // commands beyond what this driver currently supports. This stays
+        // after the reset sequence to preserve the constructor's established
+        // unsupported-configuration behavior.
+        if ultra_fast {
+            todo!("LPI2C UltraFast (HS) mode is not yet supported");
+        }
+        let (prescale, clklo, clkhi, sethold, datavd) = super::compute_baud_params(input_hz, target_hz);
+
+        critical_section::with(|_| {
+            self.pac.mcfgr1().modify(|w| w.set_prescale(prescale));
+            self.pac.mccr0().modify(|w| {
+                w.set_clklo(clklo);
+                w.set_clkhi(clkhi);
+                w.set_sethold(sethold);
+                w.set_datavd(datavd);
+            });
+            self.modify_mcr(|w| w.set_men(true));
+        });
+
+        self.clear_after_init();
     }
 
     // Raw word <-> PAC value type. Field meanings live in the PAC; the

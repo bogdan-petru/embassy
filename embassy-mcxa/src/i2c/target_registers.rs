@@ -21,11 +21,11 @@
 //!
 //! Scope: every PROTOCOL register — status, interrupts, DMA enables,
 //! data, address status — is reachable only through this facade; the
-//! driver holds no generic read/write/modify on any of them. The one
-//! deliberate exception is `set_configuration`, which touches
-//! init-only configuration registers (SCR/SCFGR1/SCFGR2/SAMR) through
-//! the PAC: they are outside the hot-path map, written once at
-//! construction, and never part of a transfer-time sequence.
+//! driver holds no generic read/write/modify on any of them. Initial
+//! configuration writes (SCR/SCFGR1/SCFGR2/SAMR) are likewise ordered by
+//! [`TargetRegisters::configure`] inside this facade through the PAC: they
+//! are outside the hot-path map, used only during construction or controlled
+//! reconfiguration, and never part of a transfer-time sequence.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
@@ -34,10 +34,11 @@ use core::sync::atomic::{Ordering, fence};
 mod lpi2c_regs;
 
 use self::lpi2c_regs::LpI2cRegisters;
-use super::{TargetRxDma, TargetTxDma};
+use super::{Address, SetupError, TargetRxDma, TargetTxDma};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, InvalidParameters, TransferOptions};
+use crate::i2c::Info;
 use crate::pac;
-use crate::pac::lpi2c::{Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
+use crate::pac::lpi2c::{Addrcfg, Filtdz, Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
 use tock_registers::interfaces::{Readable, Writeable};
 
 /// Hardware faults the target status register can report mid-transfer.
@@ -106,6 +107,7 @@ pub(super) enum ListenEvent {
 /// Safe target-specific operations over the LPI2C register block.
 #[derive(Clone, Copy)]
 pub(super) struct TargetRegisters {
+    pac: pac::lpi2c::Lpi2c,
     regs: &'static LpI2cRegisters,
 }
 
@@ -241,17 +243,156 @@ const _: () = {
 };
 
 impl TargetRegisters {
-    pub(super) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    fn new(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
+            pac: regs,
             regs: lpi2c_regs::from_pac(regs),
         }
     }
 
+    /// Construct the target facade from an instance's PAC handle. Target
+    /// orchestration works through the facade after this boundary.
+    pub(super) fn from_info(info: &Info) -> Self {
+        Self::new(info.regs())
+    }
+
     /// Cross-check the hidden raw layout against the linked PAC before
-    /// a target is configured. Driver code only receives this facade,
-    /// never the cells themselves.
-    pub(super) fn check_layout(regs: pac::lpi2c::Lpi2c) {
-        lpi2c_regs::check_layout(regs);
+    /// a target is configured.
+    fn check_layout(&self) {
+        lpi2c_regs::check_layout(self.pac);
+    }
+
+    /// Perform the complete, ordered target setup sequence. Configuration
+    /// registers are PAC-only because they are outside the transfer-time
+    /// layout, but they remain private to this facade so orchestration code
+    /// cannot splice setup writes into a live target response.
+    pub(super) fn configure(
+        &self,
+        address: &Address,
+        general_call: bool,
+        smbus_alert: bool,
+        datavd: u8,
+    ) -> Result<(), SetupError> {
+        self.check_layout();
+
+        critical_section::with(|_| {
+            // Disable the target.
+            self.pac.scr().modify(|w| w.set_sen(false));
+
+            // Soft-reset the target, read and write FIFOs.
+            self.reset_fifos();
+            self.pac.scr().modify(|w| w.set_rst(true));
+            // According to Reference Manual section 40.7.1.4, "There is no
+            // minimum delay required before clearing the software reset".
+            self.pac.scr().modify(|w| w.set_rst(false));
+
+            self.pac.scr().modify(|w| {
+                w.set_filtdz(Filtdz::FilterDisabled);
+                w.set_filten(false);
+            });
+
+            self.pac.scfgr1().modify(|w| {
+                w.set_rxstall(true);
+                w.set_txdstall(true);
+                // Stretch SCL during each address ACK until firmware
+                // acknowledges the address. Without this, address events
+                // do not queue: if firmware is delayed (busy system, slow
+                // ISR entry) past a complete transaction plus the next
+                // transaction's address, SASR is overwritten and the
+                // earlier transaction's event is silently lost — observed
+                // on FRDM-MCXA577 as a write dropped in its entirety when
+                // the target ran with artificial interrupt latency.
+                w.set_adrstall(true);
+                w.set_gcen(general_call);
+                w.set_saen(smbus_alert);
+            });
+
+            // Gate the target's SDA transitions to the SCL falling edge.
+            //
+            // With DATAVD=0 the target can change SDA as soon as its state
+            // machine advances. At the address-ACK → first-data-bit
+            // boundary, when transmit data is already available (no
+            // TXDSTALL stretch needed), that lets it release its ACK drive
+            // while SCL is still high. If the first data bit is 1, SDA
+            // then rises during SCL-high, which the controller correctly
+            // detects as a STOP condition it did not generate and reports
+            // as arbitration loss. Observed on FRDM-MCXA577: reads whose
+            // first data byte has the MSB set failed with ArbitrationLoss
+            // on roughly every other transfer; DATAVD > 0 eliminates it.
+            //
+            // Empirically ~250ns is not enough on FRDM-MCXA577; 1us
+            // eliminates the failure completely. The target stretches SCL
+            // as needed to honor the delay, so faster bus speeds remain
+            // correct, just marginally slower per byte.
+            self.pac.scfgr2().modify(|w| w.set_datavd(datavd));
+
+            // Configure address matching.
+            match address {
+                Address::Single(addr) => {
+                    let addr = *addr;
+                    self.pac.samr().write(|w| w.set_addr0(addr));
+                    self.pac.scfgr1().modify(|w| {
+                        w.set_addrcfg(if (0x00..=0x7f).contains(&addr) {
+                            Addrcfg::AddressMatch07Bit
+                        } else {
+                            Addrcfg::AddressMatch010Bit
+                        })
+                    });
+                }
+
+                Address::Dual(addr0, addr1) => {
+                    let (addr0, addr1) = (*addr0, *addr1);
+                    // Either both a 7-bit or both are 10-bit.
+                    if ((0x00..=0x7f).contains(&addr0) ^ (0x00..=0x7f).contains(&addr1))
+                        || ((0x80..=0x3ff).contains(&addr0) ^ (0x80..=0x3ff).contains(&addr1))
+                    {
+                        return Err(SetupError::InvalidAddress);
+                    }
+
+                    self.pac.samr().write(|w| {
+                        w.set_addr0(addr0);
+                        w.set_addr1(addr1);
+                    });
+                    self.pac.scfgr1().modify(|w| {
+                        w.set_addrcfg(if (0x00..=0x7f).contains(&addr0) {
+                            Addrcfg::AddressMatch07BitOrAddressMatch17Bit
+                        } else {
+                            Addrcfg::AddressMatch010BitOrAddressMatch110Bit
+                        })
+                    });
+                }
+
+                Address::Range(range) => {
+                    let (start, end) = (range.start, range.end);
+                    if ((0x00..=0x7f).contains(&start) ^ (0x00..=0x7f).contains(&end))
+                        || ((0x80..=0x3ff).contains(&start) ^ (0x80..=0x3ff).contains(&end))
+                    {
+                        return Err(SetupError::InvalidAddress);
+                    }
+
+                    self.pac.samr().write(|w| {
+                        w.set_addr0(start);
+                        w.set_addr1(end - 1);
+                    });
+                    self.pac.scfgr1().modify(|w| {
+                        w.set_addrcfg(if (0x00..=0x7f).contains(&start) {
+                            Addrcfg::FromAddressMatch07BitToAddressMatch17Bit
+                        } else {
+                            Addrcfg::FromAddressMatch010BitToAddressMatch110Bit
+                        })
+                    });
+                }
+            }
+
+            // Enable the target.
+            self.pac.scr().modify(|w| w.set_sen(true));
+
+            // Clear stale event flags left from before this
+            // (re)configuration.
+            self.clear_stale_events();
+
+            Ok(())
+        })
     }
 
     fn register_address(&self) -> usize {

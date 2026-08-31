@@ -74,7 +74,7 @@ use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
-use crate::pac::lpi2c::{Dozen, Prescale};
+use crate::pac::lpi2c::Prescale;
 use registers::{
     CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, StartAction, StartDrainStep, StopAction,
     StopStep, TransferFault,
@@ -182,7 +182,7 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         T::PERF_INT_INCR();
-        let registers = ControllerRegisters::new(T::info().regs());
+        let registers = ControllerRegisters::from_info(T::info());
         if registers.disable_interrupts_if_enabled() {
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
@@ -518,7 +518,7 @@ impl<'d> I2c<'d, Blocking> {
 impl<'d, M: Mode> I2c<'d, M> {
     #[inline(always)]
     fn registers(&self) -> ControllerRegisters {
-        ControllerRegisters::new(self.info.regs())
+        ControllerRegisters::from_info(self.info)
     }
 
     fn new_inner<T: Instance>(
@@ -564,52 +564,9 @@ impl<'d, M: Mode> I2c<'d, M> {
     }
 
     fn set_configuration(&self, config: &Config) {
-        // One-time cross-check of the Tock register map against the
-        // PAC's generated accessors (catches layout drift in either).
-        ControllerRegisters::check_layout(self.info.regs());
-
-        // Disable the controller.
-        critical_section::with(|_| self.info.regs().mcr().modify(|w| w.set_men(false)));
-
-        // Soft-reset the controller, read and write FIFOs.
-        self.registers().reset_while_disabled();
-        critical_section::with(|_| {
-            self.info.regs().mcr().modify(|w| w.set_rst(true));
-            // According to Reference Manual section 40.7.1.4, "There
-            // is no minimum delay required before clearing the
-            // software reset", therefore we clear it immediately.
-            self.info.regs().mcr().modify(|w| w.set_rst(false));
-
-            self.info.regs().mcr().modify(|w| {
-                w.set_dozen(Dozen::Enabled);
-                w.set_dbgen(false);
-            });
-        });
-
         let target_hz: u32 = config.speed.into();
-        // UltraFast (HS) mode requires programming MCCR1 and special start
-        // commands beyond what this driver currently supports. Leave it
-        // explicitly unimplemented until the HS path is wired up end-to-end.
-        if config.speed == Speed::UltraFast {
-            todo!("LPI2C UltraFast (HS) mode is not yet supported");
-        }
-        let (prescale, clklo, clkhi, sethold, datavd) = compute_baud_params(self.freq, target_hz);
-
-        critical_section::with(|_| {
-            self.info.regs().mcfgr1().modify(|w| w.set_prescale(prescale));
-            self.info.regs().mccr0().modify(|w| {
-                w.set_clklo(clklo);
-                w.set_clkhi(clkhi);
-                w.set_sethold(sethold);
-                w.set_datavd(datavd);
-            });
-
-            // Enable the controller.
-            self.info.regs().mcr().modify(|w| w.set_men(true));
-        });
-
-        // Clear all flags.
-        self.registers().clear_after_init();
+        self.registers()
+            .configure(self.freq, target_hz, config.speed == Speed::UltraFast);
     }
 
     /// Consume a session at its defined end, asserting it belongs to
