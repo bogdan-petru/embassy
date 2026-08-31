@@ -34,7 +34,7 @@ use core::sync::atomic::{Ordering, fence};
 mod lpi2c_regs;
 
 use self::lpi2c_regs::LpI2cRegisters;
-use super::{Address, SetupError, TargetRxDma, TargetTxDma};
+use super::{SetupError, TargetRxDma, TargetTxDma, ValidatedAddress};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, InvalidParameters, TransferOptions};
 use crate::pac;
 use crate::pac::lpi2c::{Addrcfg, Filtdz, Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
@@ -264,7 +264,7 @@ impl TargetRegisters {
     /// cannot splice setup writes into a live target response.
     pub(super) fn configure(
         &self,
-        address: &Address,
+        address: ValidatedAddress,
         general_call: bool,
         smbus_alert: bool,
         datavd: u8,
@@ -324,59 +324,49 @@ impl TargetRegisters {
 
             // Configure address matching.
             match address {
-                Address::Single(addr) => {
-                    let addr = *addr;
+                ValidatedAddress::Single7(addr) => {
                     self.pac.samr().write(|w| w.set_addr0(addr));
-                    self.pac.scfgr1().modify(|w| {
-                        w.set_addrcfg(if (0x00..=0x7f).contains(&addr) {
-                            Addrcfg::AddressMatch07Bit
-                        } else {
-                            Addrcfg::AddressMatch010Bit
-                        })
-                    });
+                    self.pac.scfgr1().modify(|w| w.set_addrcfg(Addrcfg::AddressMatch07Bit));
                 }
-
-                Address::Dual(addr0, addr1) => {
-                    let (addr0, addr1) = (*addr0, *addr1);
-                    // Either both a 7-bit or both are 10-bit.
-                    if ((0x00..=0x7f).contains(&addr0) ^ (0x00..=0x7f).contains(&addr1))
-                        || ((0x80..=0x3ff).contains(&addr0) ^ (0x80..=0x3ff).contains(&addr1))
-                    {
-                        return Err(SetupError::InvalidAddress);
-                    }
-
+                ValidatedAddress::Single10(addr) => {
+                    self.pac.samr().write(|w| w.set_addr0(addr));
+                    self.pac.scfgr1().modify(|w| w.set_addrcfg(Addrcfg::AddressMatch010Bit));
+                }
+                ValidatedAddress::Dual7(addr0, addr1) => {
                     self.pac.samr().write(|w| {
                         w.set_addr0(addr0);
                         w.set_addr1(addr1);
                     });
-                    self.pac.scfgr1().modify(|w| {
-                        w.set_addrcfg(if (0x00..=0x7f).contains(&addr0) {
-                            Addrcfg::AddressMatch07BitOrAddressMatch17Bit
-                        } else {
-                            Addrcfg::AddressMatch010BitOrAddressMatch110Bit
-                        })
-                    });
+                    self.pac
+                        .scfgr1()
+                        .modify(|w| w.set_addrcfg(Addrcfg::AddressMatch07BitOrAddressMatch17Bit));
                 }
-
-                Address::Range(range) => {
-                    let (start, end) = (range.start, range.end);
-                    if ((0x00..=0x7f).contains(&start) ^ (0x00..=0x7f).contains(&end))
-                        || ((0x80..=0x3ff).contains(&start) ^ (0x80..=0x3ff).contains(&end))
-                    {
-                        return Err(SetupError::InvalidAddress);
-                    }
-
+                ValidatedAddress::Dual10(addr0, addr1) => {
+                    self.pac.samr().write(|w| {
+                        w.set_addr0(addr0);
+                        w.set_addr1(addr1);
+                    });
+                    self.pac
+                        .scfgr1()
+                        .modify(|w| w.set_addrcfg(Addrcfg::AddressMatch010BitOrAddressMatch110Bit));
+                }
+                ValidatedAddress::Range7 { start, last } => {
                     self.pac.samr().write(|w| {
                         w.set_addr0(start);
-                        w.set_addr1(end - 1);
+                        w.set_addr1(last);
                     });
-                    self.pac.scfgr1().modify(|w| {
-                        w.set_addrcfg(if (0x00..=0x7f).contains(&start) {
-                            Addrcfg::FromAddressMatch07BitToAddressMatch17Bit
-                        } else {
-                            Addrcfg::FromAddressMatch010BitToAddressMatch110Bit
-                        })
+                    self.pac
+                        .scfgr1()
+                        .modify(|w| w.set_addrcfg(Addrcfg::FromAddressMatch07BitToAddressMatch17Bit));
+                }
+                ValidatedAddress::Range10 { start, last } => {
+                    self.pac.samr().write(|w| {
+                        w.set_addr0(start);
+                        w.set_addr1(last);
                     });
+                    self.pac
+                        .scfgr1()
+                        .modify(|w| w.set_addrcfg(Addrcfg::FromAddressMatch010BitToAddressMatch110Bit));
                 }
             }
 
@@ -386,9 +376,9 @@ impl TargetRegisters {
             // Clear stale event flags left from before this
             // (re)configuration.
             self.clear_stale_events();
+        });
 
-            Ok(())
-        })
+        Ok(())
     }
 
     fn register_address(&self) -> usize {

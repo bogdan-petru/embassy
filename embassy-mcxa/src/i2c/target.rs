@@ -99,7 +99,8 @@ pub(in crate::i2c) use registers::TargetRegisters;
 pub enum SetupError {
     /// Clock configuration error.
     ClockSetup(ClockError),
-    /// Invalid Address
+    /// Address is out of range, mixes address widths, or describes an empty
+    /// or reversed range.
     InvalidAddress,
     /// Other internal errors or unexpected state.
     Other,
@@ -237,12 +238,93 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 /// I2C target addresses.
 #[derive(Clone)]
 pub enum Address {
-    /// Single address
+    /// One 7-bit (`0x000..=0x07f`) or 10-bit (`0x080..=0x3ff`) address.
     Single(u16),
-    /// Two addresses
+    /// Two addresses of the same width within `0x000..=0x3ff`.
     Dual(u16, u16),
-    /// Range of addresses
+    /// End-exclusive range of addresses.
+    ///
+    /// The start and final included address (`end - 1`) must have the same
+    /// width. `end` may be one past a width boundary, so `0x20..0x30` is a
+    /// 7-bit range, `0x00..0x80` covers every 7-bit address, and
+    /// `0x80..0x400` covers the representable 10-bit range.
     Range(Range<u16>),
+}
+
+/// A target address plan that has passed the public API's validation rules.
+///
+/// Only [`Address::validate`] can construct this. The register facade accepts
+/// this proof rather than raw `u16`s, so a future setup path cannot silently
+/// rely on the PAC setters' truncating masks or reintroduce range-end
+/// arithmetic at an MMIO write site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidatedAddress {
+    Single7(u16),
+    Single10(u16),
+    Dual7(u16, u16),
+    Dual10(u16, u16),
+    Range7 { start: u16, last: u16 },
+    Range10 { start: u16, last: u16 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddressWidth {
+    SevenBit,
+    TenBit,
+}
+
+impl Address {
+    /// Validate this public address description before any peripheral,
+    /// interrupt, DMA, or pin state is changed.
+    fn validate(&self) -> Result<ValidatedAddress, SetupError> {
+        fn width(address: u16) -> Option<AddressWidth> {
+            match address {
+                0x000..=0x07f => Some(AddressWidth::SevenBit),
+                0x080..=0x3ff => Some(AddressWidth::TenBit),
+                _ => None,
+            }
+        }
+
+        match self {
+            Address::Single(address) => match width(*address) {
+                Some(AddressWidth::SevenBit) => Ok(ValidatedAddress::Single7(*address)),
+                Some(AddressWidth::TenBit) => Ok(ValidatedAddress::Single10(*address)),
+                None => Err(SetupError::InvalidAddress),
+            },
+            Address::Dual(first, second) => match (width(*first), width(*second)) {
+                (Some(AddressWidth::SevenBit), Some(AddressWidth::SevenBit)) => {
+                    Ok(ValidatedAddress::Dual7(*first, *second))
+                }
+                (Some(AddressWidth::TenBit), Some(AddressWidth::TenBit)) => {
+                    Ok(ValidatedAddress::Dual10(*first, *second))
+                }
+                _ => Err(SetupError::InvalidAddress),
+            },
+            Address::Range(range) => {
+                // `Range` is end-exclusive. Derive `last` only after an
+                // empty/reversed range has been rejected, so no release-mode
+                // wrap can turn `0..0` into a catch-all address match.
+                let Some(last) = range.end.checked_sub(1) else {
+                    return Err(SetupError::InvalidAddress);
+                };
+                if range.start > last {
+                    return Err(SetupError::InvalidAddress);
+                }
+
+                match (width(range.start), width(last)) {
+                    (Some(AddressWidth::SevenBit), Some(AddressWidth::SevenBit)) => Ok(ValidatedAddress::Range7 {
+                        start: range.start,
+                        last,
+                    }),
+                    (Some(AddressWidth::TenBit), Some(AddressWidth::TenBit)) => Ok(ValidatedAddress::Range10 {
+                        start: range.start,
+                        last,
+                    }),
+                    _ => Err(SetupError::InvalidAddress),
+                }
+            }
+        }
+    }
 }
 
 impl Default for Address {
@@ -360,6 +442,7 @@ impl<'d, M: Mode> I2c<'d, M> {
         scl: Peri<'d, impl SclPin<T>>,
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
+        address: ValidatedAddress,
         mode: M,
     ) -> Result<Self, SetupError> {
         let ClockConfig { power, source, div } = config.clock_config;
@@ -391,19 +474,15 @@ impl<'d, M: Mode> I2c<'d, M> {
             _wg: parts.wake_guard,
         };
 
-        inst.set_configuration(&config)?;
+        inst.set_configuration(&config, address)?;
 
         Ok(inst)
     }
 
-    fn set_configuration(&self, config: &Config) -> Result<(), SetupError> {
+    fn set_configuration(&self, config: &Config, address: ValidatedAddress) -> Result<(), SetupError> {
         let datavd = (self.freq / 1_000_000).clamp(1, 63) as u8;
-        self.registers().configure(
-            &config.address,
-            config.general_call.into(),
-            config.smbus_alert.into(),
-            datavd,
-        )
+        self.registers()
+            .configure(address, config.general_call.into(), config.smbus_alert.into(), datavd)
     }
 
     /// Resets both TX and RX FIFOs dropping their contents.
@@ -635,7 +714,8 @@ impl<'d> I2c<'d, Blocking> {
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
     ) -> Result<Self, SetupError> {
-        Self::new_inner(peri, scl, sda, config, Blocking)
+        let address = config.address.validate()?;
+        Self::new_inner(peri, scl, sda, config, address, Blocking)
     }
 }
 
@@ -665,12 +745,15 @@ impl<'d> I2c<'d, Async> {
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, SetupError> {
+        let address = config.address.validate()?;
+        let inst = Self::new_inner(peri, scl, sda, config, address, Async)?;
+
         T::Interrupt::unpend();
 
         // Safety: `_irq` ensures an Interrupt Handler exists.
         unsafe { T::Interrupt::enable() };
 
-        Self::new_inner(peri, scl, sda, config, Async)
+        Ok(inst)
     }
 }
 
@@ -833,10 +916,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, SetupError> {
-        T::Interrupt::unpend();
-
-        // Safety: `_irq` ensures an Interrupt Handler exists.
-        unsafe { T::Interrupt::enable() };
+        let address = config.address.validate()?;
 
         // enable this channel's interrupt
         let tx_dma = DmaChannel::new(tx_dma);
@@ -845,18 +925,26 @@ impl<'d> I2c<'d, Dma<'d>> {
         tx_dma.enable_interrupt();
         rx_dma.enable_interrupt();
 
-        Self::new_inner(
+        let inst = Self::new_inner(
             peri,
             scl,
             sda,
             config,
+            address,
             Dma {
                 tx_dma,
                 rx_dma,
                 tx_request: T::TX_DMA_REQUEST,
                 rx_request: T::RX_DMA_REQUEST,
             },
-        )
+        )?;
+
+        T::Interrupt::unpend();
+
+        // Safety: `_irq` ensures an Interrupt Handler exists.
+        unsafe { T::Interrupt::enable() };
+
+        Ok(inst)
     }
 
     /// Brand this target's RX channel/request wiring for the register
@@ -1392,5 +1480,37 @@ impl<'d, M: Mode> Drop for I2c<'d, M> {
     fn drop(&mut self) {
         self._scl.set_as_disabled();
         self._sda.set_as_disabled();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_valid(address: Address) -> bool {
+        address.validate().is_ok()
+    }
+
+    #[test]
+    fn target_address_validation_accepts_only_representable_same_width_plans() {
+        assert!(is_valid(Address::Single(0x00)));
+        assert!(is_valid(Address::Single(0x7f)));
+        assert!(is_valid(Address::Single(0x80)));
+        assert!(is_valid(Address::Single(0x3ff)));
+        assert!(!is_valid(Address::Single(0x400)));
+
+        assert!(is_valid(Address::Dual(0x20, 0x30)));
+        assert!(is_valid(Address::Dual(0x80, 0x3ff)));
+        assert!(!is_valid(Address::Dual(0x7f, 0x80)));
+        assert!(!is_valid(Address::Dual(0x400, 0x401)));
+
+        assert!(is_valid(Address::Range(0x20..0x30)));
+        assert!(is_valid(Address::Range(0x7f..0x80)));
+        assert!(is_valid(Address::Range(0x00..0x80)));
+        assert!(is_valid(Address::Range(0x80..0x400)));
+        assert!(!is_valid(Address::Range(0x00..0x00)));
+        assert!(!is_valid(Address::Range(0x31..0x30)));
+        assert!(!is_valid(Address::Range(0x7f..0x81)));
+        assert!(!is_valid(Address::Range(0x3ff..0x401)));
     }
 }

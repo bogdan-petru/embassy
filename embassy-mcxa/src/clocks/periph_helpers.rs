@@ -930,72 +930,38 @@ pub struct Lpi2cConfig {
     pub(crate) instance: Lpi2cInstance,
 }
 
-impl SPConfHelper for Lpi2cConfig {
-    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
-        // check that source is suitable
-        let mrcc0 = crate::pac::MRCC0;
-
-        let (clkdiv, clksel) = match self.instance {
-            Lpi2cInstance::Lpi2c0 => (mrcc0.mrcc_lpi2c0_clkdiv(), mrcc0.mrcc_lpi2c0_clksel()),
-            Lpi2cInstance::Lpi2c1 => (mrcc0.mrcc_lpi2c1_clkdiv(), mrcc0.mrcc_lpi2c1_clksel()),
-            Lpi2cInstance::Lpi2c2 => (mrcc0.mrcc_lpi2c2_clkdiv(), mrcc0.mrcc_lpi2c2_clksel()),
-            Lpi2cInstance::Lpi2c3 => (mrcc0.mrcc_lpi2c3_clkdiv(), mrcc0.mrcc_lpi2c3_clksel()),
-            #[cfg(feature = "mcxa5xx")]
-            Lpi2cInstance::Lpi2c4 => (mrcc0.mrcc_lpi2c4_clkdiv(), mrcc0.mrcc_lpi2c4_clksel()),
+impl Lpi2cConfig {
+    /// Validate the selected source and return the LPI2C functional-clock
+    /// frequency without changing an MRCC or peripheral register.
+    ///
+    /// I2C constructors use this to validate their complete register
+    /// configuration before they enable interrupts, claim DMA channels, or
+    /// mux pins. `pre_enable_config` below performs the corresponding MRCC
+    /// writes only after this read-only calculation has succeeded.
+    pub(crate) fn functional_clock_hz(&self, clocks: &Clocks) -> Result<u32, ClockError> {
+        let Some(source_hz) = self.source_clock_hz(clocks)? else {
+            return Ok(0);
         };
+        self.validate_functional_clock_hz(clocks, source_hz)
+    }
 
-        let (freq, variant) = match self.source {
-            Lpi2cClockSel::FroLfDiv => {
-                let freq = clocks.ensure_fro_lf_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc0;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I0ClkrootFunc0;
-
-                (freq, mux)
-            }
-            Lpi2cClockSel::FroHfDiv => {
-                let freq = clocks.ensure_fro_hf_div_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc2;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I2ClkrootFunc2;
-
-                (freq, mux)
-            }
+    fn source_clock_hz(&self, clocks: &Clocks) -> Result<Option<u32>, ClockError> {
+        match self.source {
+            Lpi2cClockSel::FroLfDiv => clocks.ensure_fro_lf_div_active(&self.power).map(Some),
+            Lpi2cClockSel::FroHfDiv => clocks.ensure_fro_hf_div_active(&self.power).map(Some),
             #[cfg(feature = "mcxa2xx")]
             #[cfg(not(feature = "sosc-as-gpio"))]
-            Lpi2cClockSel::ClkIn => {
-                let freq = clocks.ensure_clk_in_active(&self.power)?;
-                (freq, Lpi2cClkselMux::ClkrootFunc3)
-            }
-            Lpi2cClockSel::Clk1M => {
-                let freq = clocks.ensure_clk_1m_active(&self.power)?;
-                #[cfg(feature = "mcxa2xx")]
-                let mux = Lpi2cClkselMux::ClkrootFunc5;
-                #[cfg(feature = "mcxa5xx")]
-                let mux = Lpi2cClkselMux::I5ClkrootFunc5;
-
-                (freq, mux)
-            }
+            Lpi2cClockSel::ClkIn => clocks.ensure_clk_in_active(&self.power).map(Some),
+            Lpi2cClockSel::Clk1M => clocks.ensure_clk_1m_active(&self.power).map(Some),
             #[cfg(feature = "mcxa2xx")]
-            Lpi2cClockSel::Pll1ClkDiv => {
-                let freq = clocks.ensure_pll1_clk_div_active(&self.power)?;
-                (freq, Lpi2cClkselMux::ClkrootFunc6)
-            }
-            Lpi2cClockSel::None => {
-                // no ClkrootFunc7, just write manually for now
-                clksel.write(|w| w.0 = 0b111);
-                clkdiv.modify(|w| {
-                    w.set_reset(ClkdivReset::Off);
-                    w.set_halt(ClkdivHalt::Off);
-                });
-                return Ok(PreEnableParts::empty());
-            }
-        };
-        let div = self.div.into_divisor();
-        let expected = freq / div;
-        // 22.3.2 peripheral clock max functional clock limits
+            Lpi2cClockSel::Pll1ClkDiv => clocks.ensure_pll1_clk_div_active(&self.power).map(Some),
+            Lpi2cClockSel::None => Ok(None),
+        }
+    }
+
+    fn validate_functional_clock_hz(&self, clocks: &Clocks, source_hz: u32) -> Result<u32, ClockError> {
+        let expected = source_hz / self.div.into_divisor();
+        // 22.3.2 peripheral clock max functional clock limits.
         let power = match self.power {
             PoweredClock::NormalEnabledDeepSleepDisabled => clocks.active_power,
             PoweredClock::AlwaysEnabled => clocks.lp_power,
@@ -1019,6 +985,68 @@ impl SPConfHelper for Lpi2cConfig {
                 reason: "exceeds max rating",
             });
         }
+
+        Ok(expected)
+    }
+}
+
+impl SPConfHelper for Lpi2cConfig {
+    fn pre_enable_config(&self, clocks: &Clocks) -> Result<PreEnableParts, ClockError> {
+        // check that source is suitable
+        let mrcc0 = crate::pac::MRCC0;
+
+        let (clkdiv, clksel) = match self.instance {
+            Lpi2cInstance::Lpi2c0 => (mrcc0.mrcc_lpi2c0_clkdiv(), mrcc0.mrcc_lpi2c0_clksel()),
+            Lpi2cInstance::Lpi2c1 => (mrcc0.mrcc_lpi2c1_clkdiv(), mrcc0.mrcc_lpi2c1_clksel()),
+            Lpi2cInstance::Lpi2c2 => (mrcc0.mrcc_lpi2c2_clkdiv(), mrcc0.mrcc_lpi2c2_clksel()),
+            Lpi2cInstance::Lpi2c3 => (mrcc0.mrcc_lpi2c3_clkdiv(), mrcc0.mrcc_lpi2c3_clksel()),
+            #[cfg(feature = "mcxa5xx")]
+            Lpi2cInstance::Lpi2c4 => (mrcc0.mrcc_lpi2c4_clkdiv(), mrcc0.mrcc_lpi2c4_clksel()),
+        };
+
+        let Some(freq) = self.source_clock_hz(clocks)? else {
+            // no ClkrootFunc7, just write manually for now
+            clksel.write(|w| w.0 = 0b111);
+            clkdiv.modify(|w| {
+                w.set_reset(ClkdivReset::Off);
+                w.set_halt(ClkdivHalt::Off);
+            });
+            return Ok(PreEnableParts::empty());
+        };
+
+        let variant = match self.source {
+            Lpi2cClockSel::FroLfDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc0;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I0ClkrootFunc0;
+
+                mux
+            }
+            Lpi2cClockSel::FroHfDiv => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc2;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I2ClkrootFunc2;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            #[cfg(not(feature = "sosc-as-gpio"))]
+            Lpi2cClockSel::ClkIn => Lpi2cClkselMux::ClkrootFunc3,
+            Lpi2cClockSel::Clk1M => {
+                #[cfg(feature = "mcxa2xx")]
+                let mux = Lpi2cClkselMux::ClkrootFunc5;
+                #[cfg(feature = "mcxa5xx")]
+                let mux = Lpi2cClkselMux::I5ClkrootFunc5;
+
+                mux
+            }
+            #[cfg(feature = "mcxa2xx")]
+            Lpi2cClockSel::Pll1ClkDiv => Lpi2cClkselMux::ClkrootFunc6,
+            Lpi2cClockSel::None => unreachable!("None source returned a clock frequency"),
+        };
+        self.validate_functional_clock_hz(clocks, freq)?;
 
         apply_div4!(self, clksel, clkdiv, variant, freq)
     }

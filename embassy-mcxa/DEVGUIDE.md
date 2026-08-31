@@ -553,6 +553,13 @@ disagree.
   valid range, check it and return a `BadConfig`-style error (as the clock
   `pre_enable_config` does against `fmax`). Silently truncating a value with
   `& 0xF` turns a user mistake into a hard-to-debug runtime fault.
+* **Pass validated plans, not raw configuration, into MMIO.** Validate public
+  input before construction changes pins, interrupts, DMA, or peripheral state
+  whenever its bound is already known. If a field depends on the selected
+  functional clock, derive and validate it before the register facade resets
+  or configures the peripheral. Make that result a private proof/plan accepted
+  by the facade, so a later call site cannot bypass the validation and rely on
+  a PAC setter's masking behavior.
 
 #### Implementing Upstream Trait Contracts
 

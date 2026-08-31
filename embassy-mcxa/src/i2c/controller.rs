@@ -4,7 +4,7 @@
 //! Circuit (LPI2C) controller, supporting blocking,
 //! interrupt-only async, and DMA async modes of operation.
 //!
-//! The driver support all transfer speeds except for Fast Mode+.
+//! The driver supports Standard, Fast, and Fast-mode Plus transfers.
 //!
 //! ## Features
 //!
@@ -13,8 +13,10 @@
 //! - **DMA Support**: Enables high-performance data transfers using
 //! DMA.
 //! - **Configurable Bus Speeds**: Supports standard (100 kHz), fast
-//! (400 kHz), and fast-plus (1 MHz) modes. Ultra-fast (3.4 MHz) mode
-//! is not yet implemented.
+//! (400 kHz), and fast-plus (1 MHz) modes. The legacy
+//! [`Speed::UltraFast`] variant denotes 3.4-Mbit/s high-speed I2C and is
+//! rejected with [`SetupError::UnsupportedSpeed`] until its distinct
+//! protocol setup is implemented and verified.
 //! - **Error Handling**: Comprehensive error reporting, including
 //! FIFO errors, arbitration loss, and address NACK conditions.
 //! - **Embedded HAL Compatibility**: Implements traits from
@@ -76,8 +78,8 @@ use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::Prescale;
 use registers::{
-    CommandStep, ControllerAction, ControllerStatusError, StartAction, StartDrainStep, StopAction, StopStep,
-    TransferFault,
+    CommandStep, ControllerAction, ControllerSetup, ControllerStatusError, StartAction, StartDrainStep, StopAction,
+    StopStep, TransferFault,
 };
 
 // Controller protocol MMIO is private to this driver tree. The target driver
@@ -101,6 +103,12 @@ use session::{Session, SessionRxStep, StartReservation};
 pub enum SetupError {
     /// Clock configuration error.
     ClockSetup(ClockError),
+    /// The requested bus speed needs a controller mode this driver does not
+    /// yet implement.
+    UnsupportedSpeed,
+    /// An enabled [`PinLowTimeout`] cannot be represented by the current
+    /// functional clock and derived LPI2C prescaler.
+    PinLowTimeoutOutOfRange,
     /// Other internal errors or unexpected state.
     Other,
 }
@@ -205,7 +213,11 @@ pub enum Speed {
     Fast,
     /// 1 Mbit/sec
     FastPlus,
-    /// 3.4 Mbit/sec
+    /// 3.4-Mbit/s high-speed I2C.
+    ///
+    /// Kept for source compatibility, but this driver does not yet perform
+    /// the required high-speed setup. Constructors and `SetConfig` return
+    /// [`SetupError::UnsupportedSpeed`] instead of touching the peripheral.
     UltraFast,
 }
 
@@ -218,6 +230,52 @@ impl From<Speed> for u32 {
             Speed::UltraFast => 3_400_000,
         }
     }
+}
+
+/// A controller speed which is supported by this driver's complete setup and
+/// command protocol.
+///
+/// Its constructor is private to this module. Configuration code must carry
+/// this proof into the register facade, so no MMIO setup path can accidentally
+/// revive the unsupported high-speed command encoding.
+#[derive(Clone, Copy)]
+struct SupportedSpeed(u32);
+
+impl Speed {
+    fn supported(self) -> Result<SupportedSpeed, SetupError> {
+        match self {
+            Speed::Standard => Ok(SupportedSpeed(100_000)),
+            Speed::Fast => Ok(SupportedSpeed(400_000)),
+            Speed::FastPlus => Ok(SupportedSpeed(1_000_000)),
+            Speed::UltraFast => Err(SetupError::UnsupportedSpeed),
+        }
+    }
+}
+
+impl SupportedSpeed {
+    pub(super) const fn hertz(self) -> u32 {
+        self.0
+    }
+}
+
+/// Hardware watchdog for SCL or SDA being held low.
+///
+/// This is deliberately separate from [`Config::transfer_timeout`]: the
+/// latter is a software forward-progress budget, while this configures
+/// `MCFGR3[PINLOW]` in hardware. It is disabled by default so existing users
+/// keep their current clock-stretching semantics.
+#[derive(Clone, Copy, Default)]
+pub enum PinLowTimeout {
+    /// Do not enable the hardware pin-low watchdog.
+    #[default]
+    Disabled,
+    /// Fail a transfer if either bus line stays low for this long.
+    ///
+    /// The requested duration is rounded up to the hardware's 256-cycle
+    /// quantum after the selected LPI2C prescaler. A zero or unrepresentable
+    /// duration returns [`SetupError::PinLowTimeoutOutOfRange`] rather than
+    /// being truncated by the PAC register setter.
+    Enabled(embassy_time::Duration),
 }
 
 /// Compute LPI2C controller MCFGR1.PRESCALE + MCCR0 fields from peripheral
@@ -416,6 +474,13 @@ pub struct Config {
     /// bus.
     pub allow_chunked_reads: bool,
 
+    /// Hardware watchdog for a physically stuck-low SCL or SDA line.
+    ///
+    /// This is disabled by default. Enable it only after choosing a bound
+    /// compatible with the devices' legitimate clock-stretching behavior;
+    /// see [`PinLowTimeout`].
+    pub pin_low_timeout: PinLowTimeout,
+
     /// Budget for forward progress within a transfer: the wait for one
     /// received byte, for the command FIFO to drain, or for a DMA
     /// transfer to complete (scaled by length).
@@ -435,6 +500,7 @@ impl Default for Config {
             // Atomic transactions by default; opting out is a deliberate
             // per-device decision.
             allow_chunked_reads: false,
+            pin_low_timeout: PinLowTimeout::Disabled,
             transfer_timeout: embassy_time::Duration::from_millis(100),
         }
     }
@@ -468,7 +534,6 @@ pub struct I2c<'d, M: Mode> {
     _scl: Peri<'d, AnyPin>,
     _sda: Peri<'d, AnyPin>,
     mode: M,
-    is_hs: bool,
     /// See [`Config::allow_chunked_reads`].
     allow_chunked_reads: bool,
     /// See [`Config::transfer_timeout`].
@@ -515,7 +580,8 @@ impl<'d> I2c<'d, Blocking> {
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
     ) -> Result<Self, SetupError> {
-        Self::new_inner(peri, scl, sda, config, Blocking)
+        let setup = Self::construction_setup::<T>(&config)?;
+        Self::new_inner(peri, scl, sda, config, setup, Blocking)
     }
 }
 
@@ -525,11 +591,34 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.info.controller_registers()
     }
 
+    /// Build every user-controlled controller register value before a
+    /// constructor changes interrupt, DMA, pin, or LPI2C state.
+    ///
+    /// `Lpi2cConfig::functional_clock_hz` reads the already-initialized
+    /// clock plan without programming MRCC. The resulting `ControllerSetup`
+    /// is the only configuration value that crosses into the MMIO facade.
+    fn construction_setup<T: Instance>(config: &Config) -> Result<ControllerSetup, SetupError> {
+        let speed = config.speed.supported()?;
+        let ClockConfig { power, source, div } = config.clock_config;
+        let clock = Lpi2cConfig {
+            power,
+            source,
+            div,
+            instance: T::CLOCK_INSTANCE,
+        };
+        let input_hz = crate::clocks::with_clocks(|clocks| clock.functional_clock_hz(clocks))
+            .ok_or(SetupError::ClockSetup(ClockError::NeverInitialized))?
+            .map_err(SetupError::ClockSetup)?;
+
+        ControllerSetup::new(input_hz, speed, config.pin_low_timeout)
+    }
+
     fn new_inner<T: Instance>(
         _peri: Peri<'d, T>,
         scl: Peri<'d, impl SclPin<T>>,
         sda: Peri<'d, impl SdaPin<T>>,
         config: Config,
+        setup: ControllerSetup,
         mode: M,
     ) -> Result<Self, SetupError> {
         let ClockConfig { power, source, div } = config.clock_config;
@@ -555,22 +644,19 @@ impl<'d, M: Mode> I2c<'d, M> {
             _scl,
             _sda,
             mode,
-            is_hs: config.speed == Speed::UltraFast,
             allow_chunked_reads: config.allow_chunked_reads,
             timeout: config.transfer_timeout,
             freq: parts.freq,
             _wg: parts.wake_guard,
         };
 
-        inst.set_configuration(&config);
+        inst.set_configuration(setup);
 
         Ok(inst)
     }
 
-    fn set_configuration(&self, config: &Config) {
-        let target_hz: u32 = config.speed.into();
-        self.registers()
-            .configure(self.freq, target_hz, config.speed == Speed::UltraFast);
+    fn set_configuration(&self, setup: ControllerSetup) {
+        self.registers().configure(setup)
     }
 
     /// Consume a session at its defined end, asserting it belongs to
@@ -629,8 +715,7 @@ impl<'d, M: Mode> I2c<'d, M> {
 
     /// Form a semantic START action after the public address preflight.
     fn start_action(&self, address: u8, read: bool) -> StartAction {
-        StartAction::new(address, read, self.is_hs)
-            .expect("i2c: checked seven-bit address could not form a START action")
+        StartAction::new(address, read).expect("i2c: checked seven-bit address could not form a START action")
     }
 
     /// Attempt one active command on a live session. The facade combines
@@ -1669,12 +1754,15 @@ impl<'d> I2c<'d, Async> {
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, SetupError> {
+        let setup = Self::construction_setup::<T>(&config)?;
+        let inst = Self::new_inner(peri, scl, sda, config, setup, Async)?;
+
         T::Interrupt::unpend();
 
         // Safety: `_irq` ensures an Interrupt Handler exists.
         unsafe { T::Interrupt::enable() };
 
-        Self::new_inner(peri, scl, sda, config, Async)
+        Ok(inst)
     }
 }
 
@@ -1972,10 +2060,7 @@ impl<'d> I2c<'d, Dma<'d>> {
         _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: Config,
     ) -> Result<Self, SetupError> {
-        T::Interrupt::unpend();
-
-        // Safety: `_irq` ensures an Interrupt Handler exists.
-        unsafe { T::Interrupt::enable() };
+        let setup = Self::construction_setup::<T>(&config)?;
 
         // enable this channel's interrupt
         let tx_dma = DmaChannel::new(tx_dma);
@@ -1984,18 +2069,26 @@ impl<'d> I2c<'d, Dma<'d>> {
         tx_dma.enable_interrupt();
         rx_dma.enable_interrupt();
 
-        Self::new_inner(
+        let inst = Self::new_inner(
             peri,
             scl,
             sda,
             config,
+            setup,
             Dma {
                 tx_dma,
                 rx_dma,
                 tx_request: T::TX_DMA_REQUEST,
                 rx_request: T::RX_DMA_REQUEST,
             },
-        )
+        )?;
+
+        T::Interrupt::unpend();
+
+        // Safety: `_irq` ensures an Interrupt Handler exists.
+        unsafe { T::Interrupt::enable() };
+
+        Ok(inst)
     }
 }
 
@@ -2402,6 +2495,22 @@ impl<'d, M: Mode> embedded_hal_1::i2c::ErrorType for I2c<'d, M> {
     type Error = IOError;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_implemented_speeds_can_cross_the_setup_boundary() {
+        assert!(Speed::Standard.supported().is_ok());
+        assert!(Speed::Fast.supported().is_ok());
+        assert!(Speed::FastPlus.supported().is_ok());
+        assert!(matches!(
+            Speed::UltraFast.supported(),
+            Err(SetupError::UnsupportedSpeed)
+        ));
+    }
+}
+
 impl<'d, M: Mode> embedded_hal_1::i2c::I2c for I2c<'d, M> {
     fn transaction(
         &mut self,
@@ -2500,10 +2609,11 @@ impl<'d, M: Mode> embassy_embedded_hal::SetConfig for I2c<'d, M> {
     type ConfigError = SetupError;
 
     fn set_config(&mut self, config: &Self::Config) -> Result<(), SetupError> {
-        self.is_hs = config.speed == Speed::UltraFast;
+        let speed = config.speed.supported()?;
+        let setup = ControllerSetup::new(self.freq, speed, config.pin_low_timeout)?;
+        self.set_configuration(setup);
         self.allow_chunked_reads = config.allow_chunked_reads;
         self.timeout = config.transfer_timeout;
-        self.set_configuration(config);
         Ok(())
     }
 }

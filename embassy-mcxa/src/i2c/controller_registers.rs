@@ -32,13 +32,13 @@ use super::session::{
     StartTransitionPermit, StopCompleted, StopFault, StopFinalizeFault, StopFinalized, StopTransitionPermit, StopWait,
     TxDmaPermit,
 };
-use super::{ControllerRxDma, ControllerTxDma};
+use super::{ControllerRxDma, ControllerTxDma, PinLowTimeout, SetupError, SupportedSpeed};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
     Alf, Dmf, Dozen, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param,
-    Pltf, Stf,
+    Pltf, Prescale, Stf,
 };
 use tock_registers::interfaces::{Readable, Writeable};
 
@@ -313,7 +313,6 @@ enum ControllerActionKind {
 struct StartSpec {
     address: u8,
     read: bool,
-    high_speed: bool,
 }
 
 impl ControllerAction {
@@ -331,27 +330,16 @@ impl ControllerAction {
 impl StartAction {
     /// Construct a seven-bit START action. Invalid addresses cannot be
     /// represented by this type.
-    pub(super) const fn new(address: u8, read: bool, high_speed: bool) -> Option<Self> {
+    pub(super) const fn new(address: u8, read: bool) -> Option<Self> {
         if address < 0x80 {
-            Some(Self(StartSpec {
-                address,
-                read,
-                high_speed,
-            }))
+            Some(Self(StartSpec { address, read }))
         } else {
             None
         }
     }
 
     fn encode(self) -> (ControllerCommand, u8) {
-        (
-            if self.0.high_speed {
-                ControllerCommand::START_HS
-            } else {
-                ControllerCommand::START
-            },
-            self.0.address << 1 | u8::from(self.0.read),
-        )
+        (ControllerCommand::START, self.0.address << 1 | u8::from(self.0.read))
     }
 
     pub(super) fn is_read(self) -> bool {
@@ -560,8 +548,8 @@ const _: () = {
     assert!(!RecoveryClose::ReleaseAddressedRead.batch().fits(3, 4));
     assert!(!RecoveryClose::ReleaseAddressedRead.batch().fits(5, 4));
 
-    assert!(matches!(StartAction::new(0x7f, false, false), Some(_)));
-    assert!(matches!(StartAction::new(0x80, false, false), None));
+    assert!(matches!(StartAction::new(0x7f, false), Some(_)));
+    assert!(matches!(StartAction::new(0x80, false), None));
     assert!(matches!(ControllerRegisters::encode_receive(1), Some(0)));
     assert!(matches!(ControllerRegisters::encode_receive(256), Some(255)));
     assert!(matches!(ControllerRegisters::encode_receive(0), None));
@@ -691,6 +679,80 @@ const _: () = {
     assert!(!dma_buffer_fits(DMA_MAX_TRANSFER_SIZE.saturating_add(1)));
 };
 
+/// A validated `MCFGR3[PINLOW]` field value.
+///
+/// The PAC setter masks its input to 12 bits. Keeping the range proof here
+/// makes an out-of-range public duration fail before the register facade
+/// disables or resets the controller, rather than silently shortening the
+/// hardware watchdog.
+#[derive(Clone, Copy)]
+struct PinLowCycles(u16);
+
+impl PinLowCycles {
+    fn from_timeout(timeout: PinLowTimeout, input_hz: u32, prescale: Prescale) -> Result<Self, SetupError> {
+        match timeout {
+            PinLowTimeout::Disabled => Ok(Self(0)),
+            PinLowTimeout::Enabled(duration) => {
+                let duration_ns = u128::from(duration.as_nanos());
+                let prescale_divider = 1u128 << (prescale as u8);
+                // The hardware threshold is PINLOW * 256 cycles of the
+                // prescaled functional clock. Round upward: firing earlier
+                // than the user's requested safety bound would be surprising.
+                let denominator = 1_000_000_000u128 * 256 * prescale_divider;
+                let cycles = (duration_ns * u128::from(input_hz)).div_ceil(denominator);
+
+                if !(1..=0x0fff).contains(&cycles) {
+                    return Err(SetupError::PinLowTimeoutOutOfRange);
+                }
+
+                Ok(Self(cycles as u16))
+            }
+        }
+    }
+
+    const fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// Complete, validated controller configuration prepared before the facade
+/// performs any MMIO writes.
+///
+/// The outer driver can obtain this only through [`Self::new`], which couples
+/// an implemented speed to its derived prescaler and a representable pin-low
+/// watchdog. `configure` consumes this plan instead of accepting user-facing
+/// configuration values, so it cannot be called with a value the PAC would
+/// silently truncate.
+#[derive(Clone, Copy)]
+pub(super) struct ControllerSetup {
+    prescale: Prescale,
+    clklo: u8,
+    clkhi: u8,
+    sethold: u8,
+    datavd: u8,
+    pin_low_cycles: PinLowCycles,
+}
+
+impl ControllerSetup {
+    pub(super) fn new(
+        input_hz: u32,
+        speed: SupportedSpeed,
+        pin_low_timeout: PinLowTimeout,
+    ) -> Result<Self, SetupError> {
+        let (prescale, clklo, clkhi, sethold, datavd) = super::compute_baud_params(input_hz, speed.hertz());
+        let pin_low_cycles = PinLowCycles::from_timeout(pin_low_timeout, input_hz, prescale)?;
+
+        Ok(Self {
+            prescale,
+            clklo,
+            clkhi,
+            sethold,
+            datavd,
+            pin_low_cycles,
+        })
+    }
+}
+
 impl ControllerRegisters {
     /// Build the opaque controller facade from the raw instance handle.
     /// [`crate::i2c::Info::controller_registers`] is the only ordinary
@@ -712,7 +774,7 @@ impl ControllerRegisters {
     /// configuration registers stay inside the facade, next to the Tock
     /// typed hot-path cells, so an outer driver cannot splice configuration
     /// writes into a live transaction.
-    pub(super) fn configure(&self, input_hz: u32, target_hz: u32, ultra_fast: bool) {
+    pub(super) fn configure(&self, setup: ControllerSetup) {
         self.check_layout();
 
         critical_section::with(|_| self.modify_mcr(|w| w.set_men(false)));
@@ -729,22 +791,18 @@ impl ControllerRegisters {
             });
         });
 
-        // UltraFast (HS) mode requires programming MCCR1 and special START
-        // commands beyond what this driver currently supports. This stays
-        // after the reset sequence to preserve the constructor's established
-        // unsupported-configuration behavior.
-        if ultra_fast {
-            todo!("LPI2C UltraFast (HS) mode is not yet supported");
-        }
-        let (prescale, clklo, clkhi, sethold, datavd) = super::compute_baud_params(input_hz, target_hz);
-
         critical_section::with(|_| {
-            self.pac.mcfgr1().modify(|w| w.set_prescale(prescale));
+            // The reference manual requires MCFGR3 to be written while
+            // MEN=0. The reset above leaves it disabled until this block's
+            // final write, so the watchdog and baud setup become visible as
+            // one ordered configuration sequence.
+            self.pac.mcfgr3().modify(|w| w.set_pinlow(setup.pin_low_cycles.raw()));
+            self.pac.mcfgr1().modify(|w| w.set_prescale(setup.prescale));
             self.pac.mccr0().modify(|w| {
-                w.set_clklo(clklo);
-                w.set_clkhi(clkhi);
-                w.set_sethold(sethold);
-                w.set_datavd(datavd);
+                w.set_clklo(setup.clklo);
+                w.set_clkhi(setup.clkhi);
+                w.set_sethold(setup.sethold);
+                w.set_datavd(setup.datavd);
             });
             self.modify_mcr(|w| w.set_men(true));
         });
@@ -1713,5 +1771,65 @@ impl ControllerRegisters {
             armed: true,
             _buffer: core::marker::PhantomData,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_low_timeout_is_rounded_up_and_never_silently_truncated() {
+        let disabled = PinLowCycles::from_timeout(PinLowTimeout::Disabled, 12_000_000, Prescale::DivideBy1).unwrap();
+        assert_eq!(disabled.raw(), 0);
+
+        let one_quantum = PinLowCycles::from_timeout(
+            PinLowTimeout::Enabled(embassy_time::Duration::from_micros(1)),
+            12_000_000,
+            Prescale::DivideBy1,
+        )
+        .unwrap();
+        assert_eq!(one_quantum.raw(), 1);
+
+        let rounded_up = PinLowCycles::from_timeout(
+            PinLowTimeout::Enabled(embassy_time::Duration::from_micros(22)),
+            12_000_000,
+            Prescale::DivideBy1,
+        )
+        .unwrap();
+        assert_eq!(rounded_up.raw(), 2);
+
+        let prescaled = PinLowCycles::from_timeout(
+            PinLowTimeout::Enabled(embassy_time::Duration::from_micros(86)),
+            12_000_000,
+            Prescale::DivideBy4,
+        )
+        .unwrap();
+        assert_eq!(prescaled.raw(), 2);
+
+        let maximum = PinLowCycles::from_timeout(
+            PinLowTimeout::Enabled(embassy_time::Duration::from_micros(87_360)),
+            12_000_000,
+            Prescale::DivideBy1,
+        )
+        .unwrap();
+        assert_eq!(maximum.raw(), 0x0fff);
+
+        assert!(matches!(
+            PinLowCycles::from_timeout(
+                PinLowTimeout::Enabled(embassy_time::Duration::from_micros(0)),
+                12_000_000,
+                Prescale::DivideBy1,
+            ),
+            Err(SetupError::PinLowTimeoutOutOfRange)
+        ));
+        assert!(matches!(
+            PinLowCycles::from_timeout(
+                PinLowTimeout::Enabled(embassy_time::Duration::from_micros(87_361)),
+                12_000_000,
+                Prescale::DivideBy1,
+            ),
+            Err(SetupError::PinLowTimeoutOutOfRange)
+        ));
     }
 }
