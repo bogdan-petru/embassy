@@ -14,20 +14,9 @@ pub mod target;
 mod instance_info;
 pub(crate) use instance_info::Info;
 
-// The raw Tock register map is intentionally nested beneath the two
-// protocol facades. Driver modules can name `controller_registers` or
-// `target_registers`, but they cannot obtain the raw cells or cast a PAC
-// handle into them and bypass phase/ownership checks.
-mod register_facades {
-    #[path = "../controller_registers.rs"]
-    pub(in crate::i2c) mod controller_registers;
-    #[path = "../lpi2c_regs.rs"]
-    mod lpi2c_regs;
-    #[path = "../target_registers.rs"]
-    pub(in crate::i2c) mod target_registers;
-}
-
-pub(in crate::i2c) use register_facades::{controller_registers, target_registers};
+// Each protocol driver owns a private Tock/PAC facade and raw layout child.
+// This keeps controller and target MMIO vocabularies from being mixed by an
+// unrelated I2C implementation.
 
 pub(crate) mod sealed {
     /// Seal a trait

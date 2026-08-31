@@ -67,10 +67,6 @@ use core::marker::PhantomData;
 use embassy_hal_internal::Peri;
 use embassy_hal_internal::drop::OnDrop;
 
-use super::controller_registers::{
-    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, StartAction, StartDrainStep, StopAction,
-    StopStep, TransferFault,
-};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
 use crate::clocks::{ClockError, PoweredClock, WakeGuard, enable_and_reset};
@@ -79,18 +75,19 @@ use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::{Dozen, Prescale};
+use registers::{
+    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, StartAction, StartDrainStep, StopAction,
+    StopStep, TransferFault,
+};
 
+// Controller protocol MMIO is private to this driver tree. The target driver
+// owns a separate facade, so it cannot name controller events or bypass the
+// session permits by constructing this facade directly.
+#[path = "controller_registers.rs"]
+mod registers;
 #[path = "controller/session.rs"]
 mod session;
 
-// The register facade is a sibling module, so it receives only the opaque
-// permits and terminal proofs it must consume. It never names the session
-// itself or its runtime phase table.
-pub(in crate::i2c) use session::{
-    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, RxDmaPermit, StartStatusPermit,
-    StartTransitionPermit, StopCompleted, StopFault, StopFinalizeFault, StopFinalized, StopTransitionPermit, StopWait,
-    TxDmaPermit,
-};
 use session::{Session, SessionRxStep, StartReservation};
 
 /// Errors exclusive to HW initialization
@@ -306,7 +303,7 @@ fn compute_baud_params(src_hz: u32, baud_hz: u32) -> (Prescale, u8, u8, u8, u8) 
 /// and request arguments, so an RX arm cannot accidentally receive TX
 /// plumbing at an ordinary call site.
 #[must_use]
-pub(in crate::i2c) struct ControllerRxDma<'a, 'd> {
+struct ControllerRxDma<'a, 'd> {
     owner: usize,
     channel: &'a DmaChannel<'d>,
     request: DmaRequest,
@@ -321,15 +318,15 @@ impl<'a, 'd> ControllerRxDma<'a, 'd> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+    fn channel(&self) -> &'a DmaChannel<'d> {
         self.channel
     }
 
-    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+    fn request(&self) -> DmaRequest {
         self.request
     }
 }
@@ -338,7 +335,7 @@ impl<'a, 'd> ControllerRxDma<'a, 'd> {
 /// [`ControllerRxDma`] for why this is not a generic `(channel, request)`
 /// tuple.
 #[must_use]
-pub(in crate::i2c) struct ControllerTxDma<'a, 'd> {
+struct ControllerTxDma<'a, 'd> {
     owner: usize,
     channel: &'a DmaChannel<'d>,
     request: DmaRequest,
@@ -353,15 +350,15 @@ impl<'a, 'd> ControllerTxDma<'a, 'd> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+    fn channel(&self) -> &'a DmaChannel<'d> {
         self.channel
     }
 
-    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+    fn request(&self) -> DmaRequest {
         self.request
     }
 }

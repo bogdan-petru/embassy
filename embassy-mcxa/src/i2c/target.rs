@@ -72,9 +72,6 @@ use core::task::Poll;
 use embassy_hal_internal::Peri;
 use maitake_sync::WaitCell;
 
-use super::target_registers::{
-    ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep,
-};
 use super::{Async, AsyncMode, Blocking, Dma, Info, Instance, Mode, SclPin, SdaPin};
 pub use crate::clocks::PoweredClock;
 pub use crate::clocks::periph_helpers::{Div4, Lpi2cClockSel, Lpi2cConfig};
@@ -84,6 +81,13 @@ use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::{Addrcfg, Filtdz};
+use registers::{ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
+
+// Target protocol MMIO is private to this driver tree. The controller driver
+// has its own facade, so the two modes cannot name or mix each other's
+// protocol events, DMA leases, or raw Tock cells.
+#[path = "target_registers.rs"]
+mod registers;
 
 /// Errors exclusive to hardware Initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -812,7 +816,7 @@ enum RxChunkOutcome {
 /// The constructor is private to this module, so the register facade never
 /// accepts an interchangeable channel/request tuple at an arm site.
 #[must_use]
-pub(in crate::i2c) struct TargetRxDma<'a, 'd> {
+struct TargetRxDma<'a, 'd> {
     owner: usize,
     registers: TargetRegisters,
     wait_cell: &'a WaitCell,
@@ -838,23 +842,23 @@ impl<'a, 'd> TargetRxDma<'a, 'd> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+    fn channel(&self) -> &'a DmaChannel<'d> {
         self.channel
     }
 
-    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+    fn request(&self) -> DmaRequest {
         self.request
     }
 
-    pub(in crate::i2c) fn registers(&self) -> TargetRegisters {
+    fn registers(&self) -> TargetRegisters {
         self.registers
     }
 
-    pub(in crate::i2c) fn wait_cell(&self) -> &'a WaitCell {
+    fn wait_cell(&self) -> &'a WaitCell {
         self.wait_cell
     }
 }
@@ -862,7 +866,7 @@ impl<'a, 'd> TargetRxDma<'a, 'd> {
 /// The fixed TX channel/request pair for this target instance. See
 /// [`TargetRxDma`] for why this is not a generic `(channel, request)` pair.
 #[must_use]
-pub(in crate::i2c) struct TargetTxDma<'a, 'd> {
+struct TargetTxDma<'a, 'd> {
     owner: usize,
     registers: TargetRegisters,
     wait_cell: &'a WaitCell,
@@ -888,23 +892,23 @@ impl<'a, 'd> TargetTxDma<'a, 'd> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn channel(&self) -> &'a DmaChannel<'d> {
+    fn channel(&self) -> &'a DmaChannel<'d> {
         self.channel
     }
 
-    pub(in crate::i2c) fn request(&self) -> DmaRequest {
+    fn request(&self) -> DmaRequest {
         self.request
     }
 
-    pub(in crate::i2c) fn registers(&self) -> TargetRegisters {
+    fn registers(&self) -> TargetRegisters {
         self.registers
     }
 
-    pub(in crate::i2c) fn wait_cell(&self) -> &'a WaitCell {
+    fn wait_cell(&self) -> &'a WaitCell {
         self.wait_cell
     }
 }

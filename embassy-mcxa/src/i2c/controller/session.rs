@@ -6,11 +6,11 @@
 
 use core::marker::PhantomData;
 
-use super::super::controller_registers::{
+use super::IOError;
+use super::registers::{
     ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, HaltedFault, RecoveryClose, RxProgress, RxStep,
     StartAction, TransferFault,
 };
-use super::IOError;
 use crate::i2c::Info;
 
 /// Select the recovery shape for a transfer fault. An address NACK has
@@ -991,7 +991,7 @@ const _: () = {
 /// future sibling-module edit cannot enqueue a START, TRANSMIT, or STOP
 /// without choosing its matching ownership path.
 #[must_use]
-pub(in crate::i2c) struct CommandPermit<'a> {
+pub(super) struct CommandPermit<'a> {
     owner: usize,
     _owner: PhantomData<&'a mut ()>,
 }
@@ -1004,7 +1004,7 @@ impl<'a> CommandPermit<'a> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 }
@@ -1012,7 +1012,7 @@ impl<'a> CommandPermit<'a> {
 /// Capability consumed by a START action. It carries the mutable phase that
 /// must become `StartPending` exactly when the facade accepted that START.
 #[must_use]
-pub(in crate::i2c) struct StartTransitionPermit<'a> {
+pub(super) struct StartTransitionPermit<'a> {
     owner: usize,
     phase: &'a mut SessionPhase,
 }
@@ -1026,11 +1026,11 @@ impl<'a> StartTransitionPermit<'a> {
         Self { owner, phase }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn finish_enqueue(self, action: StartAction, queued: bool, _seal: FacadeSeal) {
+    pub(super) fn finish_enqueue(self, action: StartAction, queued: bool, _seal: FacadeSeal) {
         *self.phase = (*self.phase)
             .after_start_enqueue(action.is_read(), queued)
             .expect("i2c: a START was committed from the wrong phase");
@@ -1043,7 +1043,7 @@ impl<'a> StartTransitionPermit<'a> {
 /// clean status witness can outlive its specific `StartPending` phase or be
 /// replayed into a later same-controller transaction.
 #[must_use]
-pub(in crate::i2c) struct StartStatusPermit<'a> {
+pub(super) struct StartStatusPermit<'a> {
     owner: usize,
     session: &'a mut Session,
 }
@@ -1057,11 +1057,11 @@ impl<'a> StartStatusPermit<'a> {
         Self { owner, session }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn commit_settled(self, _seal: FacadeSeal) {
+    pub(super) fn commit_settled(self, _seal: FacadeSeal) {
         self.session.phase = self
             .session
             .phase
@@ -1075,7 +1075,7 @@ impl<'a> StartStatusPermit<'a> {
 /// addressed-only read nor an already-pending command can be closed through
 /// the regular terminal path.
 #[must_use]
-pub(in crate::i2c) struct StopTransitionPermit<'a> {
+pub(super) struct StopTransitionPermit<'a> {
     owner: usize,
     phase: &'a mut SessionPhase,
 }
@@ -1089,11 +1089,11 @@ impl<'a> StopTransitionPermit<'a> {
         Self { owner, phase }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 
-    pub(in crate::i2c) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
+    pub(super) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
         *self.phase = (*self.phase)
             .after_stop_enqueue(queued)
             .expect("i2c: a normal STOP was committed from the wrong phase");
@@ -1105,7 +1105,7 @@ impl<'a> StopTransitionPermit<'a> {
 /// or finalized STOP proof linear, while dropping it keeps the ordinary
 /// session recovery behavior intact on cancellation/error paths.
 #[must_use]
-pub(in crate::i2c) struct StopWait {
+pub(super) struct StopWait {
     session: Session,
 }
 
@@ -1118,11 +1118,11 @@ impl StopWait {
         Self { session }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         ControllerRegisters::new(self.session.info.regs()).identity()
     }
 
-    pub(in crate::i2c) fn into_completed(self, _seal: FacadeSeal) -> StopCompleted {
+    pub(super) fn into_completed(self, _seal: FacadeSeal) -> StopCompleted {
         StopCompleted { stop: self }
     }
 
@@ -1135,13 +1135,13 @@ impl StopWait {
 /// Returning this rather than a bare [`TransferFault`] keeps the session
 /// attached until the caller binds the halt proof and lets Drop recover.
 #[must_use]
-pub(in crate::i2c) struct StopFault {
+pub(super) struct StopFault {
     stop: StopWait,
     fault: TransferFault,
 }
 
 impl StopFault {
-    pub(in crate::i2c) fn new(stop: StopWait, fault: TransferFault, _seal: FacadeSeal) -> Self {
+    pub(super) fn new(stop: StopWait, fault: TransferFault, _seal: FacadeSeal) -> Self {
         Self { stop, fault }
     }
 
@@ -1154,20 +1154,20 @@ impl StopFault {
 /// It owns the same `StopWait`, so an idle snapshot cannot be transplanted
 /// into a second session or a second controller.
 #[must_use]
-pub(in crate::i2c) struct StopCompleted {
+pub(super) struct StopCompleted {
     stop: StopWait,
 }
 
 impl StopCompleted {
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.stop.owner()
     }
 
-    pub(in crate::i2c) fn into_wait(self) -> StopWait {
+    pub(super) fn into_wait(self) -> StopWait {
         self.stop
     }
 
-    pub(in crate::i2c) fn commit_finalized(mut self, _seal: FacadeSeal) -> StopFinalized {
+    pub(super) fn commit_finalized(mut self, _seal: FacadeSeal) -> StopFinalized {
         self.stop.session.phase = SessionPhase::StopFinalized;
         StopFinalized {
             session: self.stop.session,
@@ -1178,7 +1178,7 @@ impl StopCompleted {
 /// A clean terminal-status proof carrying the actual completed session. Its
 /// sole terminal operation consumes that session without recovery.
 #[must_use]
-pub(in crate::i2c) struct StopFinalized {
+pub(super) struct StopFinalized {
     session: Session,
 }
 
@@ -1192,13 +1192,13 @@ impl StopFinalized {
 /// completed session stays attached so error conversion cannot discard the
 /// recovery owner in the stop-step/finish-stop polling gap.
 #[must_use]
-pub(in crate::i2c) struct StopFinalizeFault {
+pub(super) struct StopFinalizeFault {
     stop: StopWait,
     fault: TransferFault,
 }
 
 impl StopFinalizeFault {
-    pub(in crate::i2c) fn new(stop: StopWait, fault: TransferFault, _seal: FacadeSeal) -> Self {
+    pub(super) fn new(stop: StopWait, fault: TransferFault, _seal: FacadeSeal) -> Self {
         Self { stop, fault }
     }
 
@@ -1212,7 +1212,7 @@ impl StopFinalizeFault {
 /// sibling I2C module cannot turn the recovery batch into a general raw-MTDR
 /// command path.
 #[must_use]
-pub(in crate::i2c) struct RecoveryPermit {
+pub(super) struct RecoveryPermit {
     owner: usize,
 }
 
@@ -1221,7 +1221,7 @@ impl RecoveryPermit {
         Self { owner: regs.identity() }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 }
@@ -1287,7 +1287,7 @@ impl Drop for StartReservation {
 /// but cannot mint one; that prevents sibling code from treating an
 /// addressed-only read as streaming without actually queueing a command.
 #[must_use]
-pub(in crate::i2c) struct FirstReceivePermit<'a> {
+pub(super) struct FirstReceivePermit<'a> {
     owner: usize,
     phase: &'a mut SessionPhase,
 }
@@ -1301,14 +1301,14 @@ impl<'a> FirstReceivePermit<'a> {
         Self { owner, phase }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 
     /// Consume this permit with the single gate outcome. Both success and
     /// failure assign through the same transition table, making the
     /// addressed-state preservation on Full/fault an explicit invariant.
-    pub(in crate::i2c) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
+    pub(super) fn finish_enqueue(self, queued: bool, _seal: FacadeSeal) {
         *self.phase = (*self.phase)
             .after_first_receive_enqueue(queued)
             .expect("i2c: a first read command was committed from the wrong phase");
@@ -1319,7 +1319,7 @@ impl<'a> FirstReceivePermit<'a> {
 /// entered the command FIFO. It remains valid while that command is pending
 /// and after a received byte proves it executed.
 #[must_use]
-pub(in crate::i2c) struct ReadReceivePermit<'a> {
+pub(super) struct ReadReceivePermit<'a> {
     owner: usize,
     _session: PhantomData<&'a Session>,
 }
@@ -1332,7 +1332,7 @@ impl<'a> ReadReceivePermit<'a> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 }
@@ -1342,7 +1342,7 @@ impl<'a> ReadReceivePermit<'a> {
 /// streaming), and the lease calls `note_read_progress` only after it has
 /// stopped the channel and observed the final transfer state.
 #[must_use]
-pub(in crate::i2c) struct RxDmaPermit<'a> {
+pub(super) struct RxDmaPermit<'a> {
     owner: usize,
     session: &'a mut Session,
 }
@@ -1359,14 +1359,14 @@ impl<'a> RxDmaPermit<'a> {
         Self { owner, session }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 
     /// Preserve evidence that the first RECEIVE executed after the DMA
     /// channel is genuinely idle. This is intentionally unavailable to a
     /// caller before it has performed the lease's paired cleanup.
-    pub(in crate::i2c) fn note_read_progress(&mut self, seal: FacadeSeal) {
+    pub(super) fn note_read_progress(&mut self, seal: FacadeSeal) {
         self.session.note_dma_read_progress(seal);
     }
 }
@@ -1375,7 +1375,7 @@ impl<'a> RxDmaPermit<'a> {
 /// pins the recovery owner in place until the lease has disabled MDER and
 /// quiesced the eDMA channel.
 #[must_use]
-pub(in crate::i2c) struct TxDmaPermit<'a> {
+pub(super) struct TxDmaPermit<'a> {
     owner: usize,
     _session: PhantomData<&'a mut Session>,
 }
@@ -1388,7 +1388,7 @@ impl<'a> TxDmaPermit<'a> {
         }
     }
 
-    pub(in crate::i2c) fn owner(&self) -> usize {
+    pub(super) fn owner(&self) -> usize {
         self.owner
     }
 }

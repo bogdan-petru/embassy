@@ -1,6 +1,6 @@
 //! Safe controller-side operations over the LPI2C register block.
 //!
-//! Two layers meet here. [`super::lpi2c_regs`] supplies `tock-registers`
+//! Two layers meet here. [`self::lpi2c_regs`] supplies `tock-registers`
 //! MMIO cells, so access direction is enforced by type: `MRDR` is
 //! read-only and popping, `MTDR` is write-only. The PAC supplies every
 //! field *meaning* — each raw word is converted through the PAC's own
@@ -22,27 +22,30 @@
 //! through the PAC: they are outside the hot-path map, written once at
 //! construction, and never part of a transfer-time sequence.
 
-use tock_registers::interfaces::{Readable, Writeable};
+#[path = "lpi2c_regs.rs"]
+mod lpi2c_regs;
 
-use super::lpi2c_regs::{self, LpI2cRegisters};
-use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
-use crate::i2c::controller::{
-    CommandPermit, ControllerRxDma, ControllerTxDma, FirstReceivePermit, ReadReceivePermit, RecoveryPermit,
-    RxDmaPermit, StartStatusPermit, StartTransitionPermit, StopCompleted, StopFault, StopFinalizeFault, StopFinalized,
-    StopTransitionPermit, StopWait, TxDmaPermit,
+use self::lpi2c_regs::LpI2cRegisters;
+use super::session::{
+    CommandPermit, FirstReceivePermit, ReadReceivePermit, RecoveryPermit, RxDmaPermit, StartStatusPermit,
+    StartTransitionPermit, StopCompleted, StopFault, StopFinalizeFault, StopFinalized, StopTransitionPermit, StopWait,
+    TxDmaPermit,
 };
+use super::{ControllerRxDma, ControllerTxDma};
+use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
     Alf, Dmf, Epf, Mbf, Mcr, McrRrf, McrRtf, Mder, Mfsr, Mier, Mrdr, Msr, MsrFef, MsrSdf, Mtdr, Ndf, Param, Pltf, Stf,
 };
+use tock_registers::interfaces::{Readable, Writeable};
 
 /// Unforgeable authority for semantic session transitions performed by this
 /// register facade. Its tuple field and constructor stay private here, so a
 /// call site outside this facade can hold a permit but cannot invoke its
 /// sealed phase-transition method without going through the matching
 /// fault/FIFO/MMIO operation below.
-pub(in crate::i2c) struct FacadeSeal(());
+pub(super) struct FacadeSeal(());
 
 impl FacadeSeal {
     fn new() -> Self {
@@ -87,7 +90,7 @@ impl ControllerStatus {
 
 /// Controller errors represented by the hardware status register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::i2c) enum ControllerStatusError {
+pub(super) enum ControllerStatusError {
     AddressNack,
     ArbitrationLoss,
     Fifo,
@@ -104,7 +107,7 @@ pub(in crate::i2c) enum ControllerStatusError {
 /// discard escape during development.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct HaltedFault {
+pub(super) struct HaltedFault {
     owner: usize,
     error: ControllerStatusError,
     #[cfg(debug_assertions)]
@@ -115,7 +118,7 @@ impl HaltedFault {
     /// The error class of this still-live halt. Recovery may inspect it to
     /// select a protocol close, but cannot extract or resolve the proof
     /// except through this facade.
-    pub(in crate::i2c) fn error(&self) -> ControllerStatusError {
+    pub(super) fn error(&self) -> ControllerStatusError {
         self.error
     }
 
@@ -145,7 +148,7 @@ impl Drop for HaltedFault {
 /// the proof before it can return an `IOError`.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct TransferFault(TransferFaultKind);
+pub(super) struct TransferFault(TransferFaultKind);
 
 /// Private so an I2C driver cannot destructure a fault into an `IOError`
 /// and accidentally drop the corresponding halt proof.
@@ -159,18 +162,18 @@ enum TransferFaultKind {
 /// [`TransferFault`]. It owns a halt until session drop or start recovery
 /// consumes it; no borrowed `error()` accessor exists on the carrier.
 #[must_use]
-pub(in crate::i2c) struct HaltSlot(Option<HaltedFault>);
+pub(super) struct HaltSlot(Option<HaltedFault>);
 
 impl HaltSlot {
-    pub(in crate::i2c) const fn empty() -> Self {
+    pub(super) const fn empty() -> Self {
         Self(None)
     }
 
-    pub(in crate::i2c) fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.0.is_none()
     }
 
-    pub(in crate::i2c) fn capture(&mut self, fault: TransferFault) -> ControllerStatusError {
+    pub(super) fn capture(&mut self, fault: TransferFault) -> ControllerStatusError {
         match fault.0 {
             TransferFaultKind::Error(error) => error,
             TransferFaultKind::Halted(proof) => {
@@ -185,7 +188,7 @@ impl HaltSlot {
         }
     }
 
-    pub(in crate::i2c) fn take(&mut self) -> Option<HaltedFault> {
+    pub(super) fn take(&mut self) -> Option<HaltedFault> {
         self.0.take()
     }
 }
@@ -203,7 +206,7 @@ impl HaltSlot {
 /// readiness flag.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) enum RxStep {
+pub(super) enum RxStep {
     Byte {
         byte: u8,
         progress: RxProgress,
@@ -228,7 +231,7 @@ pub(in crate::i2c) enum RxStep {
 /// from being applied to another.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct RxProgress {
+pub(super) struct RxProgress {
     owner: usize,
     #[cfg(debug_assertions)]
     armed: bool,
@@ -248,7 +251,7 @@ impl RxProgress {
     /// evidence reuse, while the debug-only drop guard catches ordinary
     /// accidental discards. Session adapters pair this consumption with the
     /// corresponding state transition.
-    pub(in crate::i2c) fn consume_for(self, owner: usize) {
+    pub(super) fn consume_for(self, owner: usize) {
         assert_eq!(
             self.owner, owner,
             "i2c: RX progress evidence was applied to a different controller"
@@ -282,14 +285,14 @@ impl Drop for RxProgress {
 /// the ordinary command gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct ControllerAction(ControllerActionKind);
+pub(super) struct ControllerAction(ControllerActionKind);
 
 /// A semantic START action. It is separate from ordinary active commands
 /// because the facade consumes it with a [`StartTransitionPermit`], making
 /// the queued-START phase transition inseparable from its MTDR write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct StartAction(StartSpec);
+pub(super) struct StartAction(StartSpec);
 
 /// A semantic trailing STOP action. It is intentionally separate from
 /// [`ControllerAction`] because a normal STOP is valid only from the
@@ -297,7 +300,7 @@ pub(in crate::i2c) struct StartAction(StartSpec);
 /// `StopPending` recovery owner as soon as MTDR accepts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) struct StopAction;
+pub(super) struct StopAction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControllerActionKind {
@@ -312,7 +315,7 @@ struct StartSpec {
 }
 
 impl ControllerAction {
-    pub(in crate::i2c) const fn transmit(byte: u8) -> Self {
+    pub(super) const fn transmit(byte: u8) -> Self {
         Self(ControllerActionKind::Transmit(byte))
     }
 
@@ -326,7 +329,7 @@ impl ControllerAction {
 impl StartAction {
     /// Construct a seven-bit START action. Invalid addresses cannot be
     /// represented by this type.
-    pub(in crate::i2c) const fn new(address: u8, read: bool, high_speed: bool) -> Option<Self> {
+    pub(super) const fn new(address: u8, read: bool, high_speed: bool) -> Option<Self> {
         if address < 0x80 {
             Some(Self(StartSpec {
                 address,
@@ -349,13 +352,13 @@ impl StartAction {
         )
     }
 
-    pub(in crate::i2c) fn is_read(self) -> bool {
+    pub(super) fn is_read(self) -> bool {
         self.0.read
     }
 }
 
 impl StopAction {
-    pub(in crate::i2c) const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self
     }
 
@@ -371,7 +374,7 @@ impl StopAction {
 /// later bypass error classification with a raw write.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
-pub(in crate::i2c) enum CommandStep {
+pub(super) enum CommandStep {
     Queued,
     Full,
     Fault(TransferFault),
@@ -382,7 +385,7 @@ pub(in crate::i2c) enum CommandStep {
 /// callers can obtain one only as the `Drained` arm of [`StartDrainStep`] and
 /// can consume it only through [`ControllerRegisters::finish_start_status`].
 #[must_use]
-pub(in crate::i2c) struct StartDrained<'a>(StartStatusPermit<'a>);
+pub(super) struct StartDrained<'a>(StartStatusPermit<'a>);
 
 impl<'a> StartDrained<'a> {
     fn new(permit: StartStatusPermit<'a>) -> Self {
@@ -403,7 +406,7 @@ impl<'a> StartDrained<'a> {
 /// [`StartDrained`] only after this facade observed both a clean status
 /// snapshot and an empty TX FIFO.
 #[must_use]
-pub(in crate::i2c) enum StartDrainStep<'a> {
+pub(super) enum StartDrainStep<'a> {
     Pending(StartStatusPermit<'a>),
     Drained(StartDrained<'a>),
     Fault(TransferFault),
@@ -413,7 +416,7 @@ pub(in crate::i2c) enum StartDrainStep<'a> {
 /// STOP entered MTDR for this session; an idle observation without it can
 /// never become a completed-STOP proof.
 #[must_use]
-pub(in crate::i2c) enum StopStep {
+pub(super) enum StopStep {
     Pending(StopWait),
     Completed(StopCompleted),
     Fault(StopFault),
@@ -451,7 +454,7 @@ const fn decide_active_gate(input: ActiveGateInput) -> ActiveGate {
 /// latched. This replaces a boolean flag so both protocol shapes stay
 /// auditable at the sole active-fault bypass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::i2c) enum RecoveryClose {
+pub(super) enum RecoveryClose {
     Stop,
     ReleaseAddressedRead,
 }
@@ -565,7 +568,7 @@ const _: () = {
 
 /// Safe controller-specific operations over the LPI2C register block.
 #[derive(Clone, Copy)]
-pub(in crate::i2c) struct ControllerRegisters {
+pub(super) struct ControllerRegisters {
     regs: &'static LpI2cRegisters,
 }
 
@@ -576,7 +579,7 @@ pub(in crate::i2c) struct ControllerRegisters {
 /// capability are released. The only explicit completion path and `Drop`
 /// use the same cleanup routine.
 #[must_use]
-pub(in crate::i2c) struct RxDmaLease<'s, 'channel, 'dma, 'buf> {
+pub(super) struct RxDmaLease<'s, 'channel, 'dma, 'buf> {
     regs: ControllerRegisters,
     channel: &'channel DmaChannel<'dma>,
     permit: RxDmaPermit<'s>,
@@ -589,7 +592,7 @@ impl RxDmaLease<'_, '_, '_, '_> {
     /// Register for this lease's own completion event and report the
     /// level-latched DONE state. The caller cannot accidentally wait on a
     /// different controller DMA channel after it has armed this lease.
-    pub(in crate::i2c) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+    pub(super) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
         while self.channel.wait_cell().poll_wait(cx).is_ready() {}
         self.channel.is_done()
     }
@@ -613,7 +616,7 @@ impl RxDmaLease<'_, '_, '_, '_> {
 
     /// Finish the DMA handoff before inspecting status or returning from the
     /// transfer. Dropping an unfinished lease performs the same operation.
-    pub(in crate::i2c) fn finish(mut self) -> bool {
+    pub(super) fn finish(mut self) -> bool {
         let complete = self.quiesce_and_note();
         self.armed = false;
         complete
@@ -631,7 +634,7 @@ impl Drop for RxDmaLease<'_, '_, '_, '_> {
 /// A live TX DMA handoff to the controller's write-only command/data port.
 /// See [`RxDmaLease`] for why this is a lease rather than a bare address.
 #[must_use]
-pub(in crate::i2c) struct TxDmaLease<'s, 'channel, 'dma, 'buf> {
+pub(super) struct TxDmaLease<'s, 'channel, 'dma, 'buf> {
     regs: ControllerRegisters,
     channel: &'channel DmaChannel<'dma>,
     _permit: TxDmaPermit<'s>,
@@ -642,7 +645,7 @@ pub(in crate::i2c) struct TxDmaLease<'s, 'channel, 'dma, 'buf> {
 impl TxDmaLease<'_, '_, '_, '_> {
     /// Register for this lease's own completion event; see
     /// [`RxDmaLease::poll_complete`].
-    pub(in crate::i2c) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
+    pub(super) fn poll_complete(&self, cx: &mut core::task::Context<'_>) -> bool {
         while self.channel.wait_cell().poll_wait(cx).is_ready() {}
         self.channel.is_done()
     }
@@ -655,7 +658,7 @@ impl TxDmaLease<'_, '_, '_, '_> {
 
     /// Finish the DMA handoff before status is inspected or its source
     /// buffer can be released. Dropping an unfinished lease does the same.
-    pub(in crate::i2c) fn finish(mut self) -> bool {
+    pub(super) fn finish(mut self) -> bool {
         let complete = self.quiesce();
         self.armed = false;
         complete
@@ -686,7 +689,7 @@ const _: () = {
 };
 
 impl ControllerRegisters {
-    pub(in crate::i2c) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    pub(super) fn new(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
             regs: lpi2c_regs::from_pac(regs),
         }
@@ -695,7 +698,7 @@ impl ControllerRegisters {
     /// Cross-check the hidden raw layout against the linked PAC before
     /// a controller is configured. Keeping this entry point on the
     /// facade means driver code never needs access to raw MMIO cells.
-    pub(in crate::i2c) fn check_layout(regs: pac::lpi2c::Lpi2c) {
+    pub(super) fn check_layout(regs: pac::lpi2c::Lpi2c) {
         lpi2c_regs::check_layout(regs);
     }
 
@@ -720,7 +723,7 @@ impl ControllerRegisters {
 
     /// Stable identity used by non-copyable protocol capabilities that
     /// cross from the session layer into this facade.
-    pub(in crate::i2c) fn identity(&self) -> usize {
+    pub(super) fn identity(&self) -> usize {
         self.register_address()
     }
 
@@ -750,7 +753,7 @@ impl ControllerRegisters {
     /// Disable the controller interrupt mask if any source is enabled.
     ///
     /// Returns whether the driver should wake its waiter.
-    pub(in crate::i2c) fn disable_interrupts_if_enabled(&self) -> bool {
+    pub(super) fn disable_interrupts_if_enabled(&self) -> bool {
         if self.regs.mier.get() == 0 {
             return false;
         }
@@ -763,7 +766,7 @@ impl ControllerRegisters {
     /// FIFO error, pin-low timeout). Used while DMA moves the data, where
     /// TDF/RDF service the DMA engine but an error still needs to wake
     /// the waiting task.
-    pub(in crate::i2c) fn enable_error_interrupts(&self) {
+    fn enable_error_interrupts(&self) {
         // Note: deliberately no EPIE/SDIE. Both are level-latched and
         // polluted by the silicon's spurious-flag quirks (false STOP
         // detection; EPF from repeated STARTs), so arming them storms
@@ -782,7 +785,7 @@ impl ControllerRegisters {
     /// are defined together so they cannot drift apart (an armed
     /// source outside the wake set re-arms and interrupts forever —
     /// the listen-side RSIE mismatch was exactly this class).
-    pub(in crate::i2c) fn tx_settle_wake(&self) -> bool {
+    pub(super) fn tx_settle_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_settled()
     }
@@ -791,14 +794,14 @@ impl ControllerRegisters {
     /// make progress. This is deliberately non-consuming: the caller must
     /// immediately retry [`Self::try_enqueue_active`] so the actual MTDR
     /// write still shares the fault/capacity check with every other command.
-    pub(in crate::i2c) fn tx_room_wake(&self) -> bool {
+    pub(super) fn tx_room_wake(&self) -> bool {
         self.enable_transmit_interrupts();
         self.tx_pending() < self.tx_fifo_capacity() || self.read_status().error().is_some()
     }
 
     /// Arm the receive-path interrupt set and evaluate its wake
     /// condition, as one operation — see [`Self::tx_settle_wake`].
-    pub(in crate::i2c) fn rx_wake(&self) -> bool {
+    pub(super) fn rx_wake(&self) -> bool {
         self.enable_receive_interrupts();
         self.rx_ready()
     }
@@ -810,12 +813,12 @@ impl ControllerRegisters {
     /// The DMA poller returns the non-copyable [`TransferFault`] to its
     /// caller; that caller binds a halting proof to the live session
     /// before returning its public `IOError`.
-    pub(in crate::i2c) fn error_wake(&self) -> Option<TransferFault> {
+    pub(super) fn error_wake(&self) -> Option<TransferFault> {
         self.enable_error_interrupts();
         self.take_active_fault()
     }
 
-    pub(in crate::i2c) fn enable_receive_interrupts(&self) {
+    fn enable_receive_interrupts(&self) {
         // No EPIE/SDIE — see `enable_error_interrupts`.
         self.write_mier(|w| {
             w.set_rdie(true);
@@ -826,7 +829,7 @@ impl ControllerRegisters {
         });
     }
 
-    pub(in crate::i2c) fn enable_transmit_interrupts(&self) {
+    fn enable_transmit_interrupts(&self) {
         self.write_mier(|w| {
             w.set_tdie(true);
             w.set_ndie(true);
@@ -840,7 +843,7 @@ impl ControllerRegisters {
     ///
     /// Transfer-time resets must instead flow through recovery methods
     /// that prove the engine is halted, idle, or terminal.
-    pub(in crate::i2c) fn reset_while_disabled(&self) {
+    pub(super) fn reset_while_disabled(&self) {
         self.reset_fifos();
     }
 
@@ -874,7 +877,7 @@ impl ControllerRegisters {
 
     /// Clear the power-on/configuration residue before any transaction
     /// has been opened.
-    pub(in crate::i2c) fn clear_after_init(&self) {
+    pub(super) fn clear_after_init(&self) {
         self.clear_all_status();
     }
 
@@ -883,7 +886,7 @@ impl ControllerRegisters {
     ///
     /// An idle master owns no live command pipeline, so resetting the
     /// FIFOs and clearing every W1C flag cannot release stale work.
-    pub(in crate::i2c) fn discard_idle_recovery_state(&self) {
+    pub(super) fn discard_idle_recovery_state(&self) {
         self.reset_fifos();
         self.clear_all_status();
     }
@@ -934,7 +937,7 @@ impl ControllerRegisters {
     /// Close out recovery after the recovery drain reached a terminal
     /// state. The caller has already made the master idle or escalated
     /// it, so no live command can be released by this cleanup.
-    pub(in crate::i2c) fn finish_recovery(&self) {
+    pub(super) fn finish_recovery(&self) {
         self.reset_fifos();
         self.clear_current_status();
     }
@@ -1006,7 +1009,7 @@ impl ControllerRegisters {
     /// caller must thread to its session or clears only the ordinary
     /// fault observed in the same snapshot. It deliberately does
     /// nothing on a clean snapshot.
-    pub(in crate::i2c) fn take_active_fault(&self) -> Option<TransferFault> {
+    pub(super) fn take_active_fault(&self) -> Option<TransferFault> {
         let msr = self.msr();
         self.take_active_fault_from_snapshot(&msr)
     }
@@ -1018,7 +1021,7 @@ impl ControllerRegisters {
     /// the START-boundary W1C snapshot from this facade just because some
     /// unrelated caller observed a clean status word: the same pending
     /// session must first survive an empty-TX-FIFO observation here.
-    pub(in crate::i2c) fn poll_start_drain<'a>(&self, permit: StartStatusPermit<'a>) -> StartDrainStep<'a> {
+    pub(super) fn poll_start_drain<'a>(&self, permit: StartStatusPermit<'a>) -> StartDrainStep<'a> {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a START-drain permit was used through a different controller"
@@ -1038,7 +1041,7 @@ impl ControllerRegisters {
     /// clean result commits that session's `StartPending -> Stable` mapping
     /// before the borrow is released. A fault leaves the phase pending so
     /// its normal recovery owner remains intact.
-    pub(in crate::i2c) fn finish_start_status(&self, drained: StartDrained<'_>) -> Result<(), TransferFault> {
+    pub(super) fn finish_start_status(&self, drained: StartDrained<'_>) -> Result<(), TransferFault> {
         assert!(
             self.register_address() == drained.owner(),
             "i2c: a START-drain witness was finalized through a different controller"
@@ -1059,7 +1062,7 @@ impl ControllerRegisters {
     /// priority. Scrub-safe ALF/PLTF bits from the same snapshot are
     /// cleared, but the halting bits stay latched until a recovery
     /// operation consumes the returned proof.
-    pub(in crate::i2c) fn observe_recovery_halt(&self) -> Option<HaltedFault> {
+    pub(super) fn observe_recovery_halt(&self) -> Option<HaltedFault> {
         let msr = self.msr();
         if let Some(halt) = self.halted_from_snapshot(&msr) {
             self.clear_snapshot_preserving_halts(msr);
@@ -1086,7 +1089,7 @@ impl ControllerRegisters {
     /// FIFO predicates, and token consumption together prevents an
     /// active transfer from being reset or un-halted by a reordered
     /// controller-side call.
-    pub(in crate::i2c) fn resolve_halted_fault(
+    pub(super) fn resolve_halted_fault(
         &self,
         halt: HaltedFault,
         timeout: embassy_time::Duration,
@@ -1131,7 +1134,7 @@ impl ControllerRegisters {
     ///
     /// This preserves the proof across an error return instead of
     /// relying on a later status re-read to rediscover the same latch.
-    pub(in crate::i2c) fn resolve_owned_halt(
+    pub(super) fn resolve_owned_halt(
         &self,
         halt: HaltedFault,
         timeout: embassy_time::Duration,
@@ -1158,7 +1161,7 @@ impl ControllerRegisters {
     /// FIFO), a fault that means no more data will arrive, an early
     /// termination, or `None` to keep waiting. There is deliberately no
     /// data-only variant of this wait — see the module docs.
-    pub(in crate::i2c) fn rx_step(&self) -> Option<RxStep> {
+    pub(super) fn rx_step(&self) -> Option<RxStep> {
         if self.mfsr().rxcount() != 0 {
             return Some(RxStep::Byte {
                 byte: Mrdr(self.regs.mrdr.get()).data(),
@@ -1188,7 +1191,7 @@ impl ControllerRegisters {
     /// Non-consuming readiness check for [`Self::rx_step`], for use in
     /// wake conditions. True when a byte, a fault, or an early transfer
     /// termination is pending.
-    pub(in crate::i2c) fn rx_ready(&self) -> bool {
+    fn rx_ready(&self) -> bool {
         self.mfsr().rxcount() != 0 || self.read_status().error().is_some() || self.transfer_ended()
     }
 
@@ -1196,7 +1199,7 @@ impl ControllerRegisters {
     /// in the hardware FIFO. DMA cleanup uses this after it has disabled
     /// requests and quiesced the channel: a byte that reached the FIFO but
     /// not memory still proves that the first RECEIVE executed.
-    pub(in crate::i2c) fn rx_pending(&self) -> bool {
+    fn rx_pending(&self) -> bool {
         self.mfsr().rxcount() != 0
     }
 
@@ -1204,7 +1207,7 @@ impl ControllerRegisters {
     /// same hardware fact as [`Self::rx_pending`] but prevents a recovery or
     /// fault path from turning a bare boolean into a read-streaming session
     /// transition.
-    pub(in crate::i2c) fn observe_rx_progress(&self) -> Option<RxProgress> {
+    pub(super) fn observe_rx_progress(&self) -> Option<RxProgress> {
         if self.rx_pending() {
             Some(self.rx_progress())
         } else {
@@ -1223,7 +1226,7 @@ impl ControllerRegisters {
     /// while a transfer is still active. Flags from a *previous*
     /// transaction are cleared by the START's own
     /// [`Self::finish_start_status`] check.
-    pub(in crate::i2c) fn transfer_ended(&self) -> bool {
+    pub(super) fn transfer_ended(&self) -> bool {
         let msr = self.msr();
         Self::transfer_ended_from_snapshot(&msr)
     }
@@ -1233,7 +1236,7 @@ impl ControllerRegisters {
     }
 
     /// Capacity of the shared command/transmit FIFO, in entries.
-    pub(in crate::i2c) fn tx_fifo_capacity(&self) -> usize {
+    pub(super) fn tx_fifo_capacity(&self) -> usize {
         1usize << Param(self.regs.param.get()).mtxfifo()
     }
 
@@ -1241,7 +1244,7 @@ impl ControllerRegisters {
     /// pending — i.e. the wait for a queued command is over, one way or
     /// the other. Callers classify with [`Self::take_active_fault`] or
     /// `read_status`.
-    pub(in crate::i2c) fn tx_settled(&self) -> bool {
+    fn tx_settled(&self) -> bool {
         self.mfsr().txcount() == 0 || self.read_status().error().is_some()
     }
 
@@ -1261,7 +1264,7 @@ impl ControllerRegisters {
     /// entirely — recovery has no caller to classify for — and insists
     /// on genuine idleness, so the trailing cleanup runs after the
     /// last autonomous byte and the STOP.
-    pub(in crate::i2c) fn recovery_settled(&self) -> bool {
+    pub(super) fn recovery_settled(&self) -> bool {
         self.mfsr().txcount() == 0 && self.msr().mbf() == Mbf::Idle
     }
 
@@ -1272,12 +1275,12 @@ impl ControllerRegisters {
     /// is then scrubbed, retries forever: a livelock that burns the
     /// whole recovery deadline. (The old fault-exit drain masked this
     /// by bailing on the FEF and silently discarding the bogus STOP.)
-    pub(in crate::i2c) fn master_busy(&self) -> bool {
+    pub(super) fn master_busy(&self) -> bool {
         self.msr().mbf() == Mbf::Busy
     }
 
     /// Number of commands currently waiting in the transmit FIFO.
-    pub(in crate::i2c) fn tx_pending(&self) -> usize {
+    pub(super) fn tx_pending(&self) -> usize {
         self.mfsr().txcount() as usize
     }
 
@@ -1295,7 +1298,7 @@ impl ControllerRegisters {
     /// MBF reflects the engine actually going idle. The fault arm carries
     /// the live transaction's proof; terminal status is cleared only after
     /// the [`StopCompleted`] proof is returned to [`Self::finish_stop`].
-    pub(in crate::i2c) fn stop_step(&self, stop: StopWait) -> StopStep {
+    pub(super) fn stop_step(&self, stop: StopWait) -> StopStep {
         assert!(
             self.register_address() == stop.owner(),
             "i2c: a STOP completion owner was used through a different controller"
@@ -1317,7 +1320,7 @@ impl ControllerRegisters {
     /// status is cleared only after the physical STOP proof. A fault that
     /// races in after the final `stop_step` is still returned through the
     /// same typed path, rather than being erased by terminal cleanup.
-    pub(in crate::i2c) fn finish_stop(&self, completed: StopCompleted) -> Result<StopFinalized, StopFinalizeFault> {
+    pub(super) fn finish_stop(&self, completed: StopCompleted) -> Result<StopFinalized, StopFinalizeFault> {
         assert!(
             self.register_address() == completed.owner(),
             "i2c: a completed-STOP proof was finalized through a different controller"
@@ -1346,7 +1349,7 @@ impl ControllerRegisters {
     /// recovery owner consumes that evidence before retaining the first-
     /// RECEIVE phase transition, even though it intentionally discards the
     /// byte rather than delivering it.
-    pub(in crate::i2c) fn discard_rx(&self) -> Option<RxProgress> {
+    pub(super) fn discard_rx(&self) -> Option<RxProgress> {
         let mut discarded = false;
         while self.mfsr().rxcount() != 0 {
             let _ = self.regs.mrdr.get();
@@ -1370,7 +1373,7 @@ impl ControllerRegisters {
     /// recovery STOP stays the first choice — this runs only when
     /// that provably cannot drain.
     /// Escalate a recovery drain that exceeded its bounded deadline.
-    pub(in crate::i2c) fn reset_after_recovery_timeout(&self) {
+    pub(super) fn reset_after_recovery_timeout(&self) {
         self.reset_engine();
     }
 
@@ -1387,11 +1390,7 @@ impl ControllerRegisters {
     /// A full FIFO is deliberately distinct from a fault so blocking and
     /// async callers can choose their own bounded wait without flattening a
     /// live [`TransferFault`].
-    pub(in crate::i2c) fn try_enqueue_active(
-        &self,
-        permit: CommandPermit<'_>,
-        action: ControllerAction,
-    ) -> CommandStep {
+    pub(super) fn try_enqueue_active(&self, permit: CommandPermit<'_>, action: ControllerAction) -> CommandStep {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a command permit was used through a different controller"
@@ -1403,11 +1402,7 @@ impl ControllerRegisters {
     /// Queue a START and atomically record its pending transition in the
     /// owning session/reservation. Ordinary command permits cannot enter
     /// this path, so a START cannot be emitted without its recovery phase.
-    pub(in crate::i2c) fn try_enqueue_start(
-        &self,
-        permit: StartTransitionPermit<'_>,
-        action: StartAction,
-    ) -> CommandStep {
+    pub(super) fn try_enqueue_start(&self, permit: StartTransitionPermit<'_>, action: StartAction) -> CommandStep {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a START-transition permit was used through a different controller"
@@ -1422,7 +1417,7 @@ impl ControllerRegisters {
     /// terminal transition in the owning session. Ordinary command permits
     /// cannot enter this path, so an idle observation elsewhere cannot be
     /// mistaken for completion of a STOP this session never queued.
-    pub(in crate::i2c) fn try_enqueue_stop(&self, permit: StopTransitionPermit<'_>, action: StopAction) -> CommandStep {
+    pub(super) fn try_enqueue_stop(&self, permit: StopTransitionPermit<'_>, action: StopAction) -> CommandStep {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a STOP-transition permit was used through a different controller"
@@ -1468,11 +1463,7 @@ impl ControllerRegisters {
     /// A `Full` or `Fault` result leaves that session in the addressed phase,
     /// while `Queued` moves it to the explicit first-RECEIVE-pending phase;
     /// byte/FIFO evidence later promotes it to streaming.
-    pub(in crate::i2c) fn try_enqueue_first_receive(
-        &self,
-        permit: FirstReceivePermit<'_>,
-        bytes: usize,
-    ) -> CommandStep {
+    pub(super) fn try_enqueue_first_receive(&self, permit: FirstReceivePermit<'_>, bytes: usize) -> CommandStep {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a first-read permit was used through a different controller"
@@ -1485,7 +1476,7 @@ impl ControllerRegisters {
     /// Queue a follow-on RECEIVE. The phase-specific permit means a normal
     /// active action can never accidentally begin a read stream: only the
     /// first-read transition above may do that.
-    pub(in crate::i2c) fn try_enqueue_read_receive(&self, permit: ReadReceivePermit<'_>, bytes: usize) -> CommandStep {
+    pub(super) fn try_enqueue_read_receive(&self, permit: ReadReceivePermit<'_>, bytes: usize) -> CommandStep {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a streaming-read permit was used through a different controller"
@@ -1497,7 +1488,7 @@ impl ControllerRegisters {
     /// fits. Recovery intentionally runs with a fault latched, so it must
     /// not use [`Self::try_enqueue_active`]; exposing this narrow operation
     /// keeps that exception from becoming a second raw-MTDR escape hatch.
-    pub(in crate::i2c) fn try_enqueue_recovery_close(&self, permit: RecoveryPermit, close: RecoveryClose) -> bool {
+    pub(super) fn try_enqueue_recovery_close(&self, permit: RecoveryPermit, close: RecoveryClose) -> bool {
         assert!(
             self.register_address() == permit.owner(),
             "i2c: a recovery permit was used through a different controller"
@@ -1571,7 +1562,7 @@ impl ControllerRegisters {
     /// This is the sole safe owner of the MRDR endpoint. Its return value
     /// retains both the live session proof and destination borrow until the
     /// paired `MDER off -> eDMA quiesce` cleanup runs.
-    pub(in crate::i2c) fn arm_rx_dma<'s, 'channel, 'dma, 'buf>(
+    pub(super) fn arm_rx_dma<'s, 'channel, 'dma, 'buf>(
         &self,
         permit: RxDmaPermit<'s>,
         port: ControllerRxDma<'channel, 'dma>,
@@ -1626,7 +1617,7 @@ impl ControllerRegisters {
     /// This is the sole safe owner of the MTDR endpoint. The directional
     /// permit prevents an RX phase from accidentally writing commands/data,
     /// and the returned lease owns the matching shutdown.
-    pub(in crate::i2c) fn arm_tx_dma<'s, 'channel, 'dma, 'buf>(
+    pub(super) fn arm_tx_dma<'s, 'channel, 'dma, 'buf>(
         &self,
         permit: TxDmaPermit<'s>,
         port: ControllerTxDma<'channel, 'dma>,

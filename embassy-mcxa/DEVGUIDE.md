@@ -746,6 +746,18 @@ session module should consume it. Rust's ownership system can prevent an
 accidental API misuse; it cannot prove timing or electrical facts about the
 bus, so retain bounded waits, hardware tests, and cancellation cleanup.
 
+#### Keep per-protocol MMIO facades in their driver trees
+
+When controller and target modes share one hardware block, give each protocol
+its own private facade module and make the raw Tock register layout a private
+child of that facade. Do not re-export a controller facade across the whole
+I2C crate merely because the target uses the same peripheral type. Then a
+target edit cannot name controller-only events, DMA leases, permits, or raw
+Tock cells (and vice versa); those mistakes fail at name resolution before a
+facade/Tock access can be added. This does not by itself prohibit a deliberate
+raw PAC access through a shared instance handle; make that a separate,
+reviewed capability split rather than claiming the module boundary proves it.
+
 #### Module-global mutable state must be reset at construction
 
 Some controllers (notably DMA-driven ones with descriptor rings or bounce
