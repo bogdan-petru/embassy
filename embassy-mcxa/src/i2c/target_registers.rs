@@ -13,7 +13,7 @@
 //! - [`TargetRegisters::tx_step`]: **faults and termination win over**
 //!   TX-space — pushing a byte into a transfer that already ended, or
 //!   that has faulted, is never right.
-//! - [`TargetRegisters::listen_ready`]: faults are part of the wake
+//! - [`TargetRegisters::listen_wake`]: faults are part of the wake
 //!   condition, because their interrupts are armed.
 //!
 //! Call sites consume typed events and cannot reorder these checks; the
@@ -436,7 +436,7 @@ impl TargetRegisters {
     }
 
     /// Interrupts relevant while receiving data (respond_to_write).
-    pub(super) fn enable_receive_interrupts(&self) {
+    fn enable_receive_interrupts(&self) {
         self.write_sier(|w| {
             w.set_feie(true);
             w.set_beie(true);
@@ -447,7 +447,7 @@ impl TargetRegisters {
     }
 
     /// Interrupts relevant while transmitting data (respond_to_read).
-    pub(super) fn enable_transmit_interrupts(&self) {
+    fn enable_transmit_interrupts(&self) {
         self.write_sier(|w| {
             w.set_feie(true);
             w.set_beie(true);
@@ -585,6 +585,15 @@ impl TargetRegisters {
         })
     }
 
+    /// Arm the listening interrupt set and evaluate its matching readiness
+    /// predicate as one operation. This keeps the armed sources and the
+    /// predicate together, so a future target wait cannot enable an event
+    /// that its readiness check ignores.
+    pub(super) fn listen_wake(&self, general_call: bool, smbus_alert: bool) -> bool {
+        self.enable_listen_interrupts(general_call, smbus_alert);
+        self.listen_ready()
+    }
+
     /// Interrupts for listening for a new transaction. Deliberately no
     /// RSIE: the armed set must equal [`Self::listen_ready`]'s wake
     /// set, or a source that fires without satisfying the predicate
@@ -593,7 +602,7 @@ impl TargetRegisters {
     /// (armed), which is what classification keys on; an RSF-only wake
     /// would classify against a stale SASR. The general-call and
     /// SMBus-alert sources are driver configuration, passed in.
-    pub(super) fn enable_listen_interrupts(&self, general_call: bool, smbus_alert: bool) {
+    fn enable_listen_interrupts(&self, general_call: bool, smbus_alert: bool) {
         self.write_sier(|w| {
             w.set_sarie(smbus_alert);
             w.set_gcie(general_call);
@@ -700,7 +709,7 @@ impl TargetRegisters {
 
     /// Non-consuming readiness check for [`Self::rx_event`], for use in
     /// wake conditions.
-    pub(super) fn rx_ready(&self) -> bool {
+    fn rx_ready(&self) -> bool {
         let ssr = self.ssr();
         ssr.rdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
     }
@@ -726,7 +735,7 @@ impl TargetRegisters {
 
     /// Non-consuming readiness check for [`Self::tx_step`], for use in
     /// wake conditions.
-    pub(super) fn tx_ready(&self) -> bool {
+    fn tx_ready(&self) -> bool {
         let ssr = self.ssr();
         ssr.tdf() || ssr.sdf() || ssr.rsf() || ssr.bef() || ssr.fef()
     }
@@ -735,7 +744,7 @@ impl TargetRegisters {
     /// transaction — an address match (or its general-call / SMBus-alert
     /// classifications), a STOP, **or a fault**.
     ///
-    /// BEF/FEF belong here because `enable_listen_ints` arms BEIE/FEIE:
+    /// BEF/FEF belong here because [`Self::listen_wake`] arms BEIE/FEIE:
     /// a fault that wakes the ISR but is not part of the wake condition
     /// leaves the waiter re-arming a still-latched, level-triggered
     /// source forever. The caller's status read classifies and clears

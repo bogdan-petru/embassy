@@ -1063,31 +1063,6 @@ impl<'d, M: AsyncMode> I2c<'d, M>
 where
     Self: AsyncEngine,
 {
-    /// Enable only the interrupts relevant to listening for a new address match.
-    ///
-    /// Deliberately no RSIE: the armed set must equal `listen_ready`'s
-    /// wake set, or a source that fires without satisfying the
-    /// predicate re-arms and interrupts forever. A repeated START is
-    /// not itself a listen event — the address phase that follows it
-    /// raises AVF (armed), which is what classification keys on; an
-    /// RSF-only wake would classify against a stale SASR. RSF latching
-    /// quietly during the listen is fine: `status` observes and clears
-    /// it alongside the address event it belongs to.
-    fn enable_listen_ints(&self) {
-        self.registers()
-            .enable_listen_interrupts(self.general_call.clone().into(), self.smbus_alert.clone().into());
-    }
-
-    /// Arm the listen interrupt set and evaluate its wake condition as
-    /// one operation (the armed set depends on driver config —
-    /// general call, SMBus alert — so the pairing lives here rather
-    /// than in the register wrapper). Includes BEF/FEF — see
-    /// `listen_ready`.
-    fn listen_wake(&self) -> bool {
-        self.enable_listen_ints();
-        self.registers().listen_ready()
-    }
-
     // Public API: Async
 
     /// Asynchronously wait for new events.
@@ -1101,10 +1076,12 @@ where
     /// - `Err(IOError)` if an error occurs.
     pub async fn async_listen(&mut self) -> Result<Request, IOError> {
         self.clear_status();
+        let general_call = self.general_call.into();
+        let smbus_alert = self.smbus_alert.into();
 
         self.info
             .wait_cell()
-            .wait_for(|| self.listen_wake())
+            .wait_for(|| self.registers().listen_wake(general_call, smbus_alert))
             .await
             .map_err(|_| IOError::Other)?;
 
