@@ -893,7 +893,7 @@ impl ControllerRegisters {
     ///
     /// Transfer-time resets must instead flow through recovery methods
     /// that prove the engine is halted, idle, or terminal.
-    pub(super) fn reset_while_disabled(&self) {
+    fn reset_while_disabled(&self) {
         self.reset_fifos();
     }
 
@@ -927,7 +927,7 @@ impl ControllerRegisters {
 
     /// Clear the power-on/configuration residue before any transaction
     /// has been opened.
-    pub(super) fn clear_after_init(&self) {
+    fn clear_after_init(&self) {
         self.clear_all_status();
     }
 
