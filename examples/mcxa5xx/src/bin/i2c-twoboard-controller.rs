@@ -90,12 +90,12 @@ async fn main(spawner: Spawner) {
                 continue;
             }
             assert!(
-                matches!(t, "async" | "dma" | "blocking"),
+                matches!(t, "async" | "dma" | "blocking" | "pin_low"),
                 "SUITE_PHASES: unknown phase name"
             );
         }
         assert!(
-            ["async", "dma", "blocking"].iter().any(|p| phase_enabled(p)),
+            ["async", "dma", "blocking", "pin_low"].iter().any(|p| phase_enabled(p)),
             "SUITE_PHASES enables no phase"
         );
     }
@@ -154,6 +154,19 @@ async fn main(spawner: Spawner) {
         ccfg.speed = Speed::Standard;
         let mut ctrl = I2c::new_blocking(p.LPI2C3.reborrow(), p.P3_21.reborrow(), p.P3_20.reborrow(), ccfg).unwrap();
         i2c_twoboard::harness::run_blocking("blocking", &mut ctrl);
+    }
+
+    // LAST, deliberately: the pin-low probe stalls the target past the
+    // controller's watchdog, and the abort can leave the bus held by a
+    // target that never saw a STOP (releasing it needs a bus-clear
+    // sequence the driver does not implement yet). Nothing may run after
+    // it; the runner resets the target board at the start of every run,
+    // which clears the bus.
+    if phase_enabled("pin_low") {
+        let mut ccfg = controller::Config::default();
+        ccfg.speed = Speed::Standard;
+        let mut ctrl = I2c::new_async(p.LPI2C3.reborrow(), p.P3_21.reborrow(), p.P3_20.reborrow(), Irqs, ccfg).unwrap();
+        i2c_twoboard::harness::run_pin_low("pin_low", &mut ctrl).await;
     }
 
     defmt::info!("== two-board i2c test: all enabled phases passed ==");

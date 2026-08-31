@@ -75,7 +75,7 @@ use embassy_time::Instant;
 use hal::Peri;
 use hal::i2c::Blocking;
 use hal::i2c::controller::{
-    Config as CtrlConfig, I2c as ControllerI2c, IOError as ControllerIOError, SetupError, Speed,
+    Config as CtrlConfig, I2c as ControllerI2c, IOError as ControllerIOError, PinLowTimeout, SetupError, Speed,
 };
 use hal::i2c::target::{self, Address, Config as TargetConfig, InterruptHandler, ReadStatus, Request, WriteStatus};
 use hal::interrupt::typelevel::Binding;
@@ -143,9 +143,40 @@ const CTRL_RESET_STATS: u8 = 4;
 const STATS_LEN: usize = 8;
 const STATS_ECHO: [u8; 4] = [0x3C, 0x5A, 0xC3, 0xA5];
 
+/// One-shot: park the target's CPU inside a critical section during the
+/// next READ so nothing refills `STDR` and the target's TXDSTALL stretch
+/// physically holds SCL low — the only way this rig can reach the
+/// controller's `MCFGR3[PINLOW]` watchdog. See `t_pin_low_timeout`.
+///
+/// A read victim is deliberate. An aborted read leaves at most the one
+/// stranded `STDR` byte that the next address match discards; an aborted
+/// write would leave received bytes resident in the target's RX path to
+/// corrupt the next anchored verify.
+const CTRL_ARM_PIN_LOW_STALL: u8 = 5;
+
 /// Buffer size the overflow probe serves the next write with — small
 /// enough that a probe-length-plus-one write overflows it.
 const OVERFLOW_PROBE_LEN: usize = 8;
+
+/// How long the stalled respond may wait for a termination that never
+/// comes, before the serve loop abandons it and returns to `listen`.
+/// Must outlast [`PIN_LOW_STALL_CYCLES`] (~12 ms) so the bound is what
+/// ends the respond, not the stall; the controller-side test waits past
+/// this before it expects the target to answer again.
+const PIN_LOW_RESPOND_BOUND_MS: u64 = 20;
+
+/// CPU-blocking cycles for the pin-low stall, calibrated against the
+/// overflow probe's spike on this part (20_000 cycles ≈ 600 µs): ~12 ms.
+///
+/// It has to outlast the *first served view*, not just the watchdog. On
+/// the DMA target the eDMA refills `STDR` with no CPU involvement, so a
+/// blocked CPU stretches nothing until the serve loop needs to hand over
+/// the next [`BUF_LEN`] view — ~3.6 ms into a 100 kHz read. The stall
+/// must still be running then, and must then hold for the 1.5 ms
+/// watchdog on top. ~12 ms clears both with margin, and dwarfs the
+/// ~0.5 ms interrupt-latency interference blackout, so the stretch that
+/// trips the watchdog is unambiguously this stall.
+const PIN_LOW_STALL_CYCLES: u32 = 400_000;
 
 /// Per-phase driver capabilities the tests key their expectations on.
 /// Typed and passed from the binary, where the engine type is concrete
@@ -278,6 +309,9 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
     // One-shot overflow probe (see `t_overflow_write`): armed by the
     // control write, consumed by the next Write request.
     let mut overflow_probe = false;
+    // One-shot pin-low stall (see `t_pin_low_timeout`): armed by the
+    // control write, consumed by the next Read request.
+    let mut pin_low_stall = false;
     // Settle-audit counter (see `t_settle_audit`): incremented on
     // every NeedMore whose follow-up terminates with zero bytes;
     // served and reset by the one-shot stats mode.
@@ -368,6 +402,10 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 // data — keeps the arm idempotent.
                 if total == CTRL_LEN && small[..4] == CTRL_MAGIC {
                     match small[4] {
+                        CTRL_ARM_PIN_LOW_STALL => {
+                            pin_low_stall = true;
+                            defmt::info!("[T] pin-low stall armed");
+                        }
                         CTRL_ARM_OVERFLOW_PROBE => {
                             overflow_probe = true;
                             defmt::info!("[T] overflow probe re-armed");
@@ -387,6 +425,7 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             stats_pending = false;
                             stateless = false;
                             overflow_probe = false;
+                            pin_low_stall = false;
                         }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
@@ -414,6 +453,45 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 view[..4].copy_from_slice(&STATS_ECHO);
                 view[4..8].copy_from_slice(&premature_needmore.to_le_bytes());
                 let _ = tgt.respond_read(&view).await.unwrap();
+            }
+            Request::Read(_) if pin_low_stall => {
+                pin_low_stall = false;
+                // Block the CPU so the serve loop cannot hand over the
+                // next view; the target's TXDSTALL stretch then holds
+                // SCL low until it can. The short delay first lets the
+                // address phase through, so the stretch lands inside
+                // the data phase.
+                //
+                // The controller must ask for MORE than one view. On
+                // the DMA target the eDMA feeds `STDR` autonomously, so
+                // a blocked CPU stretches nothing for as long as the
+                // armed chunk lasts — only the view HANDOVER needs
+                // firmware. The interrupt target stretches on the first
+                // byte either way; sizing the request past [`BUF_LEN`]
+                // is what makes the two behave alike.
+                let view = [0u8; BUF_LEN];
+                let stall = async {
+                    embassy_time::Timer::after_micros(200).await;
+                    critical_section::with(|_| cortex_m::asm::delay(PIN_LOW_STALL_CYCLES));
+                };
+                // The controller answers its watchdog by disabling its
+                // master mid-transfer (MEN off), so no STOP or repeated
+                // START ever reaches us. Bound the respond, or this
+                // serve loop waits forever for a termination that is
+                // never coming — the target respond paths have no
+                // deadline of their own.
+                let (_served, ()) = embassy_futures::join::join(
+                    embassy_futures::select::select(
+                        tgt.respond_read(&view),
+                        embassy_time::Timer::after_millis(PIN_LOW_RESPOND_BOUND_MS),
+                    ),
+                    stall,
+                )
+                .await;
+                // Nothing commits and the cursor is left alone: the
+                // controller-side test anchors (rewrites the buffer)
+                // before it verifies.
+                defmt::info!("[T] pin-low stall served");
             }
             Request::Read(_) => {
                 if stateless {
@@ -489,6 +567,10 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                 // verified.)
                 if n == CTRL_LEN && scratch[..4] == CTRL_MAGIC {
                     match scratch[4] {
+                        CTRL_ARM_PIN_LOW_STALL => {
+                            pin_low_stall = true;
+                            defmt::info!("[T] pin-low stall armed");
+                        }
                         CTRL_ARM_OVERFLOW_PROBE => {
                             overflow_probe = true;
                             defmt::info!("[T] overflow probe armed");
@@ -508,6 +590,7 @@ async fn serve<T: TargetPort>(tgt: &mut T) -> ! {
                             stats_pending = false;
                             stateless = false;
                             overflow_probe = false;
+                            pin_low_stall = false;
                         }
                         m => {
                             stateless = m != CTRL_STATELESS_OFF;
@@ -761,6 +844,40 @@ pub mod harness {
             stats.fef_retries,
             stats.end_retries
         );
+    }
+
+    /// Run the pin-low watchdog probe as an isolated final step.
+    ///
+    /// Separate from [`run`] because it can leave the bus held by the
+    /// stalled target (see [`tests::t_pin_low_timeout`]), so nothing may
+    /// follow it. Panics on failure, like the other entry points.
+    pub async fn run_pin_low<C: Controller>(mode: &str, ctrl: &mut C) {
+        defmt::info!("== pin-low watchdog probe [{=str}] start ==", mode);
+
+        let mut model = Model::new();
+        let mut stats = tests::RetryStats::default();
+
+        if let Err(e) = tests::t_audit_reset(ctrl, &mut stats).await {
+            defmt::error!("[{=str}] pin_low audit reset failed: {=str}", mode, e);
+            panic!("audit reset failed");
+        }
+        if ctrl.write(TARGET_ADDR, &model.buf).await.is_err() {
+            defmt::error!("[{=str}] pin_low sync write failed", mode);
+            panic!("target sync failed");
+        }
+
+        let t0 = Instant::now();
+        match tests::t_pin_low_timeout(ctrl, &mut model, &mut stats).await {
+            Ok(()) => defmt::info!(
+                "[{=str}] pin_low_timeout PASS ({=u64} ms)",
+                mode,
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => {
+                defmt::error!("[{=str}] pin_low_timeout FAIL: {=str}", mode, e);
+                panic!("test failure");
+            }
+        }
     }
 
     /// Blocking-path battery: the polled driver has no interrupt path, so
@@ -2190,6 +2307,118 @@ pub mod tests {
                 );
                 return Err("queued_suffix_address_nack: post-race verify mismatch");
             }
+        }
+
+        Ok(())
+    }
+
+    /// Pin-low watchdog coverage — the one driver path that only a
+    /// physically held-low bus line can reach.
+    ///
+    /// The target is armed to park its CPU inside a critical section for
+    /// ~12 ms during the next read (see [`CTRL_ARM_PIN_LOW_STALL`]), and
+    /// the read is sized past one served view so the stall bites at the
+    /// handover — the one point even the DMA target needs firmware. Its
+    /// TXDSTALL stretch then holds SCL low far past the 1.5 ms watchdog
+    /// configured here. `MCFGR3[PINLOW]`
+    /// then fires, and the driver's terminal recovery — interrupts off,
+    /// MEN off, FIFOs discarded, the one W1C that may acknowledge PLTF,
+    /// MEN back on — is the only path that can clear it.
+    ///
+    /// Asserted: the transfer fails as exactly `PinLowTimeout`, never
+    /// succeeds and never reports another class, and the terminal
+    /// recovery returns rather than hanging. The watchdog is disabled
+    /// again before any assert can return, so a failure cannot leak a
+    /// 1.5 ms bound into whatever runs next.
+    ///
+    /// NOT asserted: that the bus is usable afterwards — see the comment
+    /// at the recovery probe below. This test therefore runs LAST, after
+    /// every phase, because it can legitimately leave the bus held; the
+    /// runner resets the target board at the start of every run, which
+    /// clears it.
+    ///
+    /// Not covered: a stuck-SDA line. TXDSTALL gives us SCL from
+    /// firmware alone; holding SDA low needs a jumper to ground.
+    pub async fn t_pin_low_timeout<C: Controller>(
+        ctrl: &mut C,
+        model: &mut Model,
+        stats: &mut RetryStats,
+    ) -> TestResult {
+        let arm = [
+            CTRL_MAGIC[0],
+            CTRL_MAGIC[1],
+            CTRL_MAGIC[2],
+            CTRL_MAGIC[3],
+            CTRL_ARM_PIN_LOW_STALL,
+        ];
+        ctl_write(ctrl, &arm, stats).await.map_err(|_| "pin_low: arm failed")?;
+
+        // Enable the watchdog for the victim transfer only. 1.5 ms clears
+        // the ~0.5 ms interference blackout — which can make the
+        // CONTROLLER stretch its own SCL on a command-FIFO underrun — with
+        // margin, while sitting far below the target's ~6 ms stall, so the
+        // only thing that can trip it is the stall.
+        let mut cfg = CtrlConfig::default();
+        cfg.speed = Speed::Standard;
+        cfg.pin_low_timeout = PinLowTimeout::Enabled(embassy_time::Duration::from_micros(1_500));
+        if ctrl.set_config(&cfg).is_err() {
+            // The stall is still armed and would otherwise fire on an
+            // unrelated later read.
+            let _ = t_audit_reset(ctrl, stats).await;
+            return Err("pin_low: enabling the watchdog failed");
+        }
+
+        // Deliberately longer than one served view: the stall bites at
+        // the view handover, which is the only point the DMA target
+        // needs its CPU (see [`PIN_LOW_STALL_CYCLES`]).
+        let mut buf = [0u8; BUF_LEN + 16];
+        let outcome = ctrl.read(TARGET_ADDR, &mut buf).await;
+
+        // Restore BEFORE judging: a failed assert must not leave the
+        // watchdog armed for every later test in the phase.
+        let mut restore = CtrlConfig::default();
+        restore.speed = Speed::Standard;
+        let restored = ctrl.set_config(&restore);
+
+        match outcome {
+            Err(ControllerIOError::PinLowTimeout) => {}
+            Ok(()) => return Err("pin_low: the stalled read completed"),
+            Err(_) => return Err("pin_low: wrong error class for a held-low line"),
+        }
+        restored.map_err(|_| "pin_low: restoring the default config failed")?;
+
+        // The controller aborts the moment its watchdog fires (~5 ms in),
+        // but the target stays unresponsive well past that: its CPU is
+        // still blocked, and the respond it can never finish only unwinds
+        // at its own bound. Wait that out before asking anything of it.
+        embassy_time::Timer::after_millis(PIN_LOW_RESPOND_BOUND_MS + 20).await;
+
+        // BUS RECOVERY IS REPORTED, NOT ASSERTED — and that is a finding,
+        // not a convenience. Measured here: after the watchdog aborts a
+        // read mid-transfer, every subsequent transfer fails with
+        // `Timeout` (never `AddressNack`) for as long as it is retried.
+        // The controller half is fine — terminal recovery cycles MEN and
+        // the driver is usable — but the TARGET is left mid-transfer and
+        // never saw a STOP, so its hardware keeps stretching and the bus
+        // stays held. Releasing a peer in that state needs a bus-clear
+        // sequence (nine SCL pulses plus a STOP), which this driver does
+        // not implement; MEN off/on generates no clocks. Until it does,
+        // asserting recovery here would only pin a known-missing feature
+        // as a failure. Flip this to an assert the day bus-clear lands.
+        let snap = model.snapshot();
+        let mut recovered = false;
+        for _ in 0..4u32 {
+            if ctrl.write(TARGET_ADDR, &snap).await.is_ok() {
+                recovered = true;
+                break;
+            }
+            embassy_time::Timer::after_millis(20).await;
+        }
+        if recovered {
+            model.write(&snap);
+            defmt::info!("[c] pin_low: bus recovered without a bus-clear sequence");
+        } else {
+            defmt::warn!("[c] pin_low: bus still held after the abort — needs bus-clear (expected today)");
         }
 
         Ok(())
