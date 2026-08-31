@@ -7,10 +7,267 @@
 use core::marker::PhantomData;
 
 use super::super::controller_registers::{
-    ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, RxProgress, RxStep, StartAction, TransferFault,
+    ControllerRegisters, ControllerStatusError, FacadeSeal, HaltSlot, HaltedFault, RecoveryClose, RxProgress, RxStep,
+    StartAction, TransferFault,
 };
-use super::{IOError, recovery_abort_for, remediate_halted, remediate_pending};
+use super::IOError;
 use crate::i2c::Info;
+
+/// Select the recovery shape for a transfer fault. An address NACK has
+/// no ACKing target, so its manual close is always the general form;
+/// every other class retains the caller's known wire direction.
+const fn recovery_abort_for(error: ControllerStatusError, abort: Abort) -> Abort {
+    match error {
+        ControllerStatusError::AddressNack => Abort::General,
+        ControllerStatusError::ArbitrationLoss | ControllerStatusError::Fifo | ControllerStatusError::PinLowTimeout => {
+            abort
+        }
+    }
+}
+
+/// Resolve a classified fault before a live session exists. The outer driver
+/// deliberately has no access to an abort shape or recovery permit; it can
+/// request only this pre-session recovery, whose known shape is `General`.
+/// Once a session has been minted, use [`Session::bind_fault`] instead so its
+/// drop path remains the single recovery owner.
+pub(super) fn recover_before_session_fault(
+    regs: &ControllerRegisters,
+    timeout: embassy_time::Duration,
+    fault: TransferFault,
+) -> IOError {
+    let mut halt = HaltSlot::empty();
+    let error = halt.capture(fault);
+    let abort = recovery_abort_for(error, Abort::General);
+    match halt.take() {
+        Some(halt) => remediate_halted(regs, timeout, abort, halt),
+        None => remediate(regs, timeout, abort),
+    }
+    error.into()
+}
+
+/// Recover before a session exists. This is intentionally a fixed semantic
+/// operation rather than a caller-supplied close shape, so the outer driver
+/// cannot emit a recovery command without this recovery owner.
+pub(super) fn remediate_before_session(regs: &ControllerRegisters, timeout: embassy_time::Duration) {
+    remediate(regs, timeout, Abort::General);
+}
+
+fn remediate(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort) {
+    remediate_inner(regs, timeout, abort, None, None);
+}
+
+/// Recover a session that may still describe a command accepted into MTDR
+/// but not yet known to have executed. A late NDF/FEF must select the
+/// frozen-pipeline policy from that phase, rather than the ordinary
+/// cancellation policy used before any halt is observed.
+fn remediate_pending(regs: &ControllerRegisters, timeout: embassy_time::Duration, pending: PendingRecovery) {
+    remediate_inner(regs, timeout, pending.abort_for_cancellation(), None, Some(pending));
+}
+
+/// Recover using a halt proof retained by the transaction that observed
+/// it. This avoids a second status observation between the API error and
+/// the session's cleanup.
+fn remediate_halted(regs: &ControllerRegisters, timeout: embassy_time::Duration, abort: Abort, halt: HaltedFault) {
+    remediate_inner(regs, timeout, abort, Some(halt), None);
+}
+
+fn remediate_inner(
+    regs: &ControllerRegisters,
+    timeout: embassy_time::Duration,
+    mut abort: Abort,
+    known_halt: Option<HaltedFault>,
+    mut late_halt_phase: Option<PendingRecovery>,
+) {
+    #[cfg(feature = "defmt")]
+    defmt::trace!("Recovering controller",);
+
+    // Recovery must not re-enter the fault-aware transfer paths that
+    // lead here (a session drop or pre-start recovery): with a fault
+    // that keeps re-latching, that cycle
+    // recurses until the stack overflows. Everything below is
+    // self-contained.
+    //
+    // Resetting the FIFOs drops whatever the aborted transfer left
+    // queued — but a FIFO reset issued while the engine is ACTIVELY
+    // RUNNING a command corrupts its transaction bookkeeping
+    // (hardware-observed: the closing STOP then forms on the wire,
+    // EPF/SDF latch, yet MBF/BBF stick busy forever and later
+    // commands are ignored — a state not even an engine reset fully
+    // unwinds). So the entry reset runs ONLY when the engine is idle.
+    // A latched fault is deliberately NOT accepted as proof of a
+    // halted engine: the spurious-ALF quirk latches "arbitration
+    // loss" on a transfer that is still running, and gating the reset
+    // on it would land exactly the corruption above.
+    //
+    // The busy entry must ALSO not clear flags blindly: a latched
+    // NDF/FEF is what holds a halted engine off its stale pipeline
+    // (see `take_active_fault`), so the halting classes
+    // are recognized FIRST — the auto-STOP is waited out and the
+    // pipeline discarded, or (empty FIFO: nothing to replay, no
+    // auto-STOP coming) the halt is cleared for the drain's manual
+    // close. Everything else is scrubbed snapshot-honestly, which
+    // cannot erase a halting fault racing in.
+    let deadline = embassy_time::Instant::now() + timeout;
+    // A queued first RECEIVE may have executed before recovery began,
+    // leaving its byte in the hardware FIFO. Retain that proof even if a
+    // halting status is only observed later in the recovery drain.
+    late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
+    let busy = regs.master_busy();
+    let mut resolved = false;
+    if let Some(halt) = known_halt {
+        // The transaction owner observed this exact NDF/FEF before
+        // returning its error. Resolve that proof directly instead of
+        // relying on the drop path to rediscover a latched bit.
+        resolved = regs.resolve_owned_halt(halt, timeout, deadline);
+    } else if !busy {
+        // Idle entry: nothing is running — dropping the stale
+        // pipeline and clearing everything is unconditionally safe.
+        regs.discard_idle_recovery_state();
+    } else {
+        if let Some(halt) = regs.observe_recovery_halt() {
+            // The halt freezes the engine, so this is the authoritative
+            // FIFO observation for a first RECEIVE that raced recovery's
+            // entry snapshot.
+            late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
+            if let Some(phase) = late_halt_phase {
+                abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+            }
+            resolved = regs.resolve_halted_fault(halt, timeout, deadline);
+        }
+    }
+
+    // The recovery STOP is meaningful ONLY while a transfer is open
+    // on the wire. Queued onto an idle controller (a NACK the
+    // hardware already auto-STOPped, an abort that never reached the
+    // bus) it is a protocol violation the engine refuses with FEF and
+    // never consumes — the drain below would then burn its whole
+    // deadline for nothing (hardware-observed on ordinary NACK
+    // recoveries once the drain stopped exiting on latched faults).
+    // An idle controller needs no closing: reset, clear, done.
+    //
+    // Re-sampled: the engine fetches queued commands autonomously, so
+    // the entry sample can go stale idle→busy between it and the
+    // reset above (a dropped start whose START was still queued). The
+    // drain then closes the now-running transaction properly; if that
+    // reset DID land on the just-started engine and wedge it, the
+    // drain cannot settle and its deadline arm escalates to the
+    // engine reset — a bounded ending instead of a silent skip. (The
+    // opposite staleness, busy→idle, is the drain's 500 µs
+    // idle-with-close-pending break below.)
+    if !resolved && (busy || regs.master_busy()) {
+        // The closing sequence is shape-specific — see [`Abort`] —
+        // and is queued once there is room behind whatever the abort
+        // left pending (those commands run out first; a read
+        // pipeline's final byte auto-NACKs, which is exactly what
+        // frees the target for the STOP).
+        let mut queued = false;
+        let mut idle_since: Option<embassy_time::Instant> = None;
+        loop {
+            // The entry `busy` sample can go stale within microseconds
+            // (an auto-STOP or fault-terminated transfer finishing as
+            // recovery enters). The close then targets an IDLE engine:
+            // a protocol violation it refuses with FEF and — with the
+            // fault scrub below re-clearing it — retries forever, a
+            // livelock that would burn the whole deadline (hardware-
+            // observed at tens of thousands of scrubs per burn). An
+            // engine that stays idle with the close still pending was
+            // never going to run it: the transaction already closed
+            // itself, which is all recovery wanted — drop the bogus
+            // close (trailing FIFO reset) and leave. The persistence
+            // window rides out the legitimate µs-scale fetch gap
+            // between queueing a command and MBF asserting.
+            if !regs.master_busy() && regs.tx_pending() > 0 {
+                let now = embassy_time::Instant::now();
+                let since = *idle_since.get_or_insert(now);
+                if now - since > embassy_time::Duration::from_micros(500) {
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+            // The master HALTS on a latched fault and consumes no
+            // further commands until it is cleared. What happens next
+            // is CLASS-specific (recovery has no caller to classify
+            // for, but it must still read the flags honestly — one
+            // snapshot, clearing only what that snapshot's class
+            // permits; see `observe_recovery_halt`):
+            //
+            // * ALF/PLTF may be SPURIOUS on this silicon — latched on
+            //   a transfer that is still running — so the step scrubs
+            //   them (only when actually latched: a tight
+            //   unconditional clear loop hammering MSR disturbed
+            //   otherwise-clean drains on hardware) and the run-out
+            //   continues; a GENUINE arbitration loss idles the
+            //   engine, which the idle-with-close-pending break above
+            //   then ends.
+            // * NDF/FEF are real sequencing verdicts, and the latched
+            //   flag is what keeps the stale pipeline frozen. Observe
+            //   them BEFORE choosing this iteration's close: once the
+            //   halt is observed, the FIFO snapshot is stable proof of
+            //   whether a pending first RECEIVE executed.
+            if let Some(halt) = regs.observe_recovery_halt() {
+                late_halt_phase = retain_recovery_rx_progress(late_halt_phase, regs);
+                if let Some(phase) = late_halt_phase {
+                    abort = recovery_abort_for(halt.error(), phase.abort_for_halted_fault());
+                }
+                if regs.resolve_halted_fault(halt, timeout, deadline) {
+                    break;
+                }
+                // Unresolved: the no-auto-STOP path just discarded
+                // the frozen pipeline — the drain's own queued
+                // close included. Re-queue it, or every exit
+                // condition goes dead (settled needs the close to
+                // run; the idle-pending break needs something
+                // pending) and the loop would burn the deadline
+                // into the engine reset.
+                queued = false;
+                idle_since = None;
+            } else {
+                // Keep the RX FIFO empty: an abandoned in-flight RECEIVE
+                // stalls the engine in SCL flow control (no fault!) the
+                // moment the un-popped FIFO fills, and would otherwise
+                // never finish — see `discard_rx`. Retain a byte that this
+                // drain consumes as first-RECEIVE execution evidence for a
+                // fault that may latch on a later iteration.
+                late_halt_phase = retain_recovery_discarded_rx_progress(late_halt_phase, regs);
+            }
+
+            let close = if abort == Abort::ReadAddressed {
+                RecoveryClose::ReleaseAddressedRead
+            } else {
+                RecoveryClose::Stop
+            };
+            if !queued && regs.try_enqueue_recovery_close(RecoveryPermit::for_registers(regs), close) {
+                queued = true;
+            }
+
+            // Settled only counts once the closing commands are in:
+            // the engine idles between the aborted pipeline and the
+            // close, and exiting there would leave the transaction
+            // open.
+            if queued && regs.recovery_settled() {
+                break;
+            }
+
+            // A target holding SCL low satisfies no exit condition,
+            // so the wait is bounded like every other — recovery must
+            // not be the one path that can still hang — and on expiry
+            // the engine is hard-reset: whatever holds it, the abort
+            // must complete and release this side of the bus.
+            if embassy_time::Instant::now() > deadline {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("recovery close did not settle within the transfer timeout; resetting the engine");
+                regs.reset_after_recovery_timeout();
+                break;
+            }
+        }
+    }
+
+    // Now provably past the active abort (or hard-reset): drop
+    // whatever remains queued or received so the next transaction
+    // starts from a clean slate.
+    regs.finish_recovery();
+}
 
 /// An open bus transaction — a session whose drop path performs safe
 /// recovery.
@@ -317,7 +574,7 @@ impl Drop for Session {
 ///   documented unreliable shape on this silicon);
 /// * everything else closes with a bare STOP.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Abort {
+enum Abort {
     /// Writes, STARTs that never reached the wire, STOP failures,
     /// fault-halted engines: a bare STOP always forms.
     General,
@@ -488,18 +745,18 @@ impl SessionPhase {
 }
 
 /// An opaque snapshot of the phase that must survive a session drop until
-/// recovery has classified any late halt. The parent can request only the
-/// recovery decisions below; it cannot construct, inspect, or overwrite the
-/// underlying [`SessionPhase`].
+/// recovery has classified any late halt. It keeps phase selection confined
+/// to this module; no outer driver code can construct, inspect, or overwrite
+/// the underlying [`SessionPhase`].
 #[derive(Clone, Copy)]
-pub(super) struct PendingRecovery(SessionPhase);
+struct PendingRecovery(SessionPhase);
 
 impl PendingRecovery {
-    pub(super) const fn abort_for_cancellation(self) -> Abort {
+    const fn abort_for_cancellation(self) -> Abort {
         self.0.abort_for_cancellation()
     }
 
-    pub(super) const fn abort_for_halted_fault(self) -> Abort {
+    const fn abort_for_halted_fault(self) -> Abort {
         self.0.abort_for_halted_fault()
     }
 }
@@ -507,10 +764,7 @@ impl PendingRecovery {
 /// Preserve first-RECEIVE evidence observed during recovery without exposing
 /// a boolean-to-phase transition. When no session phase is being recovered,
 /// do not observe or mint a proof at all.
-pub(super) fn retain_recovery_rx_progress(
-    phase: Option<PendingRecovery>,
-    regs: &ControllerRegisters,
-) -> Option<PendingRecovery> {
+fn retain_recovery_rx_progress(phase: Option<PendingRecovery>, regs: &ControllerRegisters) -> Option<PendingRecovery> {
     phase.map(|phase| match regs.observe_rx_progress() {
         Some(progress) => PendingRecovery(phase.0.after_read_progress(progress, regs.identity())),
         None => phase,
@@ -520,7 +774,7 @@ pub(super) fn retain_recovery_rx_progress(
 /// The discarded byte is intentionally not delivered, but it still proves a
 /// pending first RECEIVE executed and therefore must be threaded through the
 /// same typed phase transition as a normal read.
-pub(super) fn retain_recovery_discarded_rx_progress(
+fn retain_recovery_discarded_rx_progress(
     phase: Option<PendingRecovery>,
     regs: &ControllerRegisters,
 ) -> Option<PendingRecovery> {
@@ -963,8 +1217,8 @@ pub(in crate::i2c) struct RecoveryPermit {
 }
 
 impl RecoveryPermit {
-    pub(super) fn new(owner: usize) -> Self {
-        Self { owner }
+    fn for_registers(regs: &ControllerRegisters) -> Self {
+        Self { owner: regs.identity() }
     }
 
     pub(in crate::i2c) fn owner(&self) -> usize {

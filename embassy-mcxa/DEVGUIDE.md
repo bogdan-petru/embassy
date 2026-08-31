@@ -734,6 +734,12 @@ consume. This turns a future outer-driver edit such as `session.phase = ...`
 or a forged session literal into a compile error, while keeping the dynamic
 state table and recovery behavior local to the code that owns it.
 
+Put recovery-only policy and the constructor for its MMIO capability in that
+same module. Expose semantic operations such as “recover before a session” to
+the outer driver, rather than an abort-shape enum or a permit that can enqueue
+a raw recovery close. This makes a future orchestration edit choose a reviewed
+recovery path instead of accidentally emitting cleanup commands on its own.
+
 Use this alongside, not instead of, typed MMIO operations: the register facade
 should mint the evidence that permits a phase transition, and the private
 session module should consume it. Rust's ownership system can prevent an
