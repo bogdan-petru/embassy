@@ -76,15 +76,19 @@ use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::lpi2c::Prescale;
 use registers::{
-    CommandStep, ControllerAction, ControllerRegisters, ControllerStatusError, StartAction, StartDrainStep, StopAction,
-    StopStep, TransferFault,
+    CommandStep, ControllerAction, ControllerStatusError, StartAction, StartDrainStep, StopAction, StopStep,
+    TransferFault,
 };
 
 // Controller protocol MMIO is private to this driver tree. The target driver
-// owns a separate facade, so it cannot name controller events or bypass the
-// session permits by constructing this facade directly.
+// owns a separate facade, so it cannot name controller events or operate the
+// controller facade outside the session-permit protocol.
 #[path = "controller_registers.rs"]
 mod registers;
+// Only the opaque facade name crosses the I2C sibling boundary so `Info`
+// can construct it. Its operational methods remain `pub(super)` inside this
+// controller tree; target code cannot operate a controller facade.
+pub(in crate::i2c) use registers::ControllerRegisters;
 #[path = "controller/session.rs"]
 mod session;
 
@@ -182,7 +186,7 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         T::PERF_INT_INCR();
-        let registers = ControllerRegisters::from_info(T::info());
+        let registers = T::info().controller_registers();
         if registers.disable_interrupts_if_enabled() {
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
@@ -518,7 +522,7 @@ impl<'d> I2c<'d, Blocking> {
 impl<'d, M: Mode> I2c<'d, M> {
     #[inline(always)]
     fn registers(&self) -> ControllerRegisters {
-        ControllerRegisters::from_info(self.info)
+        self.info.controller_registers()
     }
 
     fn new_inner<T: Instance>(

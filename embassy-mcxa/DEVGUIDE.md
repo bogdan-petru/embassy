@@ -755,13 +755,20 @@ bus, so retain bounded waits, hardware tests, and cancellation cleanup.
 
 When controller and target modes share one hardware block, give each protocol
 its own private facade module and make the raw Tock register layout a private
-child of that facade. Do not re-export a controller facade across the whole
-I2C crate merely because the target uses the same peripheral type. Then a
-target edit cannot name controller-only events, DMA leases, permits, or raw
-Tock cells (and vice versa); those mistakes fail at name resolution before a
-facade/Tock access can be added. This does not by itself prohibit a deliberate
-raw PAC access through a shared instance handle; make that a separate,
-reviewed capability split rather than claiming the module boundary proves it.
+child of that facade. If the shared per-instance state must construct both
+facades, re-export only their opaque names to the I2C subtree; keep every
+operational method visible only to its protocol parent. Then a target edit
+cannot call controller-only events, DMA leases, permits, or raw Tock cells
+(and vice versa); those mistakes fail at name resolution before a
+facade/Tock access can be added.
+
+Do not expose a generic `Info::regs()` accessor. Keep the raw PAC handle as a
+private `Info` field and expose role-specific `controller_registers()` and
+`target_registers()` factories instead. This makes an accidental shared-handle
+escape a compile error while still allowing the generated static `Info` to be
+`const`-initialized. It cannot prohibit a deliberate direct import of a
+global PAC peripheral; treat that as an exceptional, reviewed escape hatch,
+not as ordinary driver code.
 
 #### Module-global mutable state must be reset at construction
 

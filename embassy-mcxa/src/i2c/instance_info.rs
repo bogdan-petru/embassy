@@ -9,6 +9,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use maitake_sync::WaitCell;
 
+use super::controller::ControllerRegisters;
+use super::target::TargetRegisters;
 use crate::pac;
 
 pub(crate) struct Info {
@@ -34,12 +36,20 @@ impl Info {
         }
     }
 
-    /// Raw PAC access is intentionally confined to the I2C implementation
-    /// subtree. Transfer-time protocol code should prefer the controller or
-    /// target register facades instead.
+    /// Get the controller-specific, opaque register facade for this instance.
+    /// Its operations are visible only inside the controller driver tree;
+    /// callers cannot turn this back into a raw PAC handle.
     #[inline(always)]
-    pub(in crate::i2c) fn regs(&self) -> pac::lpi2c::Lpi2c {
-        self.regs
+    pub(in crate::i2c) fn controller_registers(&self) -> ControllerRegisters {
+        ControllerRegisters::from_pac(self.regs)
+    }
+
+    /// Get the target-specific, opaque register facade for this instance.
+    /// Its operations are visible only inside the target driver tree; callers
+    /// cannot turn this back into a raw PAC handle.
+    #[inline(always)]
+    pub(in crate::i2c) fn target_registers(&self) -> TargetRegisters {
+        TargetRegisters::from_pac(self.regs)
     }
 
     #[inline(always)]

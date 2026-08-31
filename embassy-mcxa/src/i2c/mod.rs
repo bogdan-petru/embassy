@@ -15,8 +15,8 @@ mod instance_info;
 pub(crate) use instance_info::Info;
 
 // Each protocol driver owns a private Tock/PAC facade and raw layout child.
-// This keeps controller and target MMIO vocabularies from being mixed by an
-// unrelated I2C implementation.
+// `Info` releases only role-specific opaque facades, so controller and target
+// MMIO vocabularies cannot be mixed through the shared instance state.
 
 pub(crate) mod sealed {
     /// Seal a trait

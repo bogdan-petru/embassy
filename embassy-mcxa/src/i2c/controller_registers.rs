@@ -34,7 +34,6 @@ use super::session::{
 };
 use super::{ControllerRxDma, ControllerTxDma};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, DmaChannel, InvalidParameters, TransferOptions};
-use crate::i2c::Info;
 use crate::pac;
 use crate::pac::lpi2c::Cmd as ControllerCommand;
 use crate::pac::lpi2c::{
@@ -571,7 +570,7 @@ const _: () = {
 
 /// Safe controller-specific operations over the LPI2C register block.
 #[derive(Clone, Copy)]
-pub(super) struct ControllerRegisters {
+pub(in crate::i2c) struct ControllerRegisters {
     pac: pac::lpi2c::Lpi2c,
     regs: &'static LpI2cRegisters,
 }
@@ -693,17 +692,14 @@ const _: () = {
 };
 
 impl ControllerRegisters {
-    fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    /// Build the opaque controller facade from the raw instance handle.
+    /// [`crate::i2c::Info::controller_registers`] is the only ordinary
+    /// production path to this constructor.
+    pub(in crate::i2c) fn from_pac(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
             pac: regs,
             regs: lpi2c_regs::from_pac(regs),
         }
-    }
-
-    /// Construct the controller facade from an instance's PAC handle. Outer
-    /// controller/session code deals only in this closed facade thereafter.
-    pub(super) fn from_info(info: &Info) -> Self {
-        Self::new(info.regs())
     }
 
     /// Cross-check the hidden raw layout against the linked PAC before

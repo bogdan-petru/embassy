@@ -80,13 +80,17 @@ use crate::dma::{Channel, DMA_MAX_TRANSFER_SIZE, DmaChannel, DmaRequest};
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
-use registers::{ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRegisters, TargetRxEvent, TargetTxStep};
+use registers::{ChunkEnd, ListenEvent, RxChunkEnd, TargetFault, TargetRxEvent, TargetTxStep};
 
 // Target protocol MMIO is private to this driver tree. The controller driver
-// has its own facade, so the two modes cannot name or mix each other's
+// has its own facade, so the two modes cannot name or operate each other's
 // protocol events, DMA leases, or raw Tock cells.
 #[path = "target_registers.rs"]
 mod registers;
+// Only the opaque facade name crosses the I2C sibling boundary so `Info`
+// can construct it. Its operational methods remain `pub(super)` inside this
+// target tree; controller code cannot operate a target facade.
+pub(in crate::i2c) use registers::TargetRegisters;
 
 /// Errors exclusive to hardware Initialization
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -222,7 +226,7 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         T::PERF_INT_INCR();
-        let registers = TargetRegisters::from_info(T::info());
+        let registers = T::info().target_registers();
         if registers.disable_interrupts_if_enabled() {
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
@@ -405,7 +409,7 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Resets both TX and RX FIFOs dropping their contents.
     #[inline(always)]
     fn registers(&self) -> TargetRegisters {
-        TargetRegisters::from_info(self.info)
+        self.info.target_registers()
     }
 
     fn reset_fifos(&self) {

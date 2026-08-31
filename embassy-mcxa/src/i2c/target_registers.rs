@@ -36,7 +36,6 @@ mod lpi2c_regs;
 use self::lpi2c_regs::LpI2cRegisters;
 use super::{Address, SetupError, TargetRxDma, TargetTxDma};
 use crate::dma::{DMA_MAX_TRANSFER_SIZE, InvalidParameters, TransferOptions};
-use crate::i2c::Info;
 use crate::pac;
 use crate::pac::lpi2c::{Addrcfg, Filtdz, Sasr, Scr, ScrRrf, ScrRtf, Sder, Sier, Srdr, Ssr, Stdr};
 use tock_registers::interfaces::{Readable, Writeable};
@@ -106,7 +105,7 @@ pub(super) enum ListenEvent {
 
 /// Safe target-specific operations over the LPI2C register block.
 #[derive(Clone, Copy)]
-pub(super) struct TargetRegisters {
+pub(in crate::i2c) struct TargetRegisters {
     pac: pac::lpi2c::Lpi2c,
     regs: &'static LpI2cRegisters,
 }
@@ -243,17 +242,14 @@ const _: () = {
 };
 
 impl TargetRegisters {
-    fn new(regs: pac::lpi2c::Lpi2c) -> Self {
+    /// Build the opaque target facade from the raw instance handle.
+    /// [`crate::i2c::Info::target_registers`] is the only ordinary
+    /// production path to this constructor.
+    pub(in crate::i2c) fn from_pac(regs: pac::lpi2c::Lpi2c) -> Self {
         Self {
             pac: regs,
             regs: lpi2c_regs::from_pac(regs),
         }
-    }
-
-    /// Construct the target facade from an instance's PAC handle. Target
-    /// orchestration works through the facade after this boundary.
-    pub(super) fn from_info(info: &Info) -> Self {
-        Self::new(info.regs())
     }
 
     /// Cross-check the hidden raw layout against the linked PAC before

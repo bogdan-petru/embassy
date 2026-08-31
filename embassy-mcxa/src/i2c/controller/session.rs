@@ -350,7 +350,7 @@ impl Session {
             self.phase == SessionPhase::Stable(Abort::ReadAddressed),
             "i2c: a first read command was requested outside the addressed-read phase"
         );
-        FirstReceivePermit::new(ControllerRegisters::from_info(self.info).identity(), &mut self.phase)
+        FirstReceivePermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
 
     /// Mint the opaque permit required for an ordinary CPU TRANSMIT. START,
@@ -366,7 +366,7 @@ impl Session {
             self.phase.permits_transmit(),
             "i2c: a transmit was requested outside a stable write transaction"
         );
-        let owner = ControllerRegisters::from_info(self.info).identity();
+        let owner = self.info.controller_registers().identity();
         CommandPermit::from_session(owner, self)
     }
 
@@ -381,7 +381,7 @@ impl Session {
             ),
             "i2c: a chained read command was requested before the first RECEIVE"
         );
-        ReadReceivePermit::new(ControllerRegisters::from_info(self.info).identity(), self)
+        ReadReceivePermit::new(self.info.controller_registers().identity(), self)
     }
 
     /// Mint the capability required to arm RX DMA. Keeping the session
@@ -393,7 +393,7 @@ impl Session {
             self.halt.is_empty(),
             "i2c: a session with an unresolved halt was handed to RX DMA"
         );
-        let owner = ControllerRegisters::from_info(self.info).identity();
+        let owner = self.info.controller_registers().identity();
         RxDmaPermit::new(owner, self)
     }
 
@@ -409,14 +409,14 @@ impl Session {
             self.phase == SessionPhase::Stable(Abort::General),
             "i2c: TX DMA was requested outside the write transaction phase"
         );
-        TxDmaPermit::new(ControllerRegisters::from_info(self.info).identity(), self)
+        TxDmaPermit::new(self.info.controller_registers().identity(), self)
     }
 
     /// A received byte proves the first queued RECEIVE executed. Later
     /// cleanup may now rely on its auto-NACK rather than inject a release
     /// command after a fault-frozen FIFO.
     fn note_read_progress(&mut self, progress: RxProgress) {
-        let owner = ControllerRegisters::from_info(self.info).identity();
+        let owner = self.info.controller_registers().identity();
         self.phase = self.phase.after_read_progress(progress, owner);
     }
 
@@ -433,7 +433,7 @@ impl Session {
     /// evidence here before exposing the byte, so ordinary CPU loops cannot
     /// forget the matching first-RECEIVE phase transition.
     pub(super) fn rx_step(&mut self) -> Result<Option<SessionRxStep>, IOError> {
-        let Some(step) = ControllerRegisters::from_info(self.info).rx_step() else {
+        let Some(step) = self.info.controller_registers().rx_step() else {
             return Ok(None);
         };
         match step {
@@ -454,7 +454,7 @@ impl Session {
             self.halt.is_empty(),
             "i2c: a session with an unresolved halt was continued"
         );
-        StartTransitionPermit::new(ControllerRegisters::from_info(self.info).identity(), &mut self.phase)
+        StartTransitionPermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
 
     /// Mint the only capability that may observe a queued START's terminal
@@ -466,7 +466,7 @@ impl Session {
             self.halt.is_empty(),
             "i2c: a session with an unresolved halt was settled as a START"
         );
-        StartStatusPermit::new(ControllerRegisters::from_info(self.info).identity(), self)
+        StartStatusPermit::new(self.info.controller_registers().identity(), self)
     }
 
     /// Mint the only capability that may enqueue a normal trailing STOP.
@@ -477,7 +477,7 @@ impl Session {
             self.halt.is_empty(),
             "i2c: a session with an unresolved halt was closed normally"
         );
-        StopTransitionPermit::new(ControllerRegisters::from_info(self.info).identity(), &mut self.phase)
+        StopTransitionPermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
 
     /// Turn the moved, STOP-pending session into the owner that is threaded
@@ -502,7 +502,7 @@ impl Session {
         // may not yet have moved that byte to memory. Classify this before
         // choosing the halted-fault recovery side so every CPU/DMA caller
         // shares the same proof rule.
-        let regs = ControllerRegisters::from_info(self.info);
+        let regs = self.info.controller_registers();
         if let Some(progress) = regs.observe_rx_progress() {
             self.note_read_progress(progress);
         }
@@ -540,7 +540,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let regs = ControllerRegisters::from_info(self.info);
+        let regs = self.info.controller_registers();
         // Capture a fault that arrived after the caller's last event step
         // before selecting a pending-command close policy. In particular a
         // halted first RECEIVE must recover as ReadAddressed because its
@@ -1124,7 +1124,7 @@ impl StopWait {
     }
 
     pub(super) fn owner(&self) -> usize {
-        ControllerRegisters::from_info(self.session.info).identity()
+        self.session.info.controller_registers().identity()
     }
 
     pub(super) fn into_completed(self, _seal: FacadeSeal) -> StopCompleted {
@@ -1254,7 +1254,7 @@ impl StartReservation {
 
     pub(super) fn start_transition_permit(&mut self) -> StartTransitionPermit<'_> {
         assert!(self.armed, "i2c: a fresh START used a released reservation");
-        StartTransitionPermit::new(ControllerRegisters::from_info(self.info).identity(), &mut self.phase)
+        StartTransitionPermit::new(self.info.controller_registers().identity(), &mut self.phase)
     }
 
     pub(super) fn into_pending_session(mut self, timeout: embassy_time::Duration) -> Session {
