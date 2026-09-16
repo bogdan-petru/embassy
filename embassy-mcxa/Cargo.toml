@@ -1,0 +1,215 @@
+[package]
+name = "embassy-mcxa"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Embassy Hardware Abstraction Layer (HAL) for NXP MCXA series of MCUs"
+repository = "https://github.com/embassy-rs/embassy"
+keywords = ["embedded", "hal", "nxp", "mcxa", "embassy"]
+categories = ["embedded", "hardware-support", "no-std"]
+documentation = "https://docs.embassy.dev/embassy-mcxa"
+
+publish = false
+
+[package.metadata.embassy]
+build = [
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa2xx"]},
+    {target = "thumbv8m.main-none-eabihf", features = ["defmt", "unstable-pac", "mcxa5xx"]},
+]
+
+[package.metadata.embassy_docs]
+src_base = "https://github.com/embassy-rs/embassy/blob/embassy-mcxa-v$VERSION/embassy-mcxa/src/"
+src_base_git = "https://github.com/embassy-rs/embassy/blob/$COMMIT/embassy-mcxa/src/"
+
+features = ["defmt", "unstable-pac"]
+flavors = [
+    { name = "mcx-a256", target = "thumbv8m.main-none-eabihf", features = ["mcxa2xx"] },
+    { name = "mcx-a577", target = "thumbv8m.main-none-eabihf", features = ["mcxa5xx"] },
+]
+
+[dependencies]
+bbqueue = { version = "0.7.0", features = ["disable-cache-padding"] }
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+# The generated interrupt module re-exports this macro even for host checks.
+# The actual device vector table remains target-specific through nxp-pac/rt.
+cortex-m-rt = { version = "0.7", features = ["device"] }
+critical-section = "1.2.0"
+tock-registers = "0.9"
+safe-mmio = { version = "=0.3.1", optional = true }
+abacus-registers = { path = "experimental/abacus-registers", default-features = false, optional = true }
+i2c-one-shot-core = { path = "experimental/i2c-one-shot-core", optional = true }
+i2c-one-shot-interface = { path = "experimental/i2c-one-shot-interface", optional = true }
+i2c-one-shot-vocabulary = { path = "experimental/i2c-one-shot-vocabulary", optional = true }
+uart-one-shot-core = { path = "experimental/uart-one-shot-core", optional = true }
+uart-one-shot-interface = { path = "experimental/uart-one-shot-interface", optional = true }
+uart-one-shot-vocabulary = { path = "experimental/uart-one-shot-vocabulary", optional = true }
+defmt = { version = "1.0", optional = true }
+embassy-embedded-hal = { version = "0.6.0", path = "../embassy-embedded-hal" }
+embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
+embassy-hal-internal = { version = "0.5.0", path = "../embassy-hal-internal", features = ["cortex-m", "prio-bits-3"] }
+embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+embedded-hal-02 = { package = "embedded-hal", version = "0.2.6", features = ["unproven"] }
+embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+embedded-hal-async = { version = "1.0" }
+embedded-hal-nb = { version = "1.0" }
+embedded-io = "0.7"
+embedded-io-async = { version = "0.7.0" }
+embedded-mcu-hal = { version = "0.2.0", optional = true }
+embedded-storage = "0.3.1"
+
+# Custom executor support
+embassy-executor = { version = "0.10.0", path = "../embassy-executor" }
+
+# USB device driver trait layer
+embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
+
+# `time` dependencies
+embassy-time = { version = "0.5.1", path = "../embassy-time" }
+embassy-time-driver = { version = "0.2.2", path = "../embassy-time-driver", features = ["tick-hz-1_000_000"] }
+embassy-time-queue-utils = { version = "0.3.2", path = "../embassy-time-queue-utils" }
+
+grounded = { version = "0.2.1", features = ["cas", "critical-section"] }
+heapless = "0.9"
+maitake-sync = { version = "0.3.0", default-features = false, features = ["critical-section", "no-cache-pad"] }
+nb = "1.1.0"
+# TEMPORARY: pinned to the branch behind upstream PR embassy-rs/nxp-pac#108, which
+# adds the MCXA577 USBHS/USBPHY register blocks this driver needs. Those registers
+# only exist on that branch until the PR merges. Switch both nxp-pac entries back to
+# a released/main rev of `https://github.com/embassy-rs/nxp-pac.git` once #108 merges.
+nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0" }
+paste = "1.0.15"
+
+rand-core-06 = { package = "rand_core", version = "0.6" }
+rand-core-09 = { package = "rand_core", version = "0.9" }
+rand-core-10 = { package = "rand_core", version = "0.10" }
+
+# Host unit tests exercise pure decision logic. Keep interrupt-vector support
+# target-specific so an embedded `--no-default-features` build retains the
+# original PAC/runtime behavior while the host test build does not link an ARM
+# vector table or critical-section implementation.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0", features = ["rt"] }
+
+[build-dependencies]
+# TEMPORARY: see the note on the `[dependencies]` nxp-pac entry above. Switch back
+# to `https://github.com/embassy-rs/nxp-pac.git` once embassy-rs/nxp-pac#108 merges.
+nxp-pac = { git = "https://github.com/bogdan-petru/nxp-pac.git", rev = "1a3fd38855dc1d9c81c3ecdf7be2188e363180f0", default-features = false, features = ["metadata"] }
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+regex = "1.12.3"
+syn = "2.0.117"
+convert_case = "0.11"
+indexmap = "2.14.0"
+
+[features]
+default = ["rt", "swd-swo-as-gpio", "dma-ipd-req"]
+
+# Base defmt feature enables core + panic handler
+# Use with one logger feature: defmt-rtt (preferred) or defmt-uart (fallback)
+defmt = ["dep:defmt", "nxp-pac/defmt", "i2c-one-shot-core?/defmt", "uart-one-shot-core?/defmt"]
+
+# Enable optional embedded-mcu-hal traits
+embedded-mcu-hal = ["dep:embedded-mcu-hal"]
+
+unstable-pac = []
+
+# Experimental one-shot async/DMA controller; not a replacement for `controller::I2c`.
+i2c-one-shot = ["dep:safe-mmio", "dep:abacus-registers", "dep:i2c-one-shot-core", "dep:i2c-one-shot-interface", "dep:i2c-one-shot-vocabulary"]
+uart-one-shot = ["dep:safe-mmio", "dep:abacus-registers", "dep:uart-one-shot-core", "dep:uart-one-shot-interface", "dep:uart-one-shot-vocabulary"]
+
+# Real one-shot adapter effects over host RAM; never enable for firmware.
+one-shot-host-tests = ["test", "i2c-one-shot", "safe-mmio/custom-mmio"]
+
+# Allows for using SOSC pins as normal GPIOs.
+#
+# DISABLING this allows for use of SOSC, but reserves the GPIO pins required.
+# ENABLING this means SOSC cannot be set/configured, but makes the GPIO pins available
+sosc-as-gpio = []
+
+# Allows for using the ROSC (32k external clock) pins as normal GPIOs.
+#
+# DISABLING this allows for use of the 32k clock, but reserves the GPIO pins required.
+# ENABLING this means the 32k clock cannot be set/configured, but makes the GPIO pins available
+#
+# NOTE: Only applicable to MCXA5xx.
+rosc-32k-as-gpio = []
+
+# Allows for using SWDIO and SWCLK pins as normal GPIOs.
+#
+# WARNING: This WILL cause problems if you plan to use defmt over RTT,
+# or otherwise debug the system while running.
+#
+# If this feature is enabled, the relevant pin(s) will be set to floating inputs
+# in the HAL init function.
+#
+# This does NOT include the SWO pin.
+swd-as-gpio = []
+
+# Allows for using the SWD SWO pins as a normal GPIO. This is not used for
+# basic probe-rs/rtt usage, but is sometimes used with ITM.
+#
+# If this feature is enabled, the relevant pin(s) will be set to floating inputs
+# in the HAL init function.
+swd-swo-as-gpio = []
+
+# Allows for using the extra JTAG pins (TDI, ISPMODE_N) as normal GPIOs. You
+# must also select `swd-as-gpio`, `swd-swo-as-gpio`, and MAYBE `dangerous-reset-as-gpio`
+# to recover all JTAG pins. These are called "extras" because they aren't also used
+# for normal SWD/SWO.
+jtag-extras-as-gpio = []
+
+# Allows for using the reset pin as a normal GPIO.
+#
+# This is NOT recommended, and we have not currently tested whether it remains
+# possible to reset the device and reflash using probe-rs after enabling this
+# feature. Use at your own risk!
+dangerous-reset-as-gpio = []
+
+# Unmasks DMA IPD_REQ hardware lines in AHBSC during init. (only on MCXA5xx)
+#
+# If this feature is not set, something else is responsible for unmasking them
+# when driving DMA transfers from hardware peripheral requests.
+# This can either be another (trustzone secure) binary or from IFR0 CFPA Trustzone presets.
+dma-ipd-req = []
+
+# Dummy feature required by an embassy-hal-internal lint. Interrupt-vector
+# support is selected from the actual target architecture above, so embedded
+# `--no-default-features` builds retain the same behavior as before.
+rt = []
+
+## Enable host execution of pure HAL decision tests.
+##
+## This substitutes the std critical-section and time-driver implementations
+## for the MCU-only OSTIMER/vector setup. It is intentionally test-only: run
+## it with `--no-default-features`, and never select it for firmware.
+test = ["critical-section/std", "embassy-time/std", "embassy-time/generic-queue-8"]
+
+# Enable perf counters
+perf = []
+
+# Enable irq tracing
+trace = []
+
+# Enable the custom executor platform implementation, which allows for low-power modes.
+#
+# If this feature is enabled, users should NOT enable `embassy-executor/platform-cortex-m` or any other executor platform.
+executor-platform = []
+
+# This feature is not done yet, don't use it!
+unstable-osc32k = []
+
+#
+# Chip family selection
+#
+mcxa2xx = ["nxp-pac/mcxa256"]
+mcxa5xx = ["nxp-pac/mcxa577"]
+
+[dev-dependencies]
+# The HAL's normal executor dependency is sufficient for its host unit tests.
+# Do not add the Cortex-M executor platform here: it emits ARM-only
+# instructions and would prevent the pure I2C decision tests from running on
+# the host.
+embedded-storage = "0.3.1"
+panic-halt = "1.0.0"
+static_cell = "2.1.1"

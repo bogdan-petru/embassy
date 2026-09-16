@@ -1,0 +1,21 @@
+target
+target_ci
+target_ci_stable
+# Root-only one-off validation build directories; live target/ evidence is retained.
+/target-*/
+Cargo.lock
+third_party
+webroot
+/Cargo.toml
+out/
+# Python register-generator cache
+/embassy-mcxa/tools/__pycache__/
+# editor artifacts
+.zed
+.neoconf.json
+*.vim
+**/.idea
+**/.nvim.lua
+**/.cargo
+!**/tests/**/.cargo
+!**/examples/**/.cargo

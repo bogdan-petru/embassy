@@ -1,0 +1,17 @@
+[package]
+name = "uart-one-shot-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Short UART DMA TX protocol: DMA quiescence is not wire completion"
+
+[features]
+default = []
+defmt = ["uart-one-shot-vocabulary/defmt"]
+
+[dependencies]
+uart-one-shot-vocabulary = { path = "../uart-one-shot-vocabulary", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"

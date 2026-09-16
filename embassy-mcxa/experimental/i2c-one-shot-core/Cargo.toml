@@ -1,0 +1,19 @@
+[package]
+name = "i2c-one-shot-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Small hardware-independent ownership protocol for one async DMA I2C write"
+
+[features]
+default = []
+defmt = ["i2c-one-shot-vocabulary/defmt"]
+
+[dependencies]
+i2c-one-shot-vocabulary = { path = "../i2c-one-shot-vocabulary", default-features = false }
+
+[dev-dependencies]
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+syn = { version = "2.0", features = ["full", "visit", "extra-traits"] }
+serde_json = "1.0"

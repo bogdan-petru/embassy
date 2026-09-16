@@ -1,0 +1,24 @@
+[target.thumbv8m.main-none-eabihf]
+runner = 'probe-rs run --chip MCXA577 --preverify --verify --protocol swd --speed 12000'
+
+rustflags = [
+  "-C", "linker=flip-link",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+  # This is needed if your flash or ram addresses are not aligned to 0x10000 in memory.x
+  # See https://github.com/rust-embedded/cortex-m-quickstart/pull/95
+  "-C", "link-arg=--nmagic",
+]
+
+[build]
+target = "thumbv8m.main-none-eabihf" # Cortex-M33
+
+[env]
+# `info` is the validated default for this crate. `trace` (and even
+# per-race `debug` logs in the two-board suite) push enough RTT volume
+# to fault the MCU-Link debug connection mid-session ("Target device
+# responded with a FAULT response" / DAP DRW errors) — the exact
+# builds used for hardware validation are DEFMT_LOG=info. Cargo [env]
+# is non-forcing, so a real environment variable still overrides this
+# for targeted telemetry runs.
+DEFMT_LOG = "info"

@@ -1,0 +1,14 @@
+[package]
+name = "uart-one-shot-vocabulary"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Unsafe-free UART TX operations over owned capabilities"
+
+[features]
+default = []
+defmt = ["uart-one-shot-interface/defmt"]
+
+[dependencies]
+uart-one-shot-interface = { path = "../uart-one-shot-interface", default-features = false }

@@ -1,0 +1,12 @@
+[package]
+name = "one-shot-pac-bypass-compile-control"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Compile-only negative control for an unsafe-code lint, not firmware to run.
+# Its own workspace prevents accidental inclusion in the protocol crate graph.
+[workspace]
+
+[dependencies]
+embassy-mcxa = { path = "../../../../..", default-features = false, features = ["mcxa5xx", "unstable-pac"] }

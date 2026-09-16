@@ -1,0 +1,21 @@
+[package]
+name = "abacus-registers"
+version = "0.1.0"
+description = "System to statically prevent driver device protocol bugs via Abacus DSL and typestates"
+repository = "https://github.com/abacus-rs/abacus-registers"
+readme = "README.md"
+keywords = ["Drivers", "TypeStates"]
+license = "MIT"
+edition = "2021"
+
+[features]
+default = []
+# Retained upstream API; not used by the safe-mmio backend.
+legacy-tock = ["dep:tock-registers"]
+
+[dependencies]
+abacus-registers-dsl = { version = "0.1.0", path = "abacus-registers-dsl" }
+tock-registers = { version = "0.9.0", optional = true }
+
+[dev-dependencies]
+safe-mmio = { version = "=0.3.1", features = ["custom-mmio"] }

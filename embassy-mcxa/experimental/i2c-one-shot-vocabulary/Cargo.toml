@@ -1,0 +1,14 @@
+[package]
+name = "i2c-one-shot-vocabulary"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Unsafe-forbidden I2C operations over owned CPU and DMA capabilities"
+
+[features]
+default = []
+defmt = ["i2c-one-shot-interface/defmt"]
+
+[dependencies]
+i2c-one-shot-interface = { path = "../i2c-one-shot-interface", default-features = false }

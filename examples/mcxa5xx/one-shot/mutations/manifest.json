@@ -1,0 +1,1006 @@
+{
+  "version": 1,
+  "timeout_seconds": 600,
+  "relevant_paths": [
+    ".cargo",
+    "rust-toolchain.toml",
+    "embassy-mcxa/src",
+    "embassy-mcxa/Cargo.toml",
+    "embassy-mcxa/Cargo.lock",
+    "embassy-mcxa/build.rs",
+    "embassy-mcxa/tools",
+    "embassy-mcxa/experimental/i2c-one-shot-core",
+    "embassy-mcxa/experimental/i2c-one-shot-interface",
+    "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+    "embassy-mcxa/experimental/abacus-registers",
+    "embassy-embedded-hal",
+    "embassy-executor",
+    "embassy-executor-macros",
+    "embassy-executor-timer-queue",
+    "embassy-futures",
+    "embassy-hal-internal",
+    "embassy-sync",
+    "embassy-time",
+    "embassy-time-driver",
+    "embassy-time-queue-utils",
+    "embassy-usb-driver"
+  ],
+  "cases": [
+    {
+      "id": "forbidden-full-session-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/controller/session.rs",
+      "anchor": "pub(super) fn remediate_before_session(regs: &ControllerRegisters, timeout: embassy_time::Duration) {",
+      "replacement": "pub(super) fn remediate_before_session(regs: &ControllerRegisters, timeout: embassy_time::Duration) {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };",
+      "guarantee": "Full-driver session logic forbids newly introduced explicit unsafe, not safe PAC access.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "check",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,test",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "PROGRESS.md checkpoint 7: compiler lint boundary; no PAC-free claim for the full HAL."
+      ]
+    },
+    {
+      "id": "forbidden-bus-clear-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/controller/bus_clear.rs",
+      "anchor": "fn wait_scl_high(scl: &TemporaryOpenDrain<'_>, delay: &mut impl DelayNs) -> bool {",
+      "replacement": "fn wait_scl_high(scl: &TemporaryOpenDrain<'_>, delay: &mut impl DelayNs) -> bool {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };",
+      "guarantee": "Bus-clear sequencing forbids newly introduced explicit unsafe, not safe PAC access.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "check",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,test",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "PROGRESS.md checkpoint 7: diagnostic and exact-location control."
+      ]
+    },
+    {
+      "id": "forbidden-reset-sequence-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/reset_sequence.rs",
+      "anchor": "fn confirm(io: &mut impl RegisterIo, role: Role, mode: u32, reset: bool, enable: bool) -> bool {",
+      "replacement": "fn confirm(io: &mut impl RegisterIo, role: Role, mode: u32, reset: bool, enable: bool) -> bool {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };",
+      "guarantee": "Register-effect sequencing stays explicitly unsafe-free; concrete effects remain trusted.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "check",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,test",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "PROGRESS.md checkpoint 7: compiler lint boundary."
+      ]
+    },
+    {
+      "id": "one-shot-irq-pac-bypass",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/binding.rs",
+      "anchor": "        effects::wake_interrupt(T::Interrupt::disable, T::info().wait_cell());",
+      "replacement": "        crate::pac::LPI2C0.mtdr().write(|word| word.set_data(0));\n        effects::wake_interrupt(T::Interrupt::disable, T::info().wait_cell());",
+      "guarantee": "The inventoried wake path rejects added PAC accesses by source policy, not compiler sealing.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-core",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "wake_only_irq_policy",
+        "--message-format=json",
+        "one_shot_irq_executes_only_the_reviewed_wake_path",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "one_shot_irq_executes_only_the_reviewed_wake_path",
+        "assertion": "ONE_SHOT_WAKE_ONLY_IRQ_POLICY"
+      },
+      "evidence": [
+        "The independent compile-only PAC fixture proves the same access is accepted under forbid(unsafe_code)."
+      ]
+    },
+    {
+      "id": "one-shot-reset-release-unobserved",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/reset_sequence.rs",
+      "anchor": "    if !confirm(io, role, mode, false, false) {",
+      "replacement": "    if false {",
+      "guarantee": "The one-shot's real MMIO adapter must observe reset release before releasing its pins.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::reset_acknowledgment_precedes_release_and_pin_handoff",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::reset_acknowledgment_precedes_release_and_pin_handoff",
+        "assertion": "ONE_SHOT_RESET_CONFIRMED_BEFORE_RELEASE"
+      },
+      "evidence": [
+        "PROGRESS.md checkpoint 7: delayed acknowledgment through the real control boundary and MMIO recorder."
+      ]
+    },
+    {
+      "id": "one-shot-cross-instance-endpoint",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/endpoint.rs",
+      "anchor": "fn retain_instance(endpoint: TxEndpoint<crate::peripherals::LPI2C0>) -> TxEndpoint<crate::peripherals::LPI2C0> {\n            endpoint\n        }",
+      "replacement": "fn retain_instance(endpoint: TxEndpoint<crate::peripherals::LPI2C1>) -> TxEndpoint<crate::peripherals::LPI2C0> {\n            endpoint\n        }",
+      "guarantee": "The acquired typed endpoint cannot silently change its instance before explicit erasure.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0308",
+        "message_contains": "mismatched types",
+        "span": {
+          "text": "endpoint",
+          "occurrence": 2
+        }
+      },
+      "evidence": [
+        "After erasure the endpoint is opaque and non-Copy, not type-branded; no stronger guarantee is claimed."
+      ]
+    },
+    {
+      "id": "omit-reset-release-confirmation",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/reset_sequence.rs",
+      "anchor": "    if !confirm(io, role, mode, false, false) {",
+      "replacement": "    if false {",
+      "guarantee": "Reset release must be observed before configuration is restored or an enabled owner can be produced.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,test",
+        "--message-format=json",
+        "i2c::reset_sequence::tests::reset_confirmation_precedes_release_and_restore_remove_wait_regression",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::reset_sequence::tests::reset_confirmation_precedes_release_and_restore_remove_wait_regression",
+        "assertion": "RESET_CONFIRMATION_BEFORE_DEPENDENT_EFFECT"
+      },
+      "evidence": [
+        "WATCHDOG.md: the production reset sequence runs against scripted register effects; this is not a bus-waveform or peer-release test."
+      ]
+    },
+    {
+      "id": "write-only-read",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "    registers.write_mtdr(0);",
+      "replacement": "    let _ = registers.read_mtdr();",
+      "guarantee": "A write-only TX register exposes no CPU read operation.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `read_mtdr`",
+        "span": {
+          "text": "read_mtdr"
+        }
+      },
+      "evidence": [
+        "The actual generated LPI2C owner is compiled with the real host recorder before this exact direction rejection is checked."
+      ]
+    },
+    {
+      "id": "read-only-write",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "    registers.write_mtdr(0);",
+      "replacement": "    registers.write_msr(0);",
+      "guarantee": "A pure status register exposes no CPU write operation.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `write_msr`",
+        "span": {
+          "text": "write_msr"
+        }
+      },
+      "evidence": [
+        "The direct map exposes retained MSR reads but no CPU status write; hardware semantics remain separately reviewed."
+      ]
+    },
+    {
+      "id": "private-raw-base",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "    registers.write_mtdr(0);",
+      "replacement": "    let _raw = registers.base;\n    registers.write_mtdr(0);",
+      "guarantee": "Code outside the generated owner cannot retrieve its private raw base.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0616",
+        "message_contains": "field `base`",
+        "span": {
+          "text": "base"
+        }
+      },
+      "evidence": [
+        "The sibling fixture is outside the generated module, so this is the actual Rust privacy boundary rather than a convention."
+      ]
+    },
+    {
+      "id": "consumed-register-owner",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "    let streaming = registers.into_arm_dma();\n    let _ = streaming;",
+      "replacement": "    let streaming = registers.into_arm_dma();\n    let _again = registers.into_arm_dma();\n    let _ = streaming;",
+      "guarantee": "A consumed enabled register owner cannot be used for another transition.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0382",
+        "message_contains": "use of moved value: `registers`",
+        "span": {
+          "text": "registers",
+          "occurrence": 2
+        }
+      },
+      "evidence": [
+        "The real Enabled -> Streaming transition consumes the actual owner; this also rejects implicit copying of it."
+      ]
+    },
+    {
+      "id": "enabled-timing-write",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "    registers.write_mtdr(0);",
+      "replacement": "    registers.write_mcfgr1(0);",
+      "guarantee": "Timing/configuration registers are unavailable once the controller has reached Enabled.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `write_mcfgr1`",
+        "span": {
+          "text": "write_mcfgr1"
+        }
+      },
+      "evidence": [
+        "The real direct owner admits timing writes only in Off; the positive command also exercises confirmed construction in the host recorder."
+      ]
+    },
+    {
+      "id": "streaming-cpu-mrdr",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "fn direct_streaming_surface(mut registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n    let _ = registers.read_msr();",
+      "replacement": "fn direct_streaming_surface(mut registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n    let _ = registers.read_mrdr();",
+      "guarantee": "A Streaming owner cannot destructively pop the CPU receive FIFO while DMA owns the transfer.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `read_mrdr`",
+        "span": {
+          "text": "read_mrdr"
+        }
+      },
+      "evidence": [
+        "The direct Streaming API retains only non-destructive status/FIFO observation plus interrupt masking; no receive-data pop exists."
+      ]
+    },
+    {
+      "id": "register-owner-no-clone",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/direct_map_fixture.rs",
+      "anchor": "fn direct_owner_identity(registers: mmio::Lpi2cRegisters<mmio::Enabled>) {\n    let _ = registers;",
+      "replacement": "fn direct_owner_identity(registers: mmio::Lpi2cRegisters<mmio::Enabled>) {\n    let _clone = registers.clone();",
+      "guarantee": "The physical register owner cannot be cloned into a second CPU capability.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `clone`",
+        "span": {
+          "text": "clone",
+          "occurrence": 2
+        }
+      },
+      "evidence": [
+        "The direct owner is also moved by the fixed DMA transition; its private base and !Send/!Sync marker prevent raw or cross-thread sharing."
+      ]
+    },
+    {
+      "id": "static-dma-source",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/mod.rs",
+      "anchor": "        assert_eq!(validate(0x2a, 16), Ok(()));",
+      "replacement": "        assert_eq!(validate(0x2a, 16), Ok(()));\n        async fn stack_source(bus: I2c) {\n            let message = [42_u8; 16];\n            bus.write(0x2a, &message).await.unwrap();\n        }",
+      "guarantee": "A stack buffer cannot satisfy the deliberately static DMA source contract.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,test,i2c-one-shot",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0597",
+        "message_contains": "`message` does not live long enough",
+        "span": {
+          "text": "&message"
+        }
+      },
+      "evidence": [
+        "one_shot/mod.rs: static-buffer compile-fail example; static storage protects a forgotten future without guaranteeing that Drop runs."
+      ]
+    },
+    {
+      "id": "forbidden-core-root-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-core/src/lib.rs",
+      "anchor": "pub use i2c_one_shot_vocabulary::{Backend, DmaPoll, Error, ReceivePoll, Status, WakeOn};",
+      "replacement": "pub use i2c_one_shot_vocabulary::{Backend, DmaPoll, Error, ReceivePoll, Status, WakeOn};\npub fn mutation_root_unsafe() {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };\n}",
+      "guarantee": "The protocol crate root forbids explicit unsafe, not just its previously protected protocol module.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-core",
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "Cargo.toml",
+        "--lib",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "Declared with the capsule-style split; an isolated committed-baseline run is required before this case is recorded PASS."
+      ]
+    },
+    {
+      "id": "forbidden-vocabulary-root-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/src/lib.rs",
+      "anchor": "pub use vocabulary::Hardware;",
+      "replacement": "pub use vocabulary::Hardware;\npub fn mutation_root_unsafe() {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };\n}",
+      "guarantee": "The extracted protocol vocabulary forbids explicit unsafe at its crate root as well as in its modules.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "Cargo.toml",
+        "--lib",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "Declared with the layer-3 extraction; isolated committed-baseline validation remains required before recording PASS."
+      ]
+    },
+    {
+      "id": "vocabulary-cpu-raw-device-private",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "    fn keep_cpu<D: Device>(cpu: Cpu<D>) -> Cpu<D> {\n        let _ = &cpu;\n        cpu\n    }",
+      "replacement": "    fn keep_cpu<D: Device>(cpu: Cpu<D>) -> Cpu<D> {\n        let _ = &cpu.device;\n        cpu\n    }",
+      "guarantee": "Vocabulary consumers cannot extract the raw physical Device from an opaque CPU capability.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0616",
+        "message_contains": "field `device`",
+        "span": {
+          "text": "device"
+        }
+      },
+      "evidence": [
+        "The positive operations test moves actual Cpu/InFlight wrappers; a committed mutation run must verify this precise private-field rejection."
+      ]
+    },
+    {
+      "id": "vocabulary-flight-raw-lease-private",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "    fn keep_dma<D: Device>(flight: InFlight<D>) -> InFlight<D> {\n        let _ = &flight;\n        flight\n    }",
+      "replacement": "    fn keep_dma<D: Device>(flight: InFlight<D>) -> InFlight<D> {\n        let _ = &flight.lease;\n        flight\n    }",
+      "guarantee": "Vocabulary consumers cannot extract or split the physical lease from an opaque in-flight capability.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0616",
+        "message_contains": "field `lease`",
+        "span": {
+          "text": "lease"
+        }
+      },
+      "evidence": [
+        "The positive operations test keeps the lower cleanup owner intact; this case requires exact diagnostic/path/span matching, not merely compile failure."
+      ]
+    },
+    {
+      "id": "vocabulary-flight-has-no-cpu-command",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "    fn observe_owner<D: Device>(flight: &mut InFlight<D>) {\n        let _ = &flight;\n    }",
+      "replacement": "    fn observe_owner<D: Device>(flight: &mut InFlight<D>) {\n        flight.command(Command::Stop);\n    }",
+      "guarantee": "An in-flight capability cannot issue a CPU command before the physical binding returns quiescent CPU authority.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `command`",
+        "span": {
+          "text": "command"
+        }
+      },
+      "evidence": [
+        "Layer-2 opaque capability API beneath the unsafe-free vocabulary; low-level DMA quiescence ordering remains covered separately by real-adapter mutations."
+      ]
+    },
+    {
+      "id": "forbidden-protocol-unsafe",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-core/src/protocol.rs",
+      "anchor": "pub fn checked(status: Status, want_stop: bool) -> Result<Status, Error> {",
+      "replacement": "pub fn checked(status: Status, want_stop: bool) -> Result<Status, Error> {\n    let _probe = unsafe { core::ptr::read_volatile(&0_u32) };",
+      "guarantee": "The protocol logic's forbid(unsafe_code) scope rejects an actually required unsafe operation.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-core",
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "Cargo.toml",
+        "--lib",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "unsafe_code",
+        "message_contains": "usage of an `unsafe` block",
+        "span": {
+          "text": "unsafe { core::ptr::read_volatile(&0_u32) }"
+        }
+      },
+      "evidence": [
+        "The complete protocol and vocabulary libraries forbid unsafe, including declarations; the interface crate alone owns the reviewed unsafe Device declaration. A separate self-test caps lints and requires this mutation to survive as FAIL."
+      ]
+    },
+    {
+      "id": "omit-dma-quiesce",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/dma_boundary.rs",
+      "anchor": "        requests_off(&mut self);\n        effects.quiesce();\n        fence(Ordering::Acquire);",
+      "replacement": "        requests_off(&mut self);\n        fence(Ordering::Acquire);",
+      "guarantee": "DMA quiescence must return before CPU authority is restored.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::dma_success_quiesces_before_cpu_authority_returns",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::dma_success_quiesces_before_cpu_authority_returns",
+        "assertion": "EFFECT_QUIESCE_ORDER"
+      },
+      "evidence": [
+        "IMPLEMENTATION-PLAN.md sections 2-3: real-adapter DMA completion trace; HAL-internal quiescence is outside this seam."
+      ]
+    },
+    {
+      "id": "quiesce-before-tdde-off",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/dma_boundary.rs",
+      "anchor": "        requests_off(&mut self);\n        effects.quiesce();\n        fence(Ordering::Acquire);",
+      "replacement": "        effects.quiesce();\n        requests_off(&mut self);\n        fence(Ordering::Acquire);",
+      "guarantee": "Controller DMA request generation stops before channel quiescence begins.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::dma_success_quiesces_before_cpu_authority_returns",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::dma_success_quiesces_before_cpu_authority_returns",
+        "assertion": "EFFECT_QUIESCE_ORDER"
+      },
+      "evidence": [
+        "IMPLEMENTATION-PLAN.md sections 2-3: ordered TDDE-off and DMA quiesce effects."
+      ]
+    },
+    {
+      "id": "dma-done-as-wire-completion",
+      "kind": "behavior",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-core/src/protocol.rs",
+      "anchor": "            if status.stop_seen && status.controller_idle {",
+      "replacement": "            let _observed = status;\n            if true {",
+      "guarantee": "Reaching STOP completion after DMA DONE is insufficient without observed STOP and controller idle.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::dma_done_is_not_wire_completion_stop_and_idle_are_both_required",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::dma_done_is_not_wire_completion_stop_and_idle_are_both_required",
+        "assertion": "EFFECT_WIRE_COMPLETION"
+      },
+      "evidence": [
+        "IMPLEMENTATION-PLAN.md sections 2-3: DMA completion remains distinct from wire completion."
+      ]
+    },
+    {
+      "id": "omit-i2c-irq-rearm",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers.rs",
+      "anchor": "    effects.irq_enable();\n    decode(Msr(registers.status()))",
+      "replacement": "    if false {\n        effects.irq_enable();\n    }\n    decode(Msr(registers.status()))",
+      "guarantee": "A pending poll retains an event-triggered live wake path after registration and observation.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::i2c_observe_event_boundaries_are_ready_or_have_a_live_wake",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::i2c_observe_event_boundaries_are_ready_or_have_a_live_wake",
+        "assertion": "EFFECT_WAKE_LIVE"
+      },
+      "evidence": [
+        "IMPLEMENTATION-PLAN.md sections 2-3: enumerated real WaitCell/NVIC/ISR schedules; not exhaustive hardware interleavings."
+      ]
+    },
+    {
+      "id": "streaming-cpu-mtdr",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers.rs",
+      "anchor": "mod tests {\n    use super::*;",
+      "replacement": "mod tests {\n    use super::*;\n\n    #[allow(dead_code, unused_mut)]\n    fn mutation_streaming_mtdr(mut registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n        registers.write_mtdr(0);\n    }",
+      "guarantee": "The streaming register owner has no CPU TX FIFO command write.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `write_mtdr`",
+        "span": {
+          "text": "write_mtdr"
+        }
+      },
+      "evidence": [
+        "Generated Streaming access policy; the positive command executes the real-adapter host suite before the illegal helper is inserted."
+      ]
+    },
+    {
+      "id": "streaming-arbitrary-mder",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers.rs",
+      "anchor": "mod tests {\n    use super::*;",
+      "replacement": "mod tests {\n    use super::*;\n\n    #[allow(dead_code, unused_mut)]\n    fn mutation_streaming_mder(mut registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n        registers.write_mder(1);\n    }",
+      "guarantee": "The streaming register owner has no arbitrary DMA request register setter.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `write_mder`",
+        "span": {
+          "text": "write_mder"
+        }
+      },
+      "evidence": [
+        "Generated Streaming access policy; requests-off remains private to consuming paired quiescence."
+      ]
+    },
+    {
+      "id": "streaming-controller-reset",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers.rs",
+      "anchor": "mod tests {\n    use super::*;",
+      "replacement": "mod tests {\n    use super::*;\n\n    #[allow(dead_code)]\n    fn mutation_streaming_disable(registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n        let _disabled = registers.reset_confirmed(|| 0);\n    }",
+      "guarantee": "The streaming register owner cannot bypass paired quiescence by resetting/disabling the controller.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `reset_confirmed`",
+        "span": {
+          "text": "reset_confirmed"
+        }
+      },
+      "evidence": [
+        "Confirmed-control entry is available only to non-streaming owners; the actual quiescence order is covered by behavioral mutations."
+      ]
+    },
+    {
+      "id": "streaming-controller-enable",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers.rs",
+      "anchor": "mod tests {\n    use super::*;",
+      "replacement": "mod tests {\n    use super::*;\n\n    #[allow(dead_code)]\n    fn mutation_streaming_reset(registers: mmio::Lpi2cRegisters<mmio::Streaming>) {\n        let _enabled = registers.enable_confirmed(|| 0);\n    }",
+      "guarantee": "The streaming register owner cannot manufacture CPU authority through the confirmed-enable entry point.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0599",
+        "message_contains": "no method named `enable_confirmed`",
+        "span": {
+          "text": "enable_confirmed"
+        }
+      },
+      "evidence": [
+        "Confirmed enable is available only on Off, which Streaming cannot acquire without paired quiescence and reset."
+      ]
+    },
+    {
+      "id": "streaming-pair-private",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/effect_tests.rs",
+      "anchor": "static BYTES: [u8; 3] = [0x11, 0x22, 0x33];",
+      "replacement": "static BYTES: [u8; 3] = [0x11, 0x22, 0x33];\n\n#[allow(dead_code)]\nfn mutation_unpair(owner: super::registers::StreamingLease<TestEffects>) {\n    let _pair = owner.parts;\n}",
+      "guarantee": "Code outside the hardware boundary cannot extract the controller/channel/source pair from a live lease.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0616",
+        "message_contains": "field `parts`",
+        "span": {
+          "text": "parts"
+        }
+      },
+      "evidence": [
+        "StreamingLease field privacy across the real adapter module boundary; no detached pair is exposed for cross-transfer recombination."
+      ]
+    },
+    {
+      "id": "streaming-lease-consumed",
+      "kind": "compiler",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/effect_tests.rs",
+      "anchor": "static BYTES: [u8; 3] = [0x11, 0x22, 0x33];",
+      "replacement": "static BYTES: [u8; 3] = [0x11, 0x22, 0x33];\n\n#[allow(dead_code)]\nfn mutation_consumed_pair(owner: super::registers::StreamingLease<TestEffects>) {\n    drop(owner);\n    drop(owner);\n}",
+      "guarantee": "A consumed streaming lease cannot be reused for another operation.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0382",
+        "message_contains": "use of moved value: `owner`",
+        "span": {
+          "text": "owner",
+          "occurrence": 3
+        }
+      },
+      "evidence": [
+        "Ownership rejection on the actual StreamingLease type, independently of register state access restrictions."
+      ]
+    },
+    {
+      "id": "receiving-raw-lease-private",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "    fn retain_rx<D: Device>(receiving: Receiving<D>) -> Receiving<D> {\n        let _ = &receiving;\n        receiving\n    }",
+      "replacement": "    fn retain_rx<D: Device>(receiving: Receiving<D>) -> Receiving<D> {\n        let _ = &receiving.lease;\n        receiving\n    }",
+      "guarantee": "The live RX capability cannot be split to obtain the exclusive buffer or lower device.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0616",
+        "message_contains": "field `lease`",
+        "span": {
+          "text": "lease"
+        }
+      },
+      "evidence": [
+        "Declared RX ownership regression; isolated committed-baseline run required before PASS."
+      ]
+    },
+    {
+      "id": "forgotten-rx-buffer-access",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "        let receiving = cpu.arm_receive(0x2a, bytes).unwrap();\n        core::mem::forget(retain_rx(receiving));",
+      "replacement": "        let receiving = cpu.arm_receive(0x2a, bytes).unwrap();\n        core::mem::forget(retain_rx(receiving));\n        bytes.fill(0);",
+      "guarantee": "Forgetting the RX lease does not allow safe CPU writes through the original static buffer reference.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0499",
+        "message_contains": "cannot borrow `*bytes` as mutable more than once at a time",
+        "span": {
+          "text": "bytes",
+          "occurrence": 2
+        }
+      },
+      "evidence": [
+        "Declared; exact compiler diagnostic/span still requires committed-baseline validation. Compile-fail API doctest is separate, weaker evidence."
+      ]
+    },
+    {
+      "id": "stack-rx-buffer-rejected",
+      "kind": "compiler",
+      "source": "embassy-mcxa/experimental/i2c-one-shot-vocabulary/tests/operations.rs",
+      "anchor": "        let receiving = cpu.arm_receive(0x2a, bytes).unwrap();\n        core::mem::forget(retain_rx(receiving));",
+      "replacement": "        let _ = bytes;\n        let mut local = [0u8; 4];\n        let receiving = cpu.arm_receive(0x2a, &mut local).unwrap();\n        core::mem::forget(retain_rx(receiving));",
+      "guarantee": "An RX buffer that could disappear while a forgotten DMA writes it cannot enter the static-only capability.",
+      "cwd": "embassy-mcxa/experimental/i2c-one-shot-vocabulary",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "operations",
+        "--message-format=json"
+      ],
+      "expected": {
+        "code": "E0597",
+        "message_contains": "does not live long enough",
+        "span": {
+          "text": "&mut local"
+        }
+      },
+      "evidence": [
+        "Declared; diagnostic/span validation remains pending, not inferred from a source review."
+      ]
+    },
+    {
+      "id": "omit-rx-quiesce",
+      "kind": "behavior",
+      "source": "embassy-mcxa/src/i2c/one_shot/session/vocabulary/registers/dma_boundary.rs",
+      "anchor": "        requests_off(&mut self);\n        effects.quiesce();\n        fence(Ordering::Acquire);",
+      "replacement": "        requests_off(&mut self);\n        fence(Ordering::Acquire);",
+      "guarantee": "The actual RX adapter cannot return exclusive memory before the channel quiesces.",
+      "cwd": "embassy-mcxa",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "mcxa5xx,one-shot-host-tests",
+        "--message-format=json",
+        "i2c::one_shot::session::vocabulary::effect_tests::rx_completion_returns_storage_only_after_quiescence_and_stop",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "expected": {
+        "test": "i2c::one_shot::session::vocabulary::effect_tests::rx_completion_returns_storage_only_after_quiescence_and_stop",
+        "assertion": "RX_BUFFER_QUIESCENCE"
+      },
+      "evidence": [
+        "Real adapter register/HAL-effect test, not proof of physical DMA transactions; isolated mutation pending."
+      ]
+    }
+  ]
+}

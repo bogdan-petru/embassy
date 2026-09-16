@@ -1,0 +1,9 @@
+[package]
+name = "nxp-shared-examples"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Hardware-independent bodies and expectations for small driver port examples"
+
+[dependencies]

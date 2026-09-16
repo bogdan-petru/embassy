@@ -1,0 +1,14 @@
+[package]
+name = "i2c-one-shot-proofs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+i2c-one-shot-core = { path = "../i2c-one-shot-core", default-features = false }
+i2c-one-shot-interface = { path = "../i2c-one-shot-interface", default-features = false }
+i2c-one-shot-vocabulary = { path = "../i2c-one-shot-vocabulary", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

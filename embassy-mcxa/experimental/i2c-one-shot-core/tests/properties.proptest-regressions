@@ -1,0 +1,4 @@
+# Proptest saves failing seeds here and replays them before generating new cases.
+# Commit any new entries. Also add a literal deterministic regression for a real
+# defect: changing a generator can change the trace produced by an old seed.
+# No failing seed has been found on the unmodified production protocol so far.

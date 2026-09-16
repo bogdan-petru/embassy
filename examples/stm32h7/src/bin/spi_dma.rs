@@ -1,0 +1,74 @@
+#![no_std]
+#![no_main]
+
+use core::fmt::Write;
+use core::str::from_utf8;
+
+use cortex_m_rt::entry;
+use defmt::*;
+use embassy_executor::Executor;
+use embassy_stm32::mode::Async;
+use embassy_stm32::time::mhz;
+use embassy_stm32::{Config, bind_interrupts, dma, peripherals, spi};
+use heapless::String;
+use static_cell::StaticCell;
+use {defmt_rtt as _, panic_probe as _};
+
+bind_interrupts!(struct Irqs {
+    DMA1_STREAM3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
+    DMA1_STREAM4 => dma::InterruptHandler<peripherals::DMA1_CH4>;
+});
+
+#[embassy_executor::task]
+async fn main_task(mut spi: spi::Spi<'static, Async, spi::mode::Master>) {
+    for n in 0u32.. {
+        let mut write: String<128> = String::new();
+        let mut read = [0; 128];
+        core::write!(&mut write, "Hello DMA World {}!\r\n", n).unwrap();
+        // transfer will slice the &mut read down to &write's actual length.
+        spi.transfer(&mut read, write.as_bytes()).await.ok();
+        info!("read via spi+dma: {}", from_utf8(&read).unwrap());
+    }
+}
+
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+
+#[entry]
+fn main() -> ! {
+    info!("Hello World!");
+
+    let mut config = Config::default();
+    {
+        use embassy_stm32::rcc::*;
+        config.rcc.hsi = Some(HSIPrescaler::Div1);
+        config.rcc.csi = true;
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::Hsi,
+            prediv: PllPreDiv::Div4,
+            mul: PllMul::Mul50,
+            fracn: None,
+            divp: Some(PllDiv::Div2),
+            divq: Some(PllDiv::Div8), // used by SPI3. 100Mhz.
+            divr: None,
+        });
+        config.rcc.sys = Sysclk::Pll1P; // 400 Mhz
+        config.rcc.ahb_pre = AHBPrescaler::Div2; // 200 Mhz
+        config.rcc.apb1_pre = APBPrescaler::Div2; // 100 Mhz
+        config.rcc.apb2_pre = APBPrescaler::Div2; // 100 Mhz
+        config.rcc.apb3_pre = APBPrescaler::Div2; // 100 Mhz
+        config.rcc.apb4_pre = APBPrescaler::Div2; // 100 Mhz
+        config.rcc.voltage_scale = VoltageScale::Scale1;
+    }
+    let p = embassy_stm32::init(config);
+
+    let mut spi_config = spi::Config::default();
+    spi_config.frequency = mhz(1);
+
+    let spi = spi::Spi::new(p.SPI3, p.PB3, p.PB5, p.PB4, p.DMA1_CH3, p.DMA1_CH4, Irqs, spi_config);
+
+    let executor = EXECUTOR.init(Executor::new());
+
+    executor.run(|spawner| {
+        spawner.spawn(unwrap!(main_task(spi)));
+    })
+}
